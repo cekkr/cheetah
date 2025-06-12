@@ -1,0 +1,158 @@
+// database.go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+type Database struct {
+	path          string
+	highestKey    atomic.Uint64
+	mainKeys      *MainKeysTable
+	valuesTables  sync.Map // Cache thread-safe per *ValuesTable
+	recycleTables sync.Map // Cache thread-safe per *RecycleTable
+	mu            sync.Mutex
+}
+
+func NewDatabase(path string) (*Database, error) {
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return nil, err
+	}
+	mainKeysPath := filepath.Join(path, "main_keys.table")
+	mkt, err := NewMainKeysTable(mainKeysPath)
+	if err != nil {
+		return nil, err
+	}
+	db := &Database{path: path, mainKeys: mkt}
+	if err := db.loadHighestKey(); err != nil {
+		mkt.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func (db *Database) Path() string { return db.path }
+
+// Close chiude tutte le tabelle aperte per questo database.
+func (db *Database) Close() error {
+	var firstErr error
+	db.mainKeys.Close()
+	db.valuesTables.Range(func(key, value interface{}) bool {
+		if table, ok := value.(interface{ Close() }); ok {
+			table.Close()
+		}
+		return true
+	})
+	db.recycleTables.Range(func(key, value interface{}) bool {
+		if table, ok := value.(interface{ Close() }); ok {
+			table.Close()
+		}
+		return true
+	})
+	return firstErr
+}
+
+// getValuesTable e getRecycleTable sono i gestori della cache delle tabelle.
+func (db *Database) getValuesTable(size uint8, tableID uint32) (*ValuesTable, error) {
+	key := fmt.Sprintf("%d_%d", size, tableID)
+	if table, ok := db.valuesTables.Load(key); ok {
+		return table.(*ValuesTable), nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if table, ok := db.valuesTables.Load(key); ok {
+		return table.(*ValuesTable), nil
+	}
+	path := filepath.Join(db.path, fmt.Sprintf("values_%s.table", key))
+	newTable, err := NewValuesTable(path)
+	if err != nil {
+		return nil, err
+	}
+	db.valuesTables.Store(key, newTable)
+	return newTable, nil
+}
+
+func (db *Database) getRecycleTable(size uint8) (*RecycleTable, error) {
+	key := size
+	if table, ok := db.recycleTables.Load(key); ok {
+		return table.(*RecycleTable), nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if table, ok := db.recycleTables.Load(key); ok {
+		return table.(*RecycleTable), nil
+	}
+	path := filepath.Join(db.path, fmt.Sprintf("values_%d.recycle.table", size))
+	newTable, err := NewRecycleTable(path)
+	if err != nil {
+		return nil, err
+	}
+	db.recycleTables.Store(key, newTable)
+	return newTable, nil
+}
+
+// ExecuteCommand analizza ed esegue un comando.
+func (db *Database) ExecuteCommand(line string) (string, error) {
+	parts := strings.SplitN(line, " ", 2)
+	command := strings.ToUpper(parts[0])
+
+	switch {
+	case strings.HasPrefix(command, "INSERT"):
+		if len(parts) < 2 {
+			return "ERROR,missing_value", nil
+		}
+		value := []byte(parts[1])
+		size := 0
+		var err error
+		if strings.Contains(command, ":") {
+			sizeStr := strings.Split(command, ":")[1]
+			size, err = strconv.Atoi(sizeStr)
+			if err != nil {
+				return "ERROR,invalid_size_in_command", nil
+			}
+		}
+		return db.Insert(value, size)
+	case command == "READ":
+		if len(parts) < 2 {
+			return "ERROR,missing_key", nil
+		}
+		key, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return "ERROR,invalid_key_format", nil
+		}
+		return db.Read(key)
+	case command == "EDIT":
+		if len(parts) < 2 {
+			return "ERROR,missing_arguments", nil
+		}
+		args := strings.SplitN(parts[1], " ", 2)
+		if len(args) < 2 {
+			return "ERROR,edit_requires_key_and_value", nil
+		}
+		key, err := strconv.ParseUint(args[0], 10, 64)
+		if err != nil {
+			return "ERROR,invalid_key_format", nil
+		}
+		return db.Edit(key, []byte(args[1]))
+	case command == "DELETE":
+		if len(parts) < 2 {
+			return "ERROR,missing_key", nil
+		}
+		key, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return "ERROR,invalid_key_format", nil
+		}
+		return db.Delete(key)
+	default:
+		return "ERROR,unknown_command", nil
+	}
+}
+
+// Qui seguono le implementazioni complete dei comandi CRUD...
+// (le implementazioni complete sono nel file `commands.go` separato per chiarezza)
