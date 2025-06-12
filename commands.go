@@ -2,9 +2,13 @@
 package main
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 // --- Metodi CRUD per Database ---
@@ -136,4 +140,187 @@ func (db *Database) Delete(key uint64) (string, error) {
     }
 
     return fmt.Sprintf("SUCCESS,key=%d_deleted", key), nil
+}
+
+
+func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
+	if len(value) == 0 {
+		return "ERROR,pair_value_cannot_be_empty", nil
+	}
+
+	keyBytes := make([]byte, 6)
+	binary.BigEndian.PutUint64(keyBytes, absKey)
+	keyBytes = keyBytes[2:] // Usiamo 6 byte per la chiave assoluta
+
+	currentPrefixHex := ""
+	var parentTable *PairTable
+
+	for i, branchByte := range value {
+		isLastByte := (i == len(value)-1)
+		
+		parentTable, err := db.getPairTable(currentPrefixHex)
+		if err != nil { return "", err }
+
+		// Aggiorna il nodo genitore per indicare che ha un figlio
+		entry, _ := parentTable.ReadEntry(value[i-1]) // Legge l'entrata del byte precedente
+		if i > 0 && (entry[0]&FlagHasChild == 0) {
+			entry[0] |= FlagHasChild
+			if err := parentTable.WriteEntry(value[i-1], entry); err != nil {
+				return "", err
+			}
+		}
+		
+		currentPrefixHex += fmt.Sprintf("%02x", branchByte)
+		
+		if isLastByte {
+			// Siamo all'ultimo byte, scriviamo la chiave
+			terminalTable, err := db.getPairTable(currentPrefixHex)
+			if err != nil { return "", err }
+			
+			entry, _ := terminalTable.ReadEntry(branchByte)
+			entry[0] |= FlagIsTerminal
+			copy(entry[1:], keyBytes)
+			if err := terminalTable.WriteEntry(branchByte, entry); err != nil {
+				return "", err
+			}
+		}
+	}
+	return "SUCCESS,pair_set", nil
+}
+
+func (db *Database) PairGet(value []byte) (string, error) {
+	if len(value) == 0 {
+		return "ERROR,pair_value_cannot_be_empty", nil
+	}
+	
+	currentPrefixHex := ""
+	var currentTable *PairTable
+	
+	for i, branchByte := range value {
+		var err error
+		currentTable, err = db.getPairTable(currentPrefixHex)
+		if err != nil {
+			if os.IsNotExist(err) { return "ERROR,not_found", nil }
+			return "", err
+		}
+
+		entry, _ := currentTable.ReadEntry(branchByte)
+		
+		isLastByte := (i == len(value)-1)
+		if isLastByte {
+			if entry[0]&FlagIsTerminal == 0 {
+				return "ERROR,not_found", nil
+			}
+			keyData := make([]byte, 8)
+			copy(keyData[2:], entry[1:])
+			absKey := binary.BigEndian.Uint64(keyData)
+			return fmt.Sprintf("SUCCESS,key=%d", absKey), nil
+		}
+		
+		if entry[0]&FlagHasChild == 0 {
+			return "ERROR,not_found", nil
+		}
+		currentPrefixHex += fmt.Sprintf("%02x", branchByte)
+	}
+	return "ERROR,not_found", nil // Non dovrebbe essere raggiunto
+}
+
+type pathStackFrame struct {
+	table      *PairTable
+	branchByte byte
+	prefixHex  string
+}
+
+// PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani.
+func (db *Database) PairDel(value []byte) (string, error) {
+	if len(value) == 0 {
+		return "ERROR,pair_value_cannot_be_empty", nil
+	}
+
+	pathStack := make([]pathStackFrame, 0, len(value))
+	currentPrefixHex := ""
+
+	// Fase 1: Traversata verso il basso per trovare il valore e costruire lo stack del percorso
+	for i, branchByte := range value {
+		isLastByte := (i == len(value)-1)
+
+		currentTable, err := db.getPairTable(currentPrefixHex)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "ERROR,not_found", nil
+			}
+			return "", err
+		}
+
+		entry, _ := currentTable.ReadEntry(branchByte)
+		if entry[0] == 0 { // Se l'entrata è vuota, il percorso non esiste
+			return "ERROR,not_found", nil
+		}
+
+		// Aggiungiamo il nodo corrente e il byte che ci ha portato qui allo stack
+		pathStack = append(pathStack, pathStackFrame{table: currentTable, branchByte: branchByte, prefixHex: currentPrefixHex})
+
+		if isLastByte {
+			if entry[0]&FlagIsTerminal == 0 {
+				return "ERROR,not_found (value is a prefix, not a key)", nil
+			}
+		} else {
+			if entry[0]&FlagHasChild == 0 {
+				return "ERROR,not_found", nil
+			}
+		}
+		currentPrefixHex += fmt.Sprintf("%02x", branchByte)
+	}
+
+	// Fase 2: Modifica del nodo terminale
+	terminalFrame := pathStack[len(pathStack)-1]
+	terminalEntry, err := terminalFrame.table.ReadEntry(terminalFrame.branchByte)
+	if err != nil { return "", err }
+
+	terminalEntry[0] &= ^FlagIsTerminal // Azzera il flag terminale
+	for k := 1; k < PairEntrySize; k++ { // Azzera i dati della chiave
+		terminalEntry[k] = 0
+	}
+	if err := terminalFrame.table.WriteEntry(terminalFrame.branchByte, terminalEntry); err != nil {
+		return "", err
+	}
+
+	// Fase 3: Pulizia ricorsiva risalendo l'albero
+	for i := len(pathStack) - 1; i >= 0; i-- {
+		frame := pathStack[i]
+		
+		// Rileggiamo l'entrata per essere sicuri
+		entry, _ := frame.table.ReadEntry(frame.branchByte)
+		if entry[0] != 0 {
+			// Se l'entrata non è completamente vuota (ha ancora un figlio o è terminale), fermiamo la pulizia
+			break
+		}
+
+		// Se l'entrata è vuota, controlliamo se l'intero nodo/tabella è vuoto
+		isEmpty, err := frame.table.IsEmpty()
+		if err != nil || !isEmpty {
+			break // Se c'è un errore o non è vuoto, ci fermiamo
+		}
+		
+		// Il nodo è vuoto, lo eliminiamo
+		nodePath := filepath.Join(db.path, fmt.Sprintf("valpair.%s.table", frame.prefixHex))
+		frame.table.Close()
+		if err := os.Remove(nodePath); err != nil {
+			// Errore nella cancellazione, meglio fermarsi per evitare inconsistenza
+			return "SUCCESS,pair_deleted_but_cleanup_failed", err
+		}
+		db.pairTables.Delete(frame.prefixHex) // Rimuovi dalla cache
+
+		// Aggiorniamo il nodo genitore per rimuovere il flag HasChild
+		if i > 0 {
+			parentFrame := pathStack[i-1]
+			parentEntry, _ := parentFrame.table.ReadEntry(parentFrame.branchByte)
+			parentEntry[0] &= ^FlagHasChild // Rimuovi il flag
+			if err := parentFrame.table.WriteEntry(parentFrame.branchByte, parentEntry); err != nil {
+				return "SUCCESS,pair_deleted_but_cleanup_failed", err
+			}
+		}
+	}
+	
+	return "SUCCESS,pair_deleted", nil
 }

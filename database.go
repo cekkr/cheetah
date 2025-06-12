@@ -8,15 +8,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
+	"sync/atomic"	
 )
 
 type Database struct {
 	path          string
 	highestKey    atomic.Uint64
 	mainKeys      *MainKeysTable
-	valuesTables  sync.Map // Cache thread-safe per *ValuesTable
-	recycleTables sync.Map // Cache thread-safe per *RecycleTable
+	valuesTables  sync.Map
+	recycleTables sync.Map
+	pairTables    sync.Map // Cache per i nodi della TreeTable
 	mu            sync.Mutex
 }
 
@@ -97,6 +98,30 @@ func (db *Database) getRecycleTable(size uint8) (*RecycleTable, error) {
 	return newTable, nil
 }
 
+// getPairTable carica un nodo della TreeTable on-demand.
+func (db *Database) getPairTable(prefixHex string) (*PairTable, error) {
+	if prefixHex == "" {
+		prefixHex = "root" // Il nodo radice
+	}
+	if table, ok := db.pairTables.Load(prefixHex); ok {
+		return table.(*PairTable), nil
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if table, ok := db.pairTables.Load(prefixHex); ok {
+		return table.(*PairTable), nil
+	}
+
+	path := filepath.Join(db.path, fmt.Sprintf("valpair.%s.table", prefixHex))
+	newTable, err := NewPairTable(path)
+	if err != nil {
+		return nil, err
+	}
+	db.pairTables.Store(prefixHex, newTable)
+	return newTable, nil
+}
+
 // ExecuteCommand analizza ed esegue un comando.
 func (db *Database) ExecuteCommand(line string) (string, error) {
 	parts := strings.SplitN(line, " ", 2)
@@ -149,6 +174,24 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			return "ERROR,invalid_key_format", nil
 		}
 		return db.Delete(key)
+	case command == "PAIR_SET":
+		args := strings.SplitN(parts[1], " ", 2)
+		if len(args) < 2 { return "ERROR,pair_set_requires_value_and_key", nil }
+		value, err := parseValue(args[0])
+		if err != nil { return err.Error(), nil }
+		absKey, err := strconv.ParseUint(args[1], 10, 64)
+		if err != nil { return "ERROR,invalid_absolute_key_format", nil }
+		return db.PairSet(value, absKey)
+
+	case command == "PAIR_GET":
+		value, err := parseValue(parts[1])
+		if err != nil { return err.Error(), nil }
+		return db.PairGet(value)
+
+	case command == "PAIR_DEL":
+		value, err := parseValue(parts[1])
+		if err != nil { return err.Error(), nil }
+		return db.PairDel(value)	
 	default:
 		return "ERROR,unknown_command", nil
 	}

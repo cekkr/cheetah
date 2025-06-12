@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"hash/fnv"
 	"os"
-	"sync"
+	"sync"	
 )
 
 const KeyStripeCount = 1024
@@ -110,4 +110,65 @@ func (t *RecycleTable) Push(locationBytes []byte) error {
 	binary.BigEndian.PutUint16(counterBytes, count+1)
 	_, err := t.file.WriteAt(counterBytes, 0)
 	return err
+}
+
+///
+/// --- PairTable (TreeTable Node) ---
+///
+type PairTable struct {
+	file *os.File
+	mu   sync.RWMutex
+}
+
+func NewPairTable(path string) (*PairTable, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &PairTable{file: file}, nil
+}
+
+func (t *PairTable) ReadEntry(branchByte byte) ([]byte, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	entry := make([]byte, PairEntrySize)
+	offset := int64(branchByte) * int64(PairEntrySize)
+	_, err := t.file.ReadAt(entry, offset)
+	return entry, err
+}
+
+func (t *PairTable) WriteEntry(branchByte byte, entry []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	offset := int64(branchByte) * int64(PairEntrySize)
+	_, err := t.file.WriteAt(entry, offset)
+	return err
+}
+
+// IsEmpty controlla se il nodo non ha più figli o chiavi terminali.
+func (t *PairTable) IsEmpty() (bool, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	// Leggiamo l'intero file in un buffer per efficienza
+	info, err := t.file.Stat()
+	if err != nil { return false, err }
+	if info.Size() == 0 { return true, nil }
+
+	buffer := make([]byte, info.Size())
+	if _, err := t.file.ReadAt(buffer, 0); err != nil { return false, err }
+
+	for i := 0; i < len(buffer); i += PairEntrySize {
+		// Il primo byte di ogni entry è il flag
+		if buffer[i] != 0 {
+			return false, nil // Se un flag è settato, non è vuoto
+		}
+	}
+	return true, nil
+}
+
+func (t *PairTable) Close() {
+	t.file.Close()
 }
