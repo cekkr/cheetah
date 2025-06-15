@@ -2,23 +2,27 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"	
+	"sync/atomic"
 )
 
 type Database struct {
-	path          string
-	highestKey    atomic.Uint64
-	mainKeys      *MainKeysTable
-	valuesTables  sync.Map
-	recycleTables sync.Map
-	pairTables    sync.Map // Cache per i nodi della TreeTable
-	mu            sync.Mutex
+	path            string
+	highestKey      atomic.Uint64
+	nextPairTableID atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
+	mainKeys        *MainKeysTable
+	valuesTables    sync.Map
+	recycleTables   sync.Map
+	pairTables      sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
+	mu              sync.Mutex
+	pairDir         string // Path alla cartella /pairs
+	nextPairIDPath  string // Path al file che memorizza il contatore
 }
 
 func NewDatabase(path string) (*Database, error) {
@@ -30,7 +34,23 @@ func NewDatabase(path string) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	db := &Database{path: path, mainKeys: mkt}
+
+	pairDir := filepath.Join(path, "pairs")
+	if err := os.MkdirAll(pairDir, 0755); err != nil {
+		return nil, err
+	}
+
+	db := &Database{
+		path:           path,
+		pairDir:        pairDir,
+		nextPairIDPath: filepath.Join(pairDir, "next_id.dat"),
+	}
+
+	// Carica il contatore degli ID delle tabelle pair
+	if err := db.loadNextPairTableID(); err != nil {
+		return nil, err
+	}
+
 	if err := db.loadHighestKey(); err != nil {
 		mkt.Close()
 		return nil, err
@@ -98,27 +118,49 @@ func (db *Database) getRecycleTable(size uint8) (*RecycleTable, error) {
 	return newTable, nil
 }
 
-// getPairTable carica un nodo della TreeTable on-demand.
-func (db *Database) getPairTable(prefixHex string) (*PairTable, error) {
-	if prefixHex == "" {
-		prefixHex = "root" // Il nodo radice
+// loadNextPairTableID carica dal disco il prossimo ID da usare per una nuova tabella pair.
+func (db *Database) loadNextPairTableID() error {
+	data, err := os.ReadFile(db.nextPairIDPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Il file non esiste, partiamo da 1 (0 è la root)
+			db.nextPairTableID.Store(1)
+			return nil
+		}
+		return err
 	}
-	if table, ok := db.pairTables.Load(prefixHex); ok {
+	if len(data) >= 4 {
+		db.nextPairTableID.Store(binary.BigEndian.Uint32(data))
+	}
+	return nil
+}
+
+// getNewPairTableID restituisce un nuovo ID univoco e lo salva su disco.
+func (db *Database) getNewPairTableID() (uint32, error) {
+	newID := db.nextPairTableID.Add(1) - 1
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, newID+1)
+	return newID, os.WriteFile(db.nextPairIDPath, buf, 0644)
+}
+
+// getPairTable ora accetta un uint32 ID.
+func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
+	if table, ok := db.pairTables.Load(tableID); ok {
 		return table.(*PairTable), nil
 	}
-
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if table, ok := db.pairTables.Load(prefixHex); ok {
+	if table, ok := db.pairTables.Load(tableID); ok {
 		return table.(*PairTable), nil
 	}
 
-	path := filepath.Join(db.path, fmt.Sprintf("valpair.%s.table", prefixHex))
+	// Il nome del file è l'ID in esadecimale
+	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
 	newTable, err := NewPairTable(path)
 	if err != nil {
 		return nil, err
 	}
-	db.pairTables.Store(prefixHex, newTable)
+	db.pairTables.Store(tableID, newTable)
 	return newTable, nil
 }
 
@@ -176,25 +218,48 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		return db.Delete(key)
 	case command == "PAIR_SET":
 		args := strings.SplitN(parts[1], " ", 2)
-		if len(args) < 2 { return "ERROR,pair_set_requires_value_and_key", nil }
+		if len(args) < 2 {
+			return "ERROR,pair_set_requires_value_and_key", nil
+		}
 		value, err := parseValue(args[0])
-		if err != nil { return err.Error(), nil }
+		if err != nil {
+			return err.Error(), nil
+		}
 		absKey, err := strconv.ParseUint(args[1], 10, 64)
-		if err != nil { return "ERROR,invalid_absolute_key_format", nil }
+		if err != nil {
+			return "ERROR,invalid_absolute_key_format", nil
+		}
 		return db.PairSet(value, absKey)
 
 	case command == "PAIR_GET":
 		value, err := parseValue(parts[1])
-		if err != nil { return err.Error(), nil }
+		if err != nil {
+			return err.Error(), nil
+		}
 		return db.PairGet(value)
 
 	case command == "PAIR_DEL":
 		value, err := parseValue(parts[1])
-		if err != nil { return err.Error(), nil }
-		return db.PairDel(value)	
+		if err != nil {
+			return err.Error(), nil
+		}
+		return db.PairDel(value)
 	default:
 		return "ERROR,unknown_command", nil
 	}
+}
+
+func (db *Database) deletePairTable(tableID uint32) error {
+	// Rimuove dalla cache
+	if table, ok := db.pairTables.LoadAndDelete(tableID); ok {
+		if pt, castOk := table.(*PairTable); castOk {
+			pt.Close() // Chiude il file handle
+		}
+	}
+
+	// Costruisce il path e rimuove il file dal disco
+	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
+	return os.Remove(path)
 }
 
 // Qui seguono le implementazioni complete dei comandi CRUD...

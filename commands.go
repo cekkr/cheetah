@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+	"sort"
+	"sync"
 )
 
 // --- Metodi CRUD per Database ---
@@ -145,48 +146,53 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
 
-	keyBytes := make([]byte, 6)
-	binary.BigEndian.PutUint64(keyBytes, absKey)
-	keyBytes = keyBytes[2:] // Usiamo 6 byte per la chiave assoluta
-
-	currentPrefixHex := ""
-	//var parentTable *PairTable
+	currentTableID := uint32(0) // Si parte sempre dalla tabella radice '0'
+	var currentTable *PairTable
+	var err error
 
 	for i, branchByte := range value {
-		isLastByte := (i == len(value)-1)
-
-		parentTable, err := db.getPairTable(currentPrefixHex)
+		currentTable, err = db.getPairTable(currentTableID)
 		if err != nil {
 			return "", err
 		}
 
-		// Aggiorna il nodo genitore per indicare che ha un figlio
-		entry, _ := parentTable.ReadEntry(value[i-1]) // Legge l'entrata del byte precedente
-		if i > 0 && (entry[0]&FlagHasChild == 0) {
-			entry[0] |= FlagHasChild
-			if err := parentTable.WriteEntry(value[i-1], entry); err != nil {
-				return "", err
-			}
-		}
+		entry, _ := currentTable.ReadEntry(branchByte)
+		length := entry[0]
+		data := entry[1:]
 
-		currentPrefixHex += fmt.Sprintf("%02x", branchByte)
+		isLastByte := (i == len(value)-1)
 
 		if isLastByte {
-			// Siamo all'ultimo byte, scriviamo la chiave
-			terminalTable, err := db.getPairTable(currentPrefixHex)
+			if length == 0 && binary.BigEndian.Uint32(data) != 0 {
+				return "ERROR,conflict: a longer key already exists on this path", nil
+			}
+			entry[0] = 6                             // Lunghezza della chiave assoluta
+			binary.BigEndian.PutUint64(data, absKey) // Scrive la chiave nei 6 byte
+			return "SUCCESS,pair_set", currentTable.WriteEntry(branchByte, entry)
+		}
+
+		if length > 0 {
+			return "ERROR,conflict: a key already exists which is a prefix of your value", nil
+		}
+
+		nextTableID := binary.BigEndian.Uint32(data)
+		if nextTableID == 0 { // Il percorso non esiste, creiamolo
+			newID, err := db.getNewPairTableID()
 			if err != nil {
 				return "", err
 			}
 
-			entry, _ := terminalTable.ReadEntry(branchByte)
-			entry[0] |= FlagIsTerminal
-			copy(entry[1:], keyBytes)
-			if err := terminalTable.WriteEntry(branchByte, entry); err != nil {
+			entry[0] = 0 // Lunghezza 0 indica un puntatore
+			binary.BigEndian.PutUint32(data, newID)
+			if err := currentTable.WriteEntry(branchByte, entry); err != nil {
 				return "", err
 			}
+			currentTableID = newID
+		} else {
+			currentTableID = nextTableID
 		}
 	}
-	return "SUCCESS,pair_set", nil
+	return "ERROR,internal_logic_error", nil // Non dovrebbe essere raggiunto
 }
 
 func (db *Database) PairGet(value []byte) (string, error) {
@@ -194,12 +200,9 @@ func (db *Database) PairGet(value []byte) (string, error) {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
 
-	currentPrefixHex := ""
-	var currentTable *PairTable
-
+	currentTableID := uint32(0)
 	for i, branchByte := range value {
-		var err error
-		currentTable, err = db.getPairTable(currentPrefixHex)
+		table, err := db.getPairTable(currentTableID)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return "ERROR,not_found", nil
@@ -207,47 +210,59 @@ func (db *Database) PairGet(value []byte) (string, error) {
 			return "", err
 		}
 
-		entry, _ := currentTable.ReadEntry(branchByte)
+		entry, _ := table.ReadEntry(branchByte)
+		length := entry[0]
+		data := entry[1:]
 
-		isLastByte := (i == len(value)-1)
-		if isLastByte {
-			if entry[0]&FlagIsTerminal == 0 {
-				return "ERROR,not_found", nil
+		if isLastByte := (i == len(value)-1); isLastByte {
+			if length > 0 {
+				keyData := make([]byte, 8)
+				copy(keyData[2:], data[:length])
+				absKey := binary.BigEndian.Uint64(keyData)
+				return fmt.Sprintf("SUCCESS,key=%d", absKey), nil
 			}
-			keyData := make([]byte, 8)
-			copy(keyData[2:], entry[1:])
-			absKey := binary.BigEndian.Uint64(keyData)
-			return fmt.Sprintf("SUCCESS,key=%d", absKey), nil
-		}
-
-		if entry[0]&FlagHasChild == 0 {
 			return "ERROR,not_found", nil
 		}
-		currentPrefixHex += fmt.Sprintf("%02x", branchByte)
-	}
-	return "ERROR,not_found", nil // Non dovrebbe essere raggiunto
-}
 
-type pathStackFrame struct {
-	table      *PairTable
-	branchByte byte
-	prefixHex  string
+		if length == 0 {
+			currentTableID = binary.BigEndian.Uint32(data)
+			if currentTableID == 0 {
+				return "ERROR,not_found", nil
+			}
+		} else {
+			return "ERROR,not_found", nil
+		}
+	}
+	return "ERROR,not_found", nil
 }
 
 // PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani.
+
+type pathStackFrame struct {
+	TableID    uint32
+	BranchByte byte
+}
+
+// PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani,
+// implementando la compressione del percorso.
 func (db *Database) PairDel(value []byte) (string, error) {
 	if len(value) == 0 {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
 
+	// --- Fase 1: Scoperta del Percorso (Read Locks) ---
 	pathStack := make([]pathStackFrame, 0, len(value))
-	currentPrefixHex := ""
+	acquiredLocks := make([]*sync.RWMutex, 0, len(value))
 
-	// Fase 1: Traversata verso il basso per trovare il valore e costruire lo stack del percorso
+	cleanupReadLocks := func() {
+		for i := len(acquiredLocks) - 1; i >= 0; i-- {
+			acquiredLocks[i].RUnlock()
+		}
+	}
+
+	currentTableID := uint32(0)
 	for i, branchByte := range value {
-		isLastByte := (i == len(value)-1)
-
-		currentTable, err := db.getPairTable(currentPrefixHex)
+		table, err := db.getPairTable(currentTableID)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return "ERROR,not_found", nil
@@ -255,77 +270,133 @@ func (db *Database) PairDel(value []byte) (string, error) {
 			return "", err
 		}
 
-		entry, _ := currentTable.ReadEntry(branchByte)
-		if entry[0] == 0 { // Se l'entrata è vuota, il percorso non esiste
+		table.mu.RLock()
+		acquiredLocks = append(acquiredLocks, &table.mu)
+
+		entry, err := table.ReadEntry(branchByte)
+		if err != nil || entry[0] == 0 {
+			cleanupReadLocks()
 			return "ERROR,not_found", nil
 		}
 
-		// Aggiungiamo il nodo corrente e il byte che ci ha portato qui allo stack
-		pathStack = append(pathStack, pathStackFrame{table: currentTable, branchByte: branchByte, prefixHex: currentPrefixHex})
+		pathStack = append(pathStack, pathStackFrame{TableID: currentTableID, BranchByte: branchByte})
+		length, data := entry[0], entry[1:]
 
+		isLastByte := (i == len(value)-1)
 		if isLastByte {
-			if entry[0]&FlagIsTerminal == 0 {
-				return "ERROR,not_found (value is a prefix, not a key)", nil
-			}
-		} else {
-			if entry[0]&FlagHasChild == 0 {
+			if length == 0 {
+				cleanupReadLocks()
 				return "ERROR,not_found", nil
 			}
+		} else {
+			if length > 0 {
+				cleanupReadLocks()
+				return "ERROR,not_found", nil
+			}
+			currentTableID = binary.BigEndian.Uint32(data)
 		}
-		currentPrefixHex += fmt.Sprintf("%02x", branchByte)
+	}
+	cleanupReadLocks() // Rilasciamo tutti i read lock prima di passare ai write lock
+
+	// --- Fase 2: Blocco Esclusivo del Percorso (Write Locks) ---
+	pathTableIDs := make([]uint32, len(pathStack))
+	for i, frame := range pathStack {
+		pathTableIDs[i] = frame.TableID
 	}
 
-	// Fase 2: Modifica del nodo terminale
-	terminalFrame := pathStack[len(pathStack)-1]
-	terminalEntry, err := terminalFrame.table.ReadEntry(terminalFrame.branchByte)
-	if err != nil {
-		return "", err
+	// Ordiniamo gli ID per acquisire i lock in ordine ed evitare deadlock
+	sort.Slice(pathTableIDs, func(i, j int) bool { return pathTableIDs[i] < pathTableIDs[j] })
+
+	lockedTables := make(map[uint32]*PairTable)
+	for _, id := range pathTableIDs {
+		table, _ := db.getPairTable(id)
+		table.mu.Lock()
+		lockedTables[id] = table
 	}
-
-	terminalEntry[0] &^= FlagIsTerminal  // Azzera il flag terminale
-	for k := 1; k < PairEntrySize; k++ { // Azzera i dati della chiave
-		terminalEntry[k] = 0
-	}
-	if err := terminalFrame.table.WriteEntry(terminalFrame.branchByte, terminalEntry); err != nil {
-		return "", err
-	}
-
-	// Fase 3: Pulizia ricorsiva risalendo l'albero
-	for i := len(pathStack) - 1; i >= 0; i-- {
-		frame := pathStack[i]
-
-		// Rileggiamo l'entrata per essere sicuri
-		entry, _ := frame.table.ReadEntry(frame.branchByte)
-		if entry[0] != 0 {
-			// Se l'entrata non è completamente vuota (ha ancora un figlio o è terminale), fermiamo la pulizia
-			break
-		}
-
-		// Se l'entrata è vuota, controlliamo se l'intero nodo/tabella è vuoto
-		isEmpty, err := frame.table.IsEmpty()
-		if err != nil || !isEmpty {
-			break // Se c'è un errore o non è vuoto, ci fermiamo
-		}
-
-		// Il nodo è vuoto, lo eliminiamo
-		nodePath := filepath.Join(db.path, fmt.Sprintf("valpair.%s.table", frame.prefixHex))
-		frame.table.Close()
-		if err := os.Remove(nodePath); err != nil {
-			// Errore nella cancellazione, meglio fermarsi per evitare inconsistenza
-			return "SUCCESS,pair_deleted_but_cleanup_failed", err
-		}
-		db.pairTables.Delete(frame.prefixHex) // Rimuovi dalla cache
-
-		// Aggiorniamo il nodo genitore per rimuovere il flag HasChild
-		if i > 0 {
-			parentFrame := pathStack[i-1]
-			parentEntry, _ := parentFrame.table.ReadEntry(parentFrame.branchByte)
-			parentEntry[0] &^= FlagHasChild // Rimuovi il flag
-			if err := parentFrame.table.WriteEntry(parentFrame.branchByte, parentEntry); err != nil {
-				return "SUCCESS,pair_deleted_but_cleanup_failed", err
+	defer func() { // Assicuriamo il rilascio di tutti i write lock
+		for _, id := range pathTableIDs {
+			if table, ok := lockedTables[id]; ok {
+				table.mu.Unlock()
 			}
 		}
+	}()
+
+	// --- Fase 3: Modifica e Pulizia ---
+	// Modifichiamo il nodo terminale
+	terminalFrame := pathStack[len(pathStack)-1]
+	terminalTable := lockedTables[terminalFrame.TableID]
+	terminalEntry, _ := terminalTable.ReadEntry(terminalFrame.BranchByte)
+	terminalEntry[0] = 0 // Azzera la lunghezza, cancellando di fatto la chiave
+	for k := 1; k < PairEntrySize; k++ {
+		terminalEntry[k] = 0
 	}
+	if err := terminalTable.WriteEntry(terminalFrame.BranchByte, terminalEntry); err != nil {
+		return "", fmt.Errorf("failed to clear terminal entry: %w", err)
+	}
+
+	// Risaliamo lo stack per pulire e comprimere
+	for i := len(pathStack) - 1; i >= 0; i-- {
+		frame := pathStack[i]
+		tableToAnalyze := lockedTables[frame.TableID]
+
+		_, childCount, _ /*singleChildByte*/, singleChildEntry, err := tableToAnalyze.Analyze()
+		if err != nil {
+			continue
+		} // Se non riusciamo ad analizzare, meglio non fare nulla
+
+		// Otteniamo il genitore, se esiste
+		var parentTable *PairTable
+		var parentBranchByte byte
+		if i > 0 {
+			parentFrame := pathStack[i-1]
+			parentTable = lockedTables[parentFrame.TableID]
+			parentBranchByte = parentFrame.BranchByte
+		}
+
+		if childCount == 0 { // Nodo diventato completamente vuoto
+			if parentTable == nil {
+				break
+			} // Non cancelliamo mai il nodo radice
+
+			// Azzera il puntatore nel genitore
+			parentEntry, _ := parentTable.ReadEntry(parentBranchByte)
+			parentEntry[0] = 0
+			for k := 1; k < PairEntrySize; k++ {
+				parentEntry[k] = 0
+			}
+			if err := parentTable.WriteEntry(parentBranchByte, parentEntry); err != nil {
+				return "", err
+			}
+
+			// Cancella il file del nodo corrente
+			if err := db.deletePairTable(frame.TableID); err != nil {
+				return "", err
+			}
+			delete(lockedTables, frame.TableID) // Rimuovi dalla mappa dei lock per evitare unlock doppio
+
+		} else if childCount == 1 { // Nodo diventato ridondante -> Path Compression
+			if parentTable == nil {
+				break
+			} // Il nodo radice può avere un solo figlio, non lo comprimiamo
+
+			// Fai puntare il genitore direttamente al nipote
+			if err := parentTable.WriteEntry(parentBranchByte, singleChildEntry); err != nil {
+				return "", err
+			}
+
+			// Cancella il file del nodo corrente (ormai bypassato)
+			if err := db.deletePairTable(frame.TableID); err != nil {
+				return "", err
+			}
+			delete(lockedTables, frame.TableID)
+
+		} else { // Il nodo è ancora utile (ha >1 figli), fermiamo la pulizia
+			break
+		}
+	}
+
+	// --- Fase 4: Rilascio dei Lock ---
+	// Gestito dal defer in cima alla fase 2
 
 	return "SUCCESS,pair_deleted", nil
 }

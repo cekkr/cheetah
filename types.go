@@ -16,10 +16,18 @@ const (
 	ValueLocationIndexSize = 5
 	RecycleCounterSize     = 2
 
+	// Pair Table (New Architecture)
+	PairTableDataSize         = 6 // Dimensione fissa per i dati (contiene o un absKey o un tableID)
+	PairTableLengthByteSize   = 1 // 1 byte per indicare la lunghezza
+	PairTableEntrySize        = PairTableLengthByteSize + PairTableDataSize
+	PairTableIDSize           = 4 // 4 bytes per l'ID di una tabella pair (uint32)
+	PairTableNumByteCombos    = 1 // Quante combinazioni di byte per file (1 = 256 entrate)
+	PairTablePreallocatedSize = PairTableNumByteCombos * 256 * PairTableEntrySize
+
 	// Pair Table (TreeTable)
-	PairEntrySize    = 7
-	FlagIsTerminal   = 1 << 0
-	FlagHasChild     = 1 << 1
+	PairEntrySize  = 7
+	FlagIsTerminal = 1 << 0
+	FlagHasChild   = 1 << 1
 )
 
 // ValueLocationIndex rappresenta il puntatore da 5 byte al valore.
