@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -163,92 +162,104 @@ func (db *Database) Insert(value []byte, specifiedSize int) (string, error) {
 	if valueSize == 0 || valueSize > 255 {
 		return "ERROR,invalid_value_size", nil
 	}
-	
+
 	// Implementation is similar to before, but more structured calls will be needed in a full version.
 	// For brevity, we keep the file logic here, but it would ideally be in Table structs.
 	// 1. Get location
 	location, err := db.getAvailableLocation(uint8(valueSize))
-	if err != nil { return fmt.Sprintf("ERROR,internal:%s", err), err }
+	if err != nil {
+		return fmt.Sprintf("ERROR,internal:%s", err), err
+	}
 
 	// 2. Write value
 	vTablePath := filepath.Join(db.path, fmt.Sprintf("values_%d_%d.table", valueSize, location.TableID))
 	vFile, err := os.OpenFile(vTablePath, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	_, err = vFile.WriteAt(value, int64(location.EntryID)*int64(valueSize))
 	vFile.Close()
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	// 3. Get new key and write to main_keys
 	newKey := db.highestKey.Add(1)
 	mainKeysPath := filepath.Join(db.path, "main_keys.table")
 	mFile, err := os.OpenFile(mainKeysPath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil { return "", err }
-	
+	if err != nil {
+		return "", err
+	}
+
 	entry := make([]byte, MainKeysEntrySize)
 	entry[0] = byte(valueSize)
 	copy(entry[1:], location.Encode())
-	
+
 	_, err = mFile.WriteAt(entry, int64(newKey)*MainKeysEntrySize)
 	mFile.Close()
 	if err != nil {
 		db.highestKey.Add(^uint64(0)) // Decrement on failure
-		return "", err 
+		return "", err
 	}
-	
+
 	return fmt.Sprintf("SUCCESS,key=%d", newKey), nil
 }
 
 // DELETE
 func (db *Database) Delete(key uint64) (string, error) {
-    db.mu.Lock()
-    defer db.mu.Unlock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-    mainKeysPath := filepath.Join(db.path, "main_keys.table")
-    file, err := os.OpenFile(mainKeysPath, os.O_RDWR, 0644)
-    if err != nil { return "ERROR,key_not_found", nil }
-    defer file.Close()
+	mainKeysPath := filepath.Join(db.path, "main_keys.table")
+	file, err := os.OpenFile(mainKeysPath, os.O_RDWR, 0644)
+	if err != nil {
+		return "ERROR,key_not_found", nil
+	}
+	defer file.Close()
 
-    offset := int64(key) * MainKeysEntrySize
-    entry := make([]byte, MainKeysEntrySize)
-    if _, err := file.ReadAt(entry, offset); err != nil {
-        return "ERROR,key_not_found", nil
-    }
+	offset := int64(key) * MainKeysEntrySize
+	entry := make([]byte, MainKeysEntrySize)
+	if _, err := file.ReadAt(entry, offset); err != nil {
+		return "ERROR,key_not_found", nil
+	}
 
-    valueSize := uint8(entry[0])
-    if valueSize == 0 { return "ERROR,already_deleted", nil }
+	valueSize := uint8(entry[0])
+	if valueSize == 0 {
+		return "ERROR,already_deleted", nil
+	}
 
-    // Recycle the location
-    locationBytes := make([]byte, ValueLocationIndexSize)
+	// Recycle the location
+	locationBytes := make([]byte, ValueLocationIndexSize)
 	copy(locationBytes, entry[1:])
-    db.pushToRecycle(valueSize, locationBytes)
+	db.pushToRecycle(valueSize, locationBytes)
 
-    // Zero out the entry
-    zeroEntry := make([]byte, MainKeysEntrySize)
-    if _, err := file.WriteAt(zeroEntry, offset); err != nil {
-        return "ERROR,delete_failed", err
-    }
+	// Zero out the entry
+	zeroEntry := make([]byte, MainKeysEntrySize)
+	if _, err := file.WriteAt(zeroEntry, offset); err != nil {
+		return "ERROR,delete_failed", err
+	}
 
-    // If we deleted the highest key, we must find the new one.
-    currentHighest := db.highestKey.Load()
-    if key == currentHighest {
-        newHighest := key - 1
-        // Scan backwards to find the next valid key
-        for newHighest > 0 {
-            tempEntry := make([]byte, MainKeysEntrySize)
-            if _, err := file.ReadAt(tempEntry, int64(newHighest)*MainKeysEntrySize); err != nil {
-                 // Reached beginning of file or error
-                 newHighest = 0
-                 break
-            }
-            if tempEntry[0] != 0 { // Found a valid key
-                break
-            }
-            newHighest--
-        }
-        db.highestKey.Store(newHighest)
-    }
+	// If we deleted the highest key, we must find the new one.
+	currentHighest := db.highestKey.Load()
+	if key == currentHighest {
+		newHighest := key - 1
+		// Scan backwards to find the next valid key
+		for newHighest > 0 {
+			tempEntry := make([]byte, MainKeysEntrySize)
+			if _, err := file.ReadAt(tempEntry, int64(newHighest)*MainKeysEntrySize); err != nil {
+				// Reached beginning of file or error
+				newHighest = 0
+				break
+			}
+			if tempEntry[0] != 0 { // Found a valid key
+				break
+			}
+			newHighest--
+		}
+		db.highestKey.Store(newHighest)
+	}
 
-    return fmt.Sprintf("SUCCESS,key=%d_deleted", key), nil
+	return fmt.Sprintf("SUCCESS,key=%d_deleted", key), nil
 }
 
 // Simplified READ and EDIT for brevity, they would use the same structured approach
@@ -260,7 +271,7 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) { /* ... *
 }
 
 // --- HELPERS for Recycle and Location ---
-func (db *Database) getAvailableLocation(valueSize uint8) (ValueLocationIndex, error) { /* ... */ 
+func (db *Database) getAvailableLocation(valueSize uint8) (ValueLocationIndex, error) { /* ... */
 	// First, try to pop from recycle
 	if locBytes, ok := db.popFromRecycle(valueSize); ok {
 		return DecodeValueLocationIndex(locBytes), nil
@@ -285,22 +296,32 @@ func (db *Database) getAvailableLocation(valueSize uint8) (ValueLocationIndex, e
 func (db *Database) popFromRecycle(valueSize uint8) ([]byte, bool) {
 	recyclePath := filepath.Join(db.path, fmt.Sprintf("values_%d.recycle.table", valueSize))
 	file, err := os.OpenFile(recyclePath, os.O_RDWR, 0644)
-	if err != nil { return nil, false }
+	if err != nil {
+		return nil, false
+	}
 	defer file.Close()
-	
+
 	counterBytes := make([]byte, RecycleCounterSize)
-	if _, err := file.ReadAt(counterBytes, 0); err != nil { return nil, false }
-	
+	if _, err := file.ReadAt(counterBytes, 0); err != nil {
+		return nil, false
+	}
+
 	count := binary.BigEndian.Uint16(counterBytes)
-	if count == 0 { return nil, false }
+	if count == 0 {
+		return nil, false
+	}
 
 	offset := int64(RecycleCounterSize) + int64(count-1)*ValueLocationIndexSize
 	locBytes := make([]byte, ValueLocationIndexSize)
-	if _, err := file.ReadAt(locBytes, offset); err != nil { return nil, false }
-	
+	if _, err := file.ReadAt(locBytes, offset); err != nil {
+		return nil, false
+	}
+
 	// Update counter
 	binary.BigEndian.PutUint16(counterBytes, count-1)
-	if _, err := file.WriteAt(counterBytes, 0); err != nil { return nil, false } // Should handle this error better
+	if _, err := file.WriteAt(counterBytes, 0); err != nil {
+		return nil, false
+	} // Should handle this error better
 
 	// NOTE: Here you could implement logic to truncate the file if it gets too sparse.
 	return locBytes, true
@@ -308,9 +329,11 @@ func (db *Database) popFromRecycle(valueSize uint8) ([]byte, bool) {
 func (db *Database) pushToRecycle(valueSize uint8, locationBytes []byte) { /* ... */
 	recyclePath := filepath.Join(db.path, fmt.Sprintf("values_%d.recycle.table", valueSize))
 	file, err := os.OpenFile(recyclePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil { return } // Log error
+	if err != nil {
+		return
+	} // Log error
 	defer file.Close()
-	
+
 	counterBytes := make([]byte, RecycleCounterSize)
 	count := uint16(0)
 	if _, err := file.ReadAt(counterBytes, 0); err == nil {
@@ -319,7 +342,7 @@ func (db *Database) pushToRecycle(valueSize uint8, locationBytes []byte) { /* ..
 
 	offset := int64(RecycleCounterSize) + int64(count)*ValueLocationIndexSize
 	file.WriteAt(locationBytes, offset)
-	
+
 	binary.BigEndian.PutUint16(counterBytes, count+1)
 	file.WriteAt(counterBytes, 0)
 }
@@ -343,13 +366,17 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Printf("[%s]> ", currentDB.path)
-		if !scanner.Scan() { break }
+		if !scanner.Scan() {
+			break
+		}
 
 		line := scanner.Text()
 		parts := strings.SplitN(line, " ", 2)
 		command := strings.ToUpper(parts[0])
 
-		if command == "EXIT" { break }
+		if command == "EXIT" {
+			break
+		}
 
 		var response string
 		var execErr error
@@ -384,7 +411,7 @@ func main() {
 				}
 			}
 			response, execErr = currentDB.Insert(value, size)
-			
+
 		case command == "DELETE":
 			key, _ := strconv.ParseUint(parts[1], 10, 64)
 			response, execErr = currentDB.Delete(key)

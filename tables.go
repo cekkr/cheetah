@@ -5,34 +5,59 @@ import (
 	"encoding/binary"
 	"hash/fnv"
 	"os"
-	"sync"	
+	"sync"
 )
 
-const KeyStripeCount = 1024
+//const KeyStripeCount = 1024 // in types.go
 
 // --- MainKeysTable ---
+
+// MainKeysTable gestisce l'accesso al file main_keys.table
 type MainKeysTable struct {
 	file  *os.File
 	path  string
-	locks []sync.RWMutex
+	locks []sync.RWMutex // Lock striping
 }
 
-func NewMainKeysTable(path string) (*MainKeysTable, error) { /* ... invariato ... */ }
-func (t *MainKeysTable) getLock(key uint64) *sync.RWMutex { /* ... invariato ... */ }
-func (t *MainKeysTable) Close()                           { t.file.Close() }
+func NewMainKeysTable(path string) (*MainKeysTable, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &MainKeysTable{
+		file:  file,
+		path:  path,
+		locks: make([]sync.RWMutex, KeyStripeCount),
+	}, nil
+}
 
-// Metodi con lock
+func (t *MainKeysTable) getLock(key uint64) *sync.RWMutex {
+	hasher := fnv.New64a()
+	hasher.Write(binary.BigEndian.AppendUint64(nil, key))
+	return &t.locks[hasher.Sum64()%KeyStripeCount]
+}
+
 func (t *MainKeysTable) ReadEntry(key uint64) ([]byte, error) {
 	lock := t.getLock(key)
 	lock.RLock()
 	defer lock.RUnlock()
-	return t.readEntryFromFile(key)
+
+	entry := make([]byte, MainKeysEntrySize)
+	_, err := t.file.ReadAt(entry, int64(key)*MainKeysEntrySize)
+	return entry, err
 }
+
 func (t *MainKeysTable) WriteEntry(key uint64, entry []byte) error {
 	lock := t.getLock(key)
 	lock.Lock()
 	defer lock.Unlock()
-	return t.writeEntryToFile(key, entry)
+
+	_, err := t.file.WriteAt(entry, int64(key)*MainKeysEntrySize)
+	return err
+}
+
+func (t *MainKeysTable) Close() {
+	t.file.Close()
 }
 
 // Metodi senza lock (per uso interno quando il lock è già acquisito)
@@ -52,10 +77,29 @@ type ValuesTable struct {
 	mu   sync.RWMutex
 }
 
-func NewValuesTable(path string) (*ValuesTable, error) { /* ... invariato ... */ }
-func (t *ValuesTable) WriteAt(p []byte, off int64) (n int, err error) { /* ... invariato ... */ }
-func (t *ValuesTable) ReadAt(p []byte, off int64) (n int, err error) { /* ... invariato ... */ }
-func (t *ValuesTable) Close()                                        { t.file.Close() }
+func NewValuesTable(path string) (*ValuesTable, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &ValuesTable{file: file}, nil
+}
+
+func (t *ValuesTable) WriteAt(p []byte, off int64) (n int, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.file.WriteAt(p, off)
+}
+
+func (t *ValuesTable) ReadAt(p []byte, off int64) (n int, err error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.file.ReadAt(p, off)
+}
+
+func (t *ValuesTable) Close() {
+	t.file.Close()
+}
 
 // --- RecycleTable ---
 type RecycleTable struct {
@@ -63,8 +107,15 @@ type RecycleTable struct {
 	mu   sync.Mutex
 }
 
-func NewRecycleTable(path string) (*RecycleTable, error) { /* ... invariato ... */ }
-func (t *RecycleTable) Close()                                        { t.file.Close() }
+func NewRecycleTable(path string) (*RecycleTable, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &RecycleTable{file: file}, nil
+}
+
+func (t *RecycleTable) Close() { t.file.Close() }
 
 func (t *RecycleTable) Pop() ([]byte, bool) {
 	t.mu.Lock()
@@ -112,9 +163,9 @@ func (t *RecycleTable) Push(locationBytes []byte) error {
 	return err
 }
 
-///
-/// --- PairTable (TreeTable Node) ---
-///
+// /
+// / --- PairTable (TreeTable Node) ---
+// /
 type PairTable struct {
 	file *os.File
 	mu   sync.RWMutex
@@ -154,11 +205,17 @@ func (t *PairTable) IsEmpty() (bool, error) {
 
 	// Leggiamo l'intero file in un buffer per efficienza
 	info, err := t.file.Stat()
-	if err != nil { return false, err }
-	if info.Size() == 0 { return true, nil }
+	if err != nil {
+		return false, err
+	}
+	if info.Size() == 0 {
+		return true, nil
+	}
 
 	buffer := make([]byte, info.Size())
-	if _, err := t.file.ReadAt(buffer, 0); err != nil { return false, err }
+	if _, err := t.file.ReadAt(buffer, 0); err != nil {
+		return false, err
+	}
 
 	for i := 0; i < len(buffer); i += PairEntrySize {
 		// Il primo byte di ogni entry è il flag
