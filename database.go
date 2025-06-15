@@ -261,6 +261,3 @@ func (db *Database) deletePairTable(tableID uint32) error {
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
 	return os.Remove(path)
 }
-
-// Qui seguono le implementazioni complete dei comandi CRUD...
-// (le implementazioni complete sono nel file `commands.go` separato per chiarezza)
