@@ -99,6 +99,7 @@ func (db *Database) getValuesTable(size uint8, tableID uint32) (*ValuesTable, er
 	return newTable, nil
 }
 
+// todo: unificate getValuesTable and getRecycleTable
 func (db *Database) getRecycleTable(size uint8) (*RecycleTable, error) {
 	key := size
 	if table, ok := db.recycleTables.Load(key); ok {
