@@ -28,7 +28,7 @@ func (s *TCPServer) Start() error {
 		return err
 	}
 	defer listener.Close()
-	log.Printf("CheetahDB TCP server listening on %s", s.listenAddr)
+	logInfof("CheetahDB TCP server listening on %s", s.listenAddr)
 
 	for {
 		conn, err := listener.Accept()
@@ -41,10 +41,10 @@ func (s *TCPServer) Start() error {
 }
 
 func (s *TCPServer) handleConnection(conn net.Conn) {
-	log.Printf("INFO: New connection from %s", conn.RemoteAddr())
+	logInfof("New connection from %s", conn.RemoteAddr())
 	defer conn.Close()
 
-	currentDB, err := s.engine.GetDatabase(DefaultDbName)
+	currentDB, err := s.engine.GetDatabase(s.engine.DefaultDatabaseName())
 	if err != nil {
 		io.WriteString(conn, "ERROR,failed_to_load_default_db\n")
 		return
@@ -56,7 +56,7 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("ERROR: Reading from %s: %v", conn.RemoteAddr(), err)
+				logErrorf("Reading from %s: %v", conn.RemoteAddr(), err)
 			}
 			break
 		}
@@ -68,16 +68,54 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 
 		var response string
 		parts := strings.SplitN(line, " ", 2)
-		if strings.ToUpper(parts[0]) == "DATABASE" && len(parts) > 1 {
-			dbName := strings.TrimSpace(parts[1])
-			newDB, errDb := s.engine.GetDatabase(dbName)
+		command := strings.ToUpper(parts[0])
+		switch command {
+		case "DATABASE":
+			if len(parts) < 2 {
+				response = "ERROR,missing_database_name"
+				break
+			}
+			target, overrides, parseErr := parseDatabaseTarget(parts[1])
+			if parseErr != nil {
+				response = fmt.Sprintf("ERROR,%v", parseErr)
+				break
+			}
+			if overrides != nil {
+				s.engine.SetDatabaseOverrides(target, *overrides)
+			}
+			newDB, errDb := s.engine.GetDatabase(target)
 			if errDb != nil {
 				response = fmt.Sprintf("ERROR,cannot_load_db:%v", errDb)
 			} else {
 				currentDB = newDB
-				response = fmt.Sprintf("SUCCESS,database_changed_to_%s", dbName)
+				response = fmt.Sprintf("SUCCESS,database_changed_to_%s", target)
 			}
-		} else {
+		case "RESET_DB":
+			target := currentDB.Name()
+			var overrides *DatabaseOverrides
+			if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+				var parseErr error
+				target, overrides, parseErr = parseDatabaseTarget(parts[1])
+				if parseErr != nil {
+					response = fmt.Sprintf("ERROR,%v", parseErr)
+					break
+				}
+			}
+			if overrides != nil {
+				s.engine.SetDatabaseOverrides(target, *overrides)
+			}
+			if err := s.engine.ResetDatabase(target); err != nil {
+				response = fmt.Sprintf("ERROR,cannot_reset_db:%v", err)
+				break
+			}
+			newDB, errDb := s.engine.GetDatabase(target)
+			if errDb != nil {
+				response = fmt.Sprintf("ERROR,cannot_load_db:%v", errDb)
+			} else {
+				currentDB = newDB
+				response = fmt.Sprintf("SUCCESS,database_reset_to_%s", target)
+			}
+		default:
 			response, err = currentDB.ExecuteCommand(line)
 			if err != nil {
 				response = fmt.Sprintf("ERROR,internal_error:%v", err)
@@ -85,9 +123,9 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 		}
 
 		if _, err := io.WriteString(conn, response+"\n"); err != nil {
-			log.Printf("ERROR: Writing to %s: %v", conn.RemoteAddr(), err)
+			logErrorf("Writing to %s: %v", conn.RemoteAddr(), err)
 			break
 		}
 	}
-	log.Printf("INFO: Connection closed for %s", conn.RemoteAddr())
+	logInfof("Connection closed for %s", conn.RemoteAddr())
 }

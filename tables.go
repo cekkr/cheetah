@@ -4,8 +4,10 @@ package main
 import (
 	"encoding/binary"
 	"hash/fnv"
+	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 //const KeyStripeCount = 1024 // in types.go
@@ -167,47 +169,44 @@ func (t *RecycleTable) Push(locationBytes []byte) error {
 // / --- PairTable (TreeTable Node) ---
 // /
 type PairTable struct {
-	file *os.File
+	id   uint32
+	path string
+	file *ManagedFile
 	mu   sync.RWMutex
+	span int
 }
 
-func NewPairTable(path string) (*PairTable, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+func NewPairTable(manager *FileManager, tableID uint32, path string, branchCount int) (*PairTable, error) {
+	prealloc := int64(branchCount) * int64(PairEntrySize)
+	opts := ManagedFileOptions{
+		PreallocateSize:  prealloc,
+		CacheEnabled:     true,
+		FlushInterval:    25 * time.Millisecond,
+		SectorSize:       defaultSectorSize,
+		MaxCachedSectors: 128,
+	}
+	file, err := NewManagedFile(manager, path, opts)
 	if err != nil {
 		return nil, err
 	}
-
-	// Pre-alloca il file alla dimensione corretta se è nuovo
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-	if info.Size() == 0 {
-		if err := file.Truncate(int64(PairTablePreallocatedSize)); err != nil {
-			file.Close()
-			return nil, err
-		}
-	}
-
-	return &PairTable{file: file}, nil
+	return &PairTable{id: tableID, path: path, file: file, span: branchCount}, nil
 }
 
-func (t *PairTable) ReadEntry(branchByte byte) ([]byte, error) {
+func (t *PairTable) ReadEntry(branchIndex uint32) ([]byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	entry := make([]byte, PairEntrySize)
-	offset := int64(branchByte) * int64(PairEntrySize)
+	offset := int64(branchIndex) * int64(PairEntrySize)
 	_, err := t.file.ReadAt(entry, offset)
 	return entry, err
 }
 
-func (t *PairTable) WriteEntry(branchByte byte, entry []byte) error {
+func (t *PairTable) WriteEntry(branchIndex uint32, entry []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	offset := int64(branchByte) * int64(PairEntrySize)
+	offset := int64(branchIndex) * int64(PairEntrySize)
 	_, err := t.file.WriteAt(entry, offset)
 	return err
 }
@@ -217,9 +216,11 @@ func (t *PairTable) IsEmpty() (bool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	// Leggiamo l'intero file in un buffer per efficienza
-	info, err := t.file.Stat()
+	info, err := os.Stat(t.path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
 		return false, err
 	}
 	if info.Size() == 0 {
@@ -227,71 +228,48 @@ func (t *PairTable) IsEmpty() (bool, error) {
 	}
 
 	buffer := make([]byte, info.Size())
-	if _, err := t.file.ReadAt(buffer, 0); err != nil {
+	if _, err := t.file.ReadAt(buffer, 0); err != nil && err != io.EOF {
 		return false, err
 	}
 
 	for i := 0; i < len(buffer); i += PairEntrySize {
-		// Il primo byte di ogni entry è il flag
 		if buffer[i] != 0 {
-			return false, nil // Se un flag è settato, non è vuoto
+			return false, nil
 		}
 	}
 	return true, nil
 }
 
 func (t *PairTable) Close() {
-	t.file.Close()
+	if t.file != nil {
+		t.file.Close()
+	}
 }
 
-// Analyze scansiona tutte le 256 entrate di un nodo per determinarne lo stato.
-// Restituisce:
-// - isTerminal: se il nodo stesso rappresenta la fine di una chiave. (Non applicabile in questo modello, ma utile per future estensioni)
-// - childCount: il numero di puntatori/chiavi non vuoti.
-// - singleChildByte: se childCount è 1, questo è il byte del singolo figlio.
-// - singleChildEntry: se childCount è 1, questa è l'intera entrata del figlio.
-func (t *PairTable) Analyze() (isTerminal bool, childCount int, singleChildByte byte, singleChildEntry []byte, err error) {
-	t.mu.RLock() // Basta un read lock per analizzare
+// Snapshot returns a full copy of the current table state so callers can scan without holding locks.
+func (t *PairTable) Snapshot() ([]byte, error) {
+	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	info, err := t.file.Stat()
-	if err != nil {
-		return false, 0, 0, nil, err
+	size := int64(t.span) * int64(PairEntrySize)
+	buf := make([]byte, size)
+	if _, err := t.file.ReadAt(buf, 0); err != nil && err != io.EOF {
+		return nil, err
 	}
-	if info.Size() == 0 {
-		return false, 0, 0, nil, nil
-	}
-
-	buffer := make([]byte, info.Size())
-	if _, errRead := t.file.ReadAt(buffer, 0); errRead != nil {
-		return false, 0, 0, nil, errRead
-	}
-
-	singleChildEntry = make([]byte, PairEntrySize)
-
-	for i := 0; i < len(buffer); i += PairEntrySize {
-		entry := buffer[i : i+PairEntrySize]
-		// Il primo byte di ogni entrata è la lunghezza/flag
-		if entry[0] != 0 {
-			childCount++
-			singleChildByte = byte(i / PairEntrySize)
-			copy(singleChildEntry, entry)
-		}
-	}
-
-	// Se il conteggio non è 1, azzeriamo i risultati del figlio singolo
-	if childCount != 1 {
-		singleChildEntry = nil
-		singleChildByte = 0
-	}
-
-	return false, childCount, singleChildByte, singleChildEntry, nil
+	return buf, nil
 }
 
 // Path restituisce il percorso del file della tabella.
 func (t *PairTable) Path() string {
-	// Questo metodo è un po' un hack dato che la tabella non conosce il suo path.
-	// In un'implementazione reale, il path verrebbe passato o memorizzato.
-	// Per ora, lo lasciamo fuori, la logica di cancellazione costruirà il path.
-	return ""
+	return t.path
+}
+
+func (t *PairTable) BranchCount() int {
+	if t == nil {
+		return 0
+	}
+	if t.span <= 0 {
+		return 0
+	}
+	return t.span
 }
