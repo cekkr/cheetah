@@ -3,27 +3,43 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
+	"time"
 )
 
 type TCPServer struct {
 	listenAddr string
 	engine     *Engine
+	keepAlive  time.Duration
 }
 
-func NewTCPServer(listenAddr string, engine *Engine) *TCPServer {
+func NewTCPServer(listenAddr string, engine *Engine, keepAliveSeconds int) *TCPServer {
+	var keepAlive time.Duration
+	if keepAliveSeconds > 0 {
+		keepAlive = time.Duration(keepAliveSeconds) * time.Second
+	}
 	return &TCPServer{
 		listenAddr: listenAddr,
 		engine:     engine,
+		keepAlive:  keepAlive,
 	}
 }
 
 func (s *TCPServer) Start() error {
-	listener, err := net.Listen("tcp", s.listenAddr)
+	var listener net.Listener
+	var err error
+	if s.keepAlive > 0 {
+		var lc net.ListenConfig
+		lc.KeepAlive = s.keepAlive
+		listener, err = lc.Listen(context.Background(), "tcp", s.listenAddr)
+	} else {
+		listener, err = net.Listen("tcp", s.listenAddr)
+	}
 	if err != nil {
 		return err
 	}
@@ -41,6 +57,15 @@ func (s *TCPServer) Start() error {
 }
 
 func (s *TCPServer) handleConnection(conn net.Conn) {
+	if s.keepAlive > 0 {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			if err := tcpConn.SetKeepAlive(true); err != nil {
+				log.Printf("WARN: Unable to enable TCP keep-alive for %s: %v", conn.RemoteAddr(), err)
+			} else if err := tcpConn.SetKeepAlivePeriod(s.keepAlive); err != nil {
+				log.Printf("WARN: Unable to set TCP keep-alive period for %s: %v", conn.RemoteAddr(), err)
+			}
+		}
+	}
 	logInfof("New connection from %s", conn.RemoteAddr())
 	defer conn.Close()
 

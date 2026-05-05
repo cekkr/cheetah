@@ -90,6 +90,8 @@ Environment variables:
 - `CHEETAH_PAYLOAD_CACHE_ENTRIES` / `_MB` / `_BYTES` — cache tuning knobs.
 - `CHEETAH_LOG_LEVEL` — set to `3`/`debug` for level 3 traces (command ingress, reducer/trie steps).
 
+- `CHEETAH_PREDICT_DEEPEN` - set to `0` to disable context-matrix deepening in prediction tables (derived layers now scale with context diversity).
+
 Prefer declarative settings? Copy `config.example.ini` to `config.ini` (or point
 `CHEETAH_CONFIG_PATH` at a custom file) and edit:
 
@@ -111,9 +113,17 @@ INSERT:<size> <payload>         # create payload, returns abs key
 READ <abs_key>                  # fetch payload by key
 EDIT:<size> <abs_key> <payload> # overwrite payload in-place
 PAIR_SET <hex_prefix> <payload> # map trie prefix to payload key
-PAIR_SCAN <prefix> [limit]      # stream ordered namespace slices (cursors supported)
-PAIR_REDUCE <mode> <prefix>     # stream reducer payloads (counts/probabilities/etc.)
-PAIR_SUMMARY <prefix> [depth] [branch_limit]
+PAIR_SET_HIDDEN <hex_prefix> <payload>
+                                # map a hidden trie prefix to payload key
+PAIR_SCAN <prefix> [limit] [cursor] [include_hidden=1]
+                                # stream ordered namespace slices (cursors supported)
+PAIR_REDUCE <mode> <prefix> [limit] [cursor] [include_hidden=1]
+                                # stream reducer payloads (counts/probabilities/etc.)
+PAIR_REDUCE_ASYNC <mode> <prefix> [limit] [cursor]
+                                # enqueue reducer job and return a job identifier
+PAIR_REDUCE_STATUS <job_id>     # report reducer job progress/state
+PAIR_REDUCE_FETCH <job_id>      # fetch reducer results once completed (PENDING while running)
+PAIR_SUMMARY <prefix> [depth] [branch_limit] [include_hidden=1]
                                 # aggregate namespace statistics (payload totals, branch fan-out)
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry
@@ -125,13 +135,19 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
 - Prefix strings (`ctx:`, `ctxv:`, `prob:2`, etc.) are treated as raw bytes; encode binary prefixes
   as `x<HEX>`.
 - `PAIR_SCAN` replies include `items=<hex_prefix>:<abs_key>` pairs plus `next_cursor=<token>` when
-  additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue.
+  additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue. Add `include_hidden=1` to return hidden terminals.
 - `PAIR_REDUCE` includes inline base64 payloads so reducers can hydrate counters/probabilities
   without extra `READ` calls. Each response also includes `next_cursor` when more items exist.
+- `PAIR_REDUCE_ASYNC` is ideal for long-running reducers: it queues the request, returns a `job`
+  token immediately, and lets clients poll `PAIR_REDUCE_STATUS`/`PAIR_REDUCE_FETCH` to monitor
+  progress or stream the final payloads once the job completes.
+- `PAIR_REDUCE_FETCH` replies with `PENDING,...,progress=<percent>,completed=<n>,total=<n>` while a
+  job is still running so adapters can emit keep-alive logs; once the reducer finishes the response
+  mirrors the synchronous `PAIR_REDUCE` payload (including `next_cursor` when more pages remain).
 - `PAIR_SUMMARY` walks the trie beneath a namespace prefix, counts terminal entries, sums payload
   sizes (without hydrating the bytes), tracks min/max payloads and keys, and emits branch-level
   fan-out counts up to the requested depth. Use the optional `branch_limit` to cap the number of
-  branch digests returned (default: 32). This is the entry point for data-centric statistics—e.g.,
+  branch digests returned (default: 32) and `include_hidden=1` to count hidden terminals. This is the entry point for data-centric statistics—e.g.,
   estimating hot prefixes before launching GPU reducers or precomputing rolling hashes described in
   the tree-indexing section below.
 - `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`)
@@ -220,13 +236,27 @@ SUCCESS,key=1_deleted
     `AI_REFERENCE.md` (encode the JSON blob, then pass it as base64).
   - `PREDICT_QUERY key=<prefix> [keys=a,b,c] [ctx=<base64 json>] [windows=<base64 json>]
     [key_windows=<base64 json>] [merge=avg|sum|max] [table=name]` evaluates one or many prefixes and
-    merges their probability windows. `keys=` lets you query several prefixes at once, while
-    `key_windows=` accepts a base64 array of `{ "key": "<hex>", "windows": [[...], ...] }` objects for
-    per-prefix window overrides. Responses include the backend name (`cpu` or the simulated
-    `webgpu-simulated` merger).
-  - `PREDICT_TRAIN key=<prefix> target=<bytes> [ctx=<base64 json>] [lr=0.01] [table=name]` adjusts
-    stored weights via the forward/backward loop, and `PREDICT_CTX key=<prefix> ctx=<base64 json>
-    [mode=bias|scale] [strength=1] [table=name]` applies an immediate context bias without retraining.
+    merges their probability windows. `ctx` may be a base64-encoded JSON array (`[[...], ...]`) or an
+    object like `{"rows":[[...]],"weights":[...]}` where weights scale each row. `keys=` lets you
+    query several prefixes at once, while `key_windows=` accepts a base64 array of
+    `{ "key": "<hex>", "windows": [[...], ...] }` objects for per-prefix window overrides. Responses
+    include the backend name (`cpu` or the simulated `webgpu-simulated` merger).
+  - `PREDICT_TRAIN key=<prefix> target=<bytes> [ctx=<base64 json>] [lr=0.01] [table=name]
+    [negatives=<hex,...>]` adjusts stored weights via the forward/backward loop (optionally
+    down-weighting bad predictions listed in `negatives=`). The table now persists normalized window
+    hints from every training/adversarial context and blends them into queries automatically when no
+    `windows=` payload is supplied. `PREDICT_CTX key=<prefix> ctx=<base64 json> [mode=bias|scale]
+    [strength=1] [table=name]` applies an immediate context bias without retraining.
+  - `PREDICT_INHERIT key=<prefix> target=<bytes> sources=<hex,...> [merge=avg|sum|max] [table=name]`
+    merges existing prediction values into a new target (for example, to seed composite/merged
+    tokens with inherited context weights).
+  - `PREDICT_INHERIT_BATCH items=<base64 json> [key=<prefix>] [merge=avg|sum|max] [table=name]`
+    processes multiple inherit requests in one call. The JSON payload is an array of
+    `{ "key": "<hex>", "target": "<hex>", "sources": ["<hex>", ...], "merge": "avg" }` objects.
+  - `PREDICT_INHERIT_ASYNC items=<base64 json> [key=<prefix>] [merge=avg|sum|max] [table=name]`
+    queues a batch job and returns a `job` token for later polling.
+  - `PREDICT_INHERIT_STATUS <job_id>` reports job progress (merged/skipped/failed counts).
+  - `PREDICT_INHERIT_FETCH <job_id>` returns batch results once the job completes (or `PENDING` while running).
   - `PREDICT_BACKEND [mode=cpu|gpu] [table=name]` toggles the probability merger per table, and
     `PREDICT_BENCH samples=<n> window=<len> [table=name]` compares CPU vs accelerated merges on the
     current host.
@@ -255,13 +285,16 @@ SUCCESS,key=1_deleted
 
 - `PAIR_REDUCE counts ctx:` aggregates follower counts directly inside Go and emits the packed
   payloads inline, allowing MKNS-style reducers or other statistical aggregators to run without SQL.
-- Custom reducers can be registered in Go (see `commands.go`). Each reducer receives the pair-trie
-  iterator and can emit any payload format; clients decode the base64 payload per reducer contract.
+- Custom reducers can be registered in Go via the reducer registry (see `reducers.go`). Each reducer
+  receives the pair-trie iterator and can emit any payload format; clients decode the base64 payload
+  per reducer contract.
 
 ## Operational Notes
 
 - Prefer `screen` or `tmux` for long-lived sessions. Launch commands with explicit timeouts (≤30 min
   unless otherwise justified) so stalled reducers cannot block future sessions.
+- TCP keep-alives are configurable via `[server] keepalive_seconds` (or `CHEETAH_TCP_KEEPALIVE_SECONDS`).
+  Increase this window for WAN clients so idle sockets survive long reducer sweeps; set to `0` to rely on OS defaults.
 - `CHEETAH_HEADLESS=1` disables the interactive CLI while keeping the TCP listener up. When running in
   WSL or remote shells, pair it with `screen -dmS cheetahdb ...` and monitor `screen -ls` /
   `screen -wipe` before rebuilding.

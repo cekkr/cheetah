@@ -17,15 +17,26 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   `DBSLM_BACKEND=cheetah-db`.
 - When `src/train.py --reset` talks to cheetah, it now shrinks `PAIR_SCAN` page sizes whenever a page
   stalls and raises the TCP idle-grace target to `max(DBSLM_CHEETAH_TIMEOUT_SECONDS * 180, 60)`
-  seconds. This avoids the `cheetah response timed out after 30.0s of inactivity` spam even when the
-  namespace is empty or the server sits on a slow disk; increase
-  `DBSLM_CHEETAH_TIMEOUT_SECONDS` further if remote cheetah instances still need more time.
+  seconds (override via `DBSLM_CHEETAH_IDLE_GRACE_SECONDS`, clamp via
+  `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS`). This avoids the
+  `cheetah response timed out after 30.0s of inactivity` spam even when the namespace is empty or the
+  server sits on a slow disk; increase the timeout/idle-grace env vars further if remote cheetah
+  instances still need more time.
+- `CHEETAH_TCP_KEEPALIVE_SECONDS` (or `[server] keepalive_seconds` inside `config.ini`) enables OS
+  TCP keep-alives so idle sockets stay healthy during slow reducers or context-probe batches. The
+  server now enables keep-alives both at the listener and per accepted connection when this is set.
 - When training/decoding from inside WSL but pointing at a cheetah server running on Windows, the
   hot-path adapter auto-retries the Windows bridge IP discovered via `/etc/resolv.conf` whenever the
   configured `DBSLM_CHEETAH_HOST` resolves to loopback. Override `DBSLM_CHEETAH_HOST` with the exact
   Windows/LAN address when cheetah lives elsewhere (container, remote host, etc.). If the server
   advertises `0.0.0.0:4455`, keep the client pointed at a *real* address (127.0.0.1, LAN IP, etc.);
   connecting to `0.0.0.0` is invalid, so the adapter now rewrites that case to loopback.
+- Native Windows builds now compile cleanly. `gofmt`/`go test ./...` work with `GOOS=windows`, the
+  pair-table cache falls back to the default limit when `RLIMIT_NOFILE` is unavailable, and the
+  resource monitor degrades gracefully without `/proc` (CPU/system/IO stats show as unsupported; Go
+  runtime mem stats are still reported). Use `go run .` or `bash build.sh` from Git Bash/WSL to
+  produce `cheetah-server.exe`; set `CHEETAH_HEADLESS=1` if you want a background server without the
+  interactive CLI.
 - `cheetah-db` now keeps a bounded payload cache inside `database.go`, keyed by
   `<value_size, table_id, entry_id>` so hot `READ`/`PAIR_REDUCE` loops remain in RAM instead of
   pounding the same `values_<size>_<tableID>.table` sectors. It defaults to 16k entries (~64 MB) and
@@ -38,6 +49,23 @@ Read and collect potential implementation to do in NEXT_STEPS.md
 - `CheetahHotPathAdapter` mirrors raw follower counts (`PAIR_REDUCE counts`) and decoder metadata so
   MKNS rebuilds and session-cache profiles can run entirely over TCP. `NGramStore.topk_hit_ratio()`
   exposes coverage so you can watch cheetah eventually serve ≥90% of decoder requests.
+- Heavy reducer workloads now use the asynchronous queue: `PAIR_REDUCE_ASYNC` enqueues the request,
+  `PAIR_REDUCE_STATUS` reports progress (percent + state), and `PAIR_REDUCE_FETCH` streams the final
+  payloads once the job completes. The Python adapter polls every few seconds (configurable via
+  `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS`) so sockets never sit idle, and `CHEETAH_REDUCE_ASYNC=0`
+  forces a legacy synchronous fallback when debugging. PENDING responses now include
+  `reducer=...`, `progress=...`, and `completed/total` counters so clients can surface live progress
+  indicators instead of appearing stalled.
+- `PAIR_SCAN`/`PAIR_REDUCE` paging is cursor-aware again: when a client supplies `next_cursor`, the
+  server skips entire subtrees that fall lexicographically below that cursor so the next reducer page
+  no longer re-walks millions of keys just to reach the next chunk. Iterating large namespaces is now
+  proportional to the number of rows returned, not the total namespace size.
+- `PAIR_REDUCE` dispatch now routes through a reducer registry (`reducers.go`) so new statistical
+  reducers can be added without editing the core command parser.
+- Pair trie terminals now support a hidden flag. Use `PAIR_SET_HIDDEN` to register hidden entries and
+  pass `include_hidden=1` to `PAIR_SCAN`, `PAIR_REDUCE`, or `PAIR_SUMMARY` when you need to surface
+  them; default scans/reducers ignore hidden rows so cache-only joins do not pollute namespace stats.
+- The adapter now retries failed `PAIR_SET` registrations and confirms success with `PAIR_GET` before raising a fatal error. Tweak `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over slow or noisy links.
 - Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
   cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,
   `probabilities`, and `continuations`, eliminating the extra `READ` hop per entry.
@@ -112,6 +140,11 @@ matrix.
   with the same tooling used for `values_*.table` (e.g., `PAIR_SUMMARY` forklifts, fork transfers).
   Key/value pairs stay contiguous, which keeps hot prediction shards cache-friendly and compatible
   with the fixed-byte assumptions elsewhere in the engine.
+- Prediction table writes now happen asynchronously: inserts/edits return once the in-memory payload
+  is stored, and a background worker flushes batches every `CHEETAH_PREDICT_FLUSH_MILLIS`
+  (defaults to 75 ms). The worker also drops negligible context-weight blobs automatically; tune the
+  cleanup threshold via `CHEETAH_PREDICT_PURGE_THRESHOLD` to keep early-cycle noise from bloating the
+  tables. Shutdown waits for the queue to drain so fork transfers still see durable snapshots.
 
 ### Prediction table contract
 
@@ -123,6 +156,11 @@ matrix.
   context vector of arbitrary length. Missing entries default to zero so sparse contexts are cheap.
 - Training/ingest MUST prune edges whose normalized probability stays below the configured
   `discard_below` threshold to avoid gigabytes of low-value weights during early learning.
+- `PREDICT_TRAIN` accepts an optional `negatives=` arg (comma-separated `x...` payloads) so callers
+  can down-weight bad predictions in the same step they reinforce the target. The server now
+  captures normalized window hints from every training/adversarial context and blends them into
+  `PREDICT_QUERY` when no windows are provided (or alongside caller-supplied windows) to surface
+  hidden context correlations automatically.
 
 ### Context matrix weighting
 
@@ -130,6 +168,11 @@ matrix.
   probabilities. Vectors apply in declaration order: parents never depend on the deeper optional
   arrays, but deeper arrays can fine-tune an already-biased probability when higher precision is
   needed.
+- cheetah-db deepens every context matrix with derived mean/variance/contrast/interaction layers
+  before training or querying prediction tables. The derived layers now scale automatically with
+  context diversity (variance + row count) so shallow/generic matrices stay light while richer
+  windows get more depth. Disable this expansion by setting `CHEETAH_PREDICT_DEEPEN=0` when comparing
+  against legacy behaviour.
 - The training loop runs forward/backward passes. Forward: collect per-window probabilities, fold in
   active context vectors, truncate to the requested byte span, then merge. Backward: adjust the
   stored weights so correlated byte sequences + contexts keep consistent probabilities, attaching
@@ -160,6 +203,11 @@ matrix.
   to control aggregation, and `table=<name>` whenever multiple prediction tables coexist.
 - `PREDICT_TRAIN key=<value> target=<result> [ctx=...] [lr=0.01]` runs the recursive update loop so
   contexts fine-tune weights without rewriting payloads.
+- `PREDICT_INHERIT key=<value> target=<result> sources=<hex,...> [merge=avg|sum|max]` merges existing
+  prediction values into a new target (useful for composite token inheritance without replaying full
+  training passes). `PREDICT_INHERIT_BATCH`/`PREDICT_INHERIT_ASYNC` accept base64 JSON batches plus
+  `PREDICT_INHERIT_STATUS`/`PREDICT_INHERIT_FETCH` to monitor jobs. Set
+  `CHEETAH_PREDICT_INHERIT_ASYNC=0` to force synchronous batches.
 - `PREDICT_BACKEND [cpu|gpu]` toggles between the CPU path and the simulated WebGPU merger
   (`CHEETAH_PREDICT_MERGER=gpu` sets the default). Acceleration fans out merges across CPU cores to
   mirror WebGPU behaviour until native bindings are available.
@@ -170,8 +218,44 @@ matrix.
   enabling online bias corrections during ingest/serving.
 
 Context matrices + window specs are passed as base64-encoded JSON arrays so CLI whitespace stays
-stable. The probability merger truncates vectors to the shared byte-span before aggregating and
-automatically normalizes outputs.
+stable. You can also send a JSON object payload (`{"rows":[...],"weights":[...]}`) to scale each row
+before the prediction table applies context weights. The probability merger truncates vectors to the
+shared byte-span before aggregating and automatically normalizes outputs.
+
+#### Python integration
+
+- `src/db_slm/adapters/cheetah.py` now exposes `predict_query()`/`predict_ctx()` helpers that wrap
+  the base64 payloads described above (`helpers.cheetah_cli.format_prediction_query()` renders the
+  replies for logs/tests). The adapter automatically populates `ctx=`, `windows=`, and
+  `key_windows=` arguments when Python passes raw float matrices.
+- `ContextWindowEmbeddingManager.context_matrix_for_text()` emits the per-window vectors plus
+  dimension-level summary/fusion layers, so prediction queries see a hidden-layer style context
+  matrix aligned with the configured context dimensions.
+- `src/train.py` accepts `--cheetah-context-probe "<text>"` (repeatable) plus
+  `--cheetah-predict-table`/`--cheetah-predict-key`. At startup the trainer builds a matrix from each
+  snippet (respecting `--context-dimensions`) and issues `PREDICT_QUERY` against the selected table
+  (defaults to `context_matrices` / `meta:context_dimension_embeddings`). Probe results are logged
+  before ingest begins, giving a quick snapshot of the active context-matrix weights.
+- Training now streams structured prompts into `token_predictions`. As each JSON record is staged we
+  assemble the dependency summary, derive a context matrix, `PREDICT_SET` the next-token entry (4-byte
+  ID payloads), and `PREDICT_TRAIN` the corresponding weights. `--cheetah-token-*` knobs gate the
+  learning rate, cap, and table/key; `--disable-cheetah-token-train` skips the cycle entirely.
+- When token merging is active, the trainer issues `PREDICT_INHERIT_BATCH`/`PREDICT_INHERIT_ASYNC`
+  for newly merged tokens so composite entries inherit the prediction weights of their component
+  tokens without replaying the full context training loop.
+- `Decoder` and `run.py` blend those predictions back into sampling. Every response computes a
+  matrix from the current conversation history, `PREDICT_QUERY` hits the configured table/key, and
+  the resulting probabilities mix into the Level 1 distribution using `--cheetah-token-weight`.
+- Evaluation probes can now stream these prediction queries automatically. Pass
+  `--cheetah-eval-predict` to `train.py` and every held-out sample (token thresholds + chunk holdouts)
+  will derive a context matrix from the configured source (`dependency`, `prompt`, `response`,
+  `generated`, or `context`) and log the resulting probabilities via `PREDICT_QUERY`. Adjust
+  `--cheetah-eval-predict-limit` to cap the number of entries per sample.
+- `run.py` mirrors the same behaviour: set `--cheetah-predict-log` to emit a prediction-table summary
+  after every prompt/response. The worker grabs either the conversation history, the framed prompt,
+  or the decoded response (`--cheetah-predict-source history|prompt|response`), builds the context
+  matrix, and attaches the formatted result to the CLI log stream so interactive debugging can lean
+  on the cheetah prediction tables.
 
 ### Indexing Defaults & Jump Nodes
 
@@ -192,6 +276,12 @@ automatically normalizes outputs.
   - `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` — 24 workers / 30 s (~64 ops/s aggregate).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164324.log` — 32 workers / 45 s (90→56 ops/s before the graceful drain, 1002 inserts, errors=0).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164803.log` — 24 workers / 30 s rerun (96→67 ops/s, pair scans present in every bucket).
+- Jump nodes now live in `pair_jumps/jumps.bin` with an `index.bin` offset table, eliminating the
+  millions-of-files inode blow-up. Legacy `.jump` files are still read and backfilled into the new
+  store, then unlinked. If you still see `no space left on device` for `pair_jumps/*.jump`, check
+  inode usage (`df -i` or `find cheetah_data/<db>/pair_jumps -maxdepth 1 -type f | wc -l`) and run
+  `RESET_DB <db>`/`PAIR_PURGE *` to clear old data or move the data dir to a filesystem with more
+  inodes. Using wider nodes (`pair_bytes=2`) can reduce jump creation on very large keys.
 - The pair-table cache now enforces a descriptor cap derived from `RLIMIT_NOFILE` (override via
   `CHEETAH_MAX_PAIR_TABLES`). Idle handles are closed and transparently re-opened when the trie node
   is touched again, so long-running ingests stop tripping `open ... next_id.dat: too many open files`

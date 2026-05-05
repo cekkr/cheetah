@@ -218,10 +218,20 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 	if len(value) == 0 {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
-	if err := db.setPairValue(value, absKey); err != nil {
+	if err := db.setPairValue(value, absKey, false); err != nil {
 		return "", err
 	}
 	return "SUCCESS,pair_set", nil
+}
+
+func (db *Database) PairSetHidden(value []byte, absKey uint64) (string, error) {
+	if len(value) == 0 {
+		return "ERROR,pair_value_cannot_be_empty", nil
+	}
+	if err := db.setPairValue(value, absKey, true); err != nil {
+		return "", err
+	}
+	return "SUCCESS,pair_set_hidden", nil
 }
 
 func (db *Database) PairGet(value []byte) (string, error) {
@@ -272,7 +282,7 @@ func (db *Database) PairPurge(prefix []byte, limit int) (int, error) {
 	var cursor []byte
 	totalRemoved := 0
 	for {
-		results, nextCursor, err := db.PairScan(prefix, limit, cursor)
+		results, nextCursor, err := db.PairScanWithOptions(prefix, limit, cursor, true)
 		if err != nil {
 			return totalRemoved, err
 		}

@@ -19,3 +19,21 @@ Remember a standolone implementation, but while studying new ideal Cheetah's alg
 
 ### Last things
 - Implement in lmdb python code src/ the new Cheetah DB's prediction-tables and context-matrix features and queries 
+
+### Remember during implementation:
+Next step: exercise python src/train.py ... --cheetah-context-probe "<sample text>" against a running cheetah server to verify prediction tables respond as expected.
+
+Update: `src/train.py` now mirrors JSON prompts/responses into cheetah's `token_predictions` table
+automatically. Each chunk seeds unseen token IDs via `PREDICT_SET`, applies `PREDICT_TRAIN` with the
+context matrix derived from the prompt/dependency summary, and the decoder blends those results back
+into inference via the new `--cheetah-token-*` knobs. Use `--disable-cheetah-token-train` when you
+need to skip the hot-path updates.
+Update: `ContextWindowEmbeddingManager.context_matrix_for_text()` now appends dimension-level
+summary/fusion vectors (a hidden-layer style projection) so prediction-table contexts differ from
+the initial raw-window baseline while still honoring the configured context dimensions.
+
+### Where Cheetah's command tree/context are implemented:
+Cheetah context/prediction tables are exercised only for inspection right now. src/train.py (lines 567-614) implements _probe_context_predictions(), which builds MiniLM-derived context matrices via ContextWindowEmbeddingManager and calls hot_path.predict_query() for any --cheetah-context-probe inputs. These probes log existing prediction-table entries but don’t mutate them, so there is no real-time PREDICT_SET/PREDICT_TRAIN occurring during ingest.
+Evaluation uses the same infrastructure purely for telemetry. If you enable --cheetah-eval-predict, _build_eval_prediction_probe() (src/train.py (lines 617-642)) instantiates ContextProbabilityProbe (src/db_slm/evaluation.py (lines 88-172)). run_inference_records() then calls ContextProbabilityProbe.probe() per sample (src/db_slm/evaluation.py:824-907, 928-934), logging the prediction-table output derived from dependency layers/prompt text. Again, this is read-only; the evaluator never issues PREDICT_SET or PREDICT_TRAIN.
+The only writer into prediction tables today is ContextWindowEmbeddingManager.flush() (src/db_slm/context_window_embeddings.py (lines 398-434)): when context prototypes update, it invokes hot_path.refresh_context_predictions() (backed by predict_set + predict_ctx in src/db_slm/adapters/cheetah.py (lines 1322-1359)) to keep the context_matrices table aligned with metadata. No other part of train.py feeds cheetah prediction tables “in real time.”
+Because of that, “context dependency commands” (see helpers/cheetah_cli.format_prediction_query() usage and CLI flags documented in README.md (lines 376-398) and cheetah-db/AI_REFERENCE.md (lines 178-197)) currently surface prediction tables during eval and run.py sessions, but the actual training of those tables is still a TODO noted in cheetah-db/NEXT_STEPS.md (“Integrate prediction-table updates into ingest/train loops”).

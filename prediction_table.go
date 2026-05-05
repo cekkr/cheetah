@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,8 +24,14 @@ var errPredictionEntryNotFound = errors.New("prediction_entry_not_found")
 type ContextMatrix [][]float64
 
 const (
-	predictionFileMagic   = "CHPREDTB"
-	predictionFileVersion = uint16(1)
+	predictionFileMagic          = "CHPREDTB"
+	predictionFileVersion        = uint16(1)
+	defaultPredictFlushMillis    = 75
+	minPredictFlushMillis        = 10
+	defaultPredictPurgeThreshold = 1e-4
+	maxWindowHintSize            = 32
+	windowHintBlendWeight        = 0.35
+	maxPredictionScoreMagnitude  = 24.0
 )
 
 // PredictionValue stores the base probability and context weights for a result.
@@ -64,19 +71,58 @@ type PredictionTable struct {
 	tableName string
 	merger    ProbabilityMerger
 	closed    bool
+	dirty     bool
+	dirtyAll  bool
+	dirtyKeys map[string]struct{}
+
+	persistDelay   time.Duration
+	purgeThreshold float64
+	flushStop      chan struct{}
+	flushWG        sync.WaitGroup
+}
+
+func predictFlushInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CHEETAH_PREDICT_FLUSH_MILLIS"))
+	if raw == "" {
+		return time.Duration(defaultPredictFlushMillis) * time.Millisecond
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return time.Duration(defaultPredictFlushMillis) * time.Millisecond
+	}
+	if value < minPredictFlushMillis {
+		value = minPredictFlushMillis
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func predictPurgeThreshold() float64 {
+	raw := strings.TrimSpace(os.Getenv("CHEETAH_PREDICT_PURGE_THRESHOLD"))
+	if raw == "" {
+		return defaultPredictPurgeThreshold
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value <= 0 {
+		return defaultPredictPurgeThreshold
+	}
+	return value
 }
 
 func newPredictionTable(path string, legacyPath string, tableName string) (*PredictionTable, error) {
 	p := &PredictionTable{
-		path:      path,
-		legacy:    legacyPath,
-		tableName: tableName,
-		entries:   make(map[string]*PredictionEntry),
-		merger:    selectProbabilityMerger(""),
+		path:           path,
+		legacy:         legacyPath,
+		tableName:      tableName,
+		entries:        make(map[string]*PredictionEntry),
+		merger:         selectProbabilityMerger(""),
+		persistDelay:   predictFlushInterval(),
+		purgeThreshold: predictPurgeThreshold(),
+		flushStop:      make(chan struct{}),
 	}
 	if err := p.load(); err != nil {
 		return nil, err
 	}
+	p.startFlushWorker()
 	return p, nil
 }
 
@@ -350,12 +396,123 @@ func (p *PredictionTable) persistLocked() error {
 
 func (p *PredictionTable) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 	p.closed = true
+	p.mu.Unlock()
+	close(p.flushStop)
+	p.flushWG.Wait()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.dirty {
+		return nil
+	}
 	return p.persistLocked()
+}
+
+func (p *PredictionTable) startFlushWorker() {
+	if p.persistDelay <= 0 {
+		p.persistDelay = time.Duration(defaultPredictFlushMillis) * time.Millisecond
+	}
+	p.flushWG.Add(1)
+	go p.flushLoop()
+}
+
+func (p *PredictionTable) flushLoop() {
+	defer p.flushWG.Done()
+	ticker := time.NewTicker(p.persistDelay)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.flushStop:
+			p.flushDirty(true)
+			return
+		case <-ticker.C:
+			p.flushDirty(false)
+		}
+	}
+}
+
+func (p *PredictionTable) markDirtyLocked(key string) {
+	p.dirty = true
+	if key == "" {
+		p.dirtyAll = true
+		p.dirtyKeys = nil
+	} else if !p.dirtyAll {
+		if p.dirtyKeys == nil {
+			p.dirtyKeys = make(map[string]struct{})
+		}
+		p.dirtyKeys[key] = struct{}{}
+	}
+}
+
+func (p *PredictionTable) flushDirty(force bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !force && (!p.dirty || p.closed) {
+		return
+	}
+	if p.purgeThreshold > 0 {
+		p.pruneDirtyEntriesLocked()
+	}
+	if err := p.persistLocked(); err != nil {
+		logErrorf("prediction table %s flush failed: %v", p.tableName, err)
+		return
+	}
+	p.dirty = false
+	p.dirtyAll = false
+	p.dirtyKeys = nil
+}
+
+func (p *PredictionTable) pruneDirtyEntriesLocked() {
+	if p.purgeThreshold <= 0 || len(p.entries) == 0 {
+		return
+	}
+	if p.dirtyAll || len(p.dirtyKeys) == 0 {
+		for _, entry := range p.entries {
+			pruneEntryContextWeights(entry, p.purgeThreshold)
+		}
+		return
+	}
+	for key := range p.dirtyKeys {
+		if entry, ok := p.entries[key]; ok {
+			pruneEntryContextWeights(entry, p.purgeThreshold)
+		}
+	}
+}
+
+func pruneEntryContextWeights(entry *PredictionEntry, threshold float64) {
+	if entry == nil || len(entry.Values) == 0 || threshold <= 0 {
+		return
+	}
+	for idx := range entry.Values {
+		weights := entry.Values[idx].ContextWeights
+		if len(weights) == 0 {
+			continue
+		}
+		kept := make([]ContextWeight, 0, len(weights))
+		for _, weight := range weights {
+			if contextWeightMagnitude(weight) < threshold {
+				continue
+			}
+			kept = append(kept, weight)
+		}
+		if len(kept) == len(weights) {
+			entry.Values[idx].ContextWeights = weights
+			continue
+		}
+		entry.Values[idx].ContextWeights = kept
+	}
+}
+
+func contextWeightMagnitude(weight ContextWeight) float64 {
+	total := math.Abs(weight.Bias)
+	for _, value := range weight.Vector {
+		total += math.Abs(value)
+	}
+	return total
 }
 
 func (p *PredictionTable) ensureEntry(key string) *PredictionEntry {
@@ -408,7 +565,8 @@ func (p *PredictionTable) ImportEntries(entries []PredictionEntry) error {
 		cloned.UpdatedAt = time.Now().UTC()
 		p.entries[cloned.Key] = cloned
 	}
-	return p.persistLocked()
+	p.markDirtyLocked("")
+	return nil
 }
 
 func (p *PredictionTable) SetPrediction(key []byte, value []byte, baseProb float64, weights []ContextWeight) (PredictionEntry, error) {
@@ -436,33 +594,187 @@ func (p *PredictionTable) SetPrediction(key []byte, value []byte, baseProb float
 		})
 	}
 	entry.UpdatedAt = time.Now().UTC()
-	if err := p.persistLocked(); err != nil {
-		return *entry, err
-	}
+	p.markDirtyLocked(entry.Key)
 	return *entry, nil
 }
 
+func (p *PredictionTable) InheritValue(
+	key []byte,
+	target []byte,
+	sources [][]byte,
+	mode string,
+) (PredictionEntry, int, error) {
+	if len(sources) == 0 {
+		return PredictionEntry{}, 0, fmt.Errorf("inherit_requires_sources")
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "avg"
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.entries[encodeKey(key)]
+	if !ok || len(entry.Values) == 0 {
+		return PredictionEntry{}, 0, errPredictionEntryNotFound
+	}
+	valueMap := make(map[string]PredictionValue, len(entry.Values))
+	for _, value := range entry.Values {
+		valueMap[value.Value] = value
+	}
+	type weightAgg struct {
+		sum    []float64
+		bias   float64
+		weight float64
+	}
+	weightsByDepth := make(map[int]*weightAgg)
+	scoreSum := 0.0
+	scoreMax := 0.0
+	used := 0
+	for _, source := range sources {
+		encoded := encodeKey(source)
+		src, ok := valueMap[encoded]
+		if !ok {
+			continue
+		}
+		score := src.BaseProbability
+		if used == 0 || score > scoreMax {
+			scoreMax = score
+		}
+		scoreSum += score
+		used++
+		weight := sigmoid(score)
+		if weight <= 0 {
+			continue
+		}
+		for _, ctxWeight := range src.ContextWeights {
+			agg := weightsByDepth[ctxWeight.Depth]
+			if agg == nil {
+				agg = &weightAgg{}
+				weightsByDepth[ctxWeight.Depth] = agg
+			}
+			if len(ctxWeight.Vector) > len(agg.sum) {
+				agg.sum = append(agg.sum, make([]float64, len(ctxWeight.Vector)-len(agg.sum))...)
+			}
+			for i := 0; i < len(ctxWeight.Vector); i++ {
+				agg.sum[i] += ctxWeight.Vector[i] * weight
+			}
+			agg.bias += ctxWeight.Bias * weight
+			agg.weight += weight
+		}
+	}
+	if used == 0 {
+		return PredictionEntry{}, 0, fmt.Errorf("inherit_sources_missing")
+	}
+	mergedScore := scoreSum / float64(used)
+	switch mode {
+	case "max":
+		mergedScore = scoreMax
+	case "sum":
+		mergedScore = scoreSum
+	}
+	mergedScore = clampScore(mergedScore)
+	mergedWeights := make([]ContextWeight, 0, len(weightsByDepth))
+	depths := make([]int, 0, len(weightsByDepth))
+	for depth := range weightsByDepth {
+		depths = append(depths, depth)
+	}
+	sort.Ints(depths)
+	for _, depth := range depths {
+		agg := weightsByDepth[depth]
+		if agg == nil || agg.weight <= 0 {
+			continue
+		}
+		vector := make([]float64, len(agg.sum))
+		for i := range agg.sum {
+			vector[i] = agg.sum[i] / agg.weight
+		}
+		mergedWeights = append(mergedWeights, ContextWeight{
+			Depth:  depth,
+			Vector: vector,
+			Bias:   agg.bias / agg.weight,
+		})
+	}
+	encodedTarget := encodeKey(target)
+	found := false
+	for idx := range entry.Values {
+		if entry.Values[idx].Value == encodedTarget {
+			entry.Values[idx].BaseProbability = mergedScore
+			entry.Values[idx].ContextWeights = mergedWeights
+			entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
+			found = true
+			break
+		}
+	}
+	if !found {
+		entry.Values = append(entry.Values, PredictionValue{
+			Value:            encodedTarget,
+			BaseProbability:  mergedScore,
+			ContextWeights:   mergedWeights,
+			LastUpdatedEpoch: time.Now().Unix(),
+		})
+	}
+	entry.UpdatedAt = time.Now().UTC()
+	p.markDirtyLocked(entry.Key)
+	return *entry, used, nil
+}
+
 func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]float64) ([]PredictionResult, error) {
+	deepCtx := deepenContextMatrix(ctx)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	entry, ok := p.entries[encodeKey(key)]
 	if !ok {
 		return nil, errPredictionEntryNotFound
 	}
+	if len(entry.Values) == 0 {
+		return nil, errPredictionEntryNotFound
+	}
+	effectiveWindows := windows
+	if len(entry.WindowHints) > 0 {
+		capacity := len(windows) + len(entry.WindowHints)
+		combined := make([][]float64, 0, capacity)
+		if len(windows) > 0 {
+			combined = append(combined, windows...)
+		}
+		combined = append(combined, entry.WindowHints...)
+		effectiveWindows = combined
+	}
 	results := make([]PredictionResult, 0, len(entry.Values))
-	windowMerge := p.merger.Merge(windows)
+	windowMerge := p.merger.Merge(effectiveWindows)
+	// Treat stored BaseProbability as a score/logit. Convert to a normalized distribution
+	// via softmax so one runaway entry cannot collapse all predictions.
+	scores := make([]float64, 0, len(entry.Values))
 	for _, value := range entry.Values {
 		decoded, err := base64.StdEncoding.DecodeString(value.Value)
 		if err != nil {
 			continue
 		}
 		score := value.BaseProbability
-		score += applyContextWeights(ctx, value.ContextWeights)
+		score += applyContextWeights(deepCtx, value.ContextWeights)
 		score += mergeProbabilityWeight(windowMerge)
-		results = append(results, PredictionResult{
-			Value:       decoded,
-			Probability: clampProbability(score),
-		})
+		scores = append(scores, score)
+		results = append(results, PredictionResult{Value: decoded})
+	}
+	if len(results) == 0 {
+		return nil, errPredictionEntryNotFound
+	}
+	maxScore := scores[0]
+	for _, s := range scores[1:] {
+		if s > maxScore {
+			maxScore = s
+		}
+	}
+	var sumExp float64
+	for idx, s := range scores {
+		expVal := math.Exp(s - maxScore)
+		scores[idx] = expVal
+		sumExp += expVal
+	}
+	if sumExp <= 0 {
+		return nil, errPredictionEntryNotFound
+	}
+	for idx := range results {
+		results[idx].Probability = scores[idx] / sumExp
 	}
 	sortPredictionResults(results)
 	return results, nil
@@ -483,6 +795,310 @@ func applyContextWeights(ctx ContextMatrix, weights []ContextWeight) float64 {
 	return delta
 }
 
+func deepenContextMatrix(ctx ContextMatrix) ContextMatrix {
+	if !predictDeepenEnabled() || len(ctx) == 0 {
+		return ctx
+	}
+	rows := make(ContextMatrix, 0, len(ctx))
+	for _, row := range ctx {
+		if len(row) == 0 {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) < 2 {
+		return ctx
+	}
+	maxLen := contextMatrixMaxLen(rows)
+	if maxLen == 0 {
+		return ctx
+	}
+	meanAll := vectorMean(rows, maxLen)
+	varianceAll := vectorVariance(rows, meanAll, maxLen)
+	rmsAll := vectorRMS(rows, maxLen)
+	topMean, bottomMean := vectorMeanExtremes(rows, maxLen, 3)
+	contrast := vectorTanh(vectorSub(topMean, bottomMean))
+	interaction := vectorTanh(vectorMul(meanAll, contrast))
+	depthBlend := vectorTanh(vectorAdd(vectorAdd(meanAll, varianceAll), interaction))
+	depthScale := contextMatrixDepthScale(rows, varianceAll)
+	if depthScale <= 0 {
+		return ctx
+	}
+
+	expanded := make(ContextMatrix, 0, len(ctx)+6)
+	expanded = append(expanded, ctx...)
+	expanded = appendDerivedLayer(expanded, vectorScale(meanAll, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(varianceAll, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(rmsAll, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(contrast, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(interaction, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(depthBlend, depthScale))
+	return expanded
+}
+
+func predictDeepenEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("CHEETAH_PREDICT_DEEPEN"))
+	if raw == "" {
+		return true
+	}
+	switch strings.ToLower(raw) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func appendDerivedLayer(ctx ContextMatrix, layer []float64) ContextMatrix {
+	if len(layer) == 0 {
+		return ctx
+	}
+	return append(ctx, layer)
+}
+
+func contextMatrixMaxLen(ctx ContextMatrix) int {
+	maxLen := 0
+	for _, row := range ctx {
+		if len(row) > maxLen {
+			maxLen = len(row)
+		}
+	}
+	return maxLen
+}
+
+func vectorMean(rows ContextMatrix, maxLen int) []float64 {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil
+	}
+	mean := make([]float64, maxLen)
+	for _, row := range rows {
+		for idx, value := range row {
+			mean[idx] += value
+		}
+	}
+	denom := float64(len(rows))
+	if denom <= 0 {
+		return mean
+	}
+	for idx := range mean {
+		mean[idx] /= denom
+	}
+	return mean
+}
+
+func vectorVariance(rows ContextMatrix, mean []float64, maxLen int) []float64 {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil
+	}
+	variance := make([]float64, maxLen)
+	for _, row := range rows {
+		for idx, value := range row {
+			diff := value
+			if idx < len(mean) {
+				diff -= mean[idx]
+			}
+			variance[idx] += diff * diff
+		}
+	}
+	denom := float64(len(rows))
+	if denom <= 0 {
+		return variance
+	}
+	for idx := range variance {
+		variance[idx] /= denom
+	}
+	return variance
+}
+
+func vectorRMS(rows ContextMatrix, maxLen int) []float64 {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil
+	}
+	energy := make([]float64, maxLen)
+	for _, row := range rows {
+		for idx, value := range row {
+			energy[idx] += value * value
+		}
+	}
+	denom := float64(len(rows))
+	if denom <= 0 {
+		return energy
+	}
+	for idx := range energy {
+		energy[idx] = math.Sqrt(energy[idx] / denom)
+	}
+	return energy
+}
+
+func vectorMeanExtremes(rows ContextMatrix, maxLen int, k int) ([]float64, []float64) {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil, nil
+	}
+	if k <= 0 {
+		k = 1
+	}
+	maxK := len(rows) / 2
+	if maxK < 1 {
+		maxK = 1
+	}
+	if k > maxK {
+		k = maxK
+	}
+	type rowEnergy struct {
+		index  int
+		energy float64
+	}
+	energies := make([]rowEnergy, 0, len(rows))
+	for idx, row := range rows {
+		energies = append(energies, rowEnergy{
+			index:  idx,
+			energy: vectorEnergy(row),
+		})
+	}
+	sort.Slice(energies, func(i, j int) bool {
+		return energies[i].energy > energies[j].energy
+	})
+	topRows := make(ContextMatrix, 0, k)
+	bottomRows := make(ContextMatrix, 0, k)
+	for i := 0; i < k && i < len(energies); i++ {
+		topRows = append(topRows, rows[energies[i].index])
+		bottomIdx := len(energies) - 1 - i
+		if bottomIdx >= 0 && bottomIdx < len(energies) {
+			bottomRows = append(bottomRows, rows[energies[bottomIdx].index])
+		}
+	}
+	return vectorMean(topRows, maxLen), vectorMean(bottomRows, maxLen)
+}
+
+func vectorEnergy(row []float64) float64 {
+	if len(row) == 0 {
+		return 0
+	}
+	total := 0.0
+	for _, value := range row {
+		total += math.Abs(value)
+	}
+	return total / float64(len(row))
+}
+
+func vectorAdd(a, b []float64) []float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	size := len(a)
+	if len(b) > size {
+		size = len(b)
+	}
+	result := make([]float64, size)
+	for idx := 0; idx < size; idx++ {
+		if idx < len(a) {
+			result[idx] += a[idx]
+		}
+		if idx < len(b) {
+			result[idx] += b[idx]
+		}
+	}
+	return result
+}
+
+func vectorSub(a, b []float64) []float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	size := len(a)
+	if len(b) > size {
+		size = len(b)
+	}
+	result := make([]float64, size)
+	for idx := 0; idx < size; idx++ {
+		if idx < len(a) {
+			result[idx] += a[idx]
+		}
+		if idx < len(b) {
+			result[idx] -= b[idx]
+		}
+	}
+	return result
+}
+
+func vectorMul(a, b []float64) []float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	size := len(a)
+	if len(b) > size {
+		size = len(b)
+	}
+	result := make([]float64, size)
+	for idx := 0; idx < size; idx++ {
+		aVal := 0.0
+		bVal := 0.0
+		if idx < len(a) {
+			aVal = a[idx]
+		}
+		if idx < len(b) {
+			bVal = b[idx]
+		}
+		result[idx] = aVal * bVal
+	}
+	return result
+}
+
+func vectorTanh(values []float64) []float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]float64, len(values))
+	for idx, value := range values {
+		result[idx] = math.Tanh(value)
+	}
+	return result
+}
+
+func vectorScale(values []float64, scale float64) []float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	scaled := make([]float64, len(values))
+	for idx, value := range values {
+		scaled[idx] = value * scale
+	}
+	return scaled
+}
+
+func vectorMeanAbs(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	var total float64
+	for _, value := range values {
+		if value < 0 {
+			total -= value
+		} else {
+			total += value
+		}
+	}
+	return total / float64(len(values))
+}
+
+func contextMatrixDepthScale(rows ContextMatrix, variance []float64) float64 {
+	if len(rows) == 0 || len(variance) == 0 {
+		return 0
+	}
+	magnitude := vectorMeanAbs(variance)
+	if magnitude <= 0 {
+		return 0
+	}
+	scale := math.Tanh(magnitude * math.Log1p(float64(len(rows))))
+	if scale <= 0 {
+		return 0
+	}
+	if scale >= 1 {
+		return 1
+	}
+	return scale
+}
+
 func mergeProbabilityWeight(merged []float64) float64 {
 	if len(merged) == 0 {
 		return 0
@@ -494,33 +1110,130 @@ func mergeProbabilityWeight(merged []float64) float64 {
 	return sum / float64(len(merged))
 }
 
-// Train updates the weights by applying a very small gradient step.
-func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float64) (PredictionEntry, error) {
+func mergeWindowHints(existing [][]float64, ctx ContextMatrix) [][]float64 {
+	if len(ctx) == 0 {
+		return existing
+	}
+	target := existing
+	if target == nil {
+		target = make([][]float64, len(ctx))
+	}
+	if len(target) < len(ctx) {
+		target = append(target, make([][]float64, len(ctx)-len(target))...)
+	}
+	for idx, vector := range ctx {
+		hint := normalizeWindowHint(vector, maxWindowHintSize)
+		if len(hint) == 0 {
+			continue
+		}
+		if len(target[idx]) == 0 {
+			target[idx] = hint
+			continue
+		}
+		target[idx] = blendWindowHint(target[idx], hint, windowHintBlendWeight)
+	}
+	return target
+}
+
+func normalizeWindowHint(vector []float64, limit int) []float64 {
+	if len(vector) == 0 {
+		return nil
+	}
+	hint := vector
+	if limit > 0 && len(hint) > limit {
+		hint = hint[:limit]
+	}
+	normalized := append([]float64(nil), hint...)
+	var norm float64
+	for _, v := range normalized {
+		norm += v * v
+	}
+	if norm == 0 {
+		return normalized
+	}
+	scale := 1.0 / math.Sqrt(norm)
+	for i := range normalized {
+		normalized[i] *= scale
+	}
+	return normalized
+}
+
+func blendWindowHint(existing, incoming []float64, weight float64) []float64 {
+	if len(incoming) == 0 {
+		return existing
+	}
+	if len(existing) == 0 {
+		return append([]float64(nil), incoming...)
+	}
+	if weight <= 0 || weight >= 1 {
+		weight = windowHintBlendWeight
+	}
+	size := len(existing)
+	if len(incoming) > size {
+		size = len(incoming)
+	}
+	blended := make([]float64, size)
+	for i := 0; i < size; i++ {
+		base := 0.0
+		if i < len(existing) {
+			base = existing[i]
+		}
+		next := 0.0
+		if i < len(incoming) {
+			next = incoming[i]
+		}
+		blended[i] = (base * (1 - weight)) + (next * weight)
+	}
+	return blended
+}
+
+// Train updates the weights by applying a very small gradient step. Optional
+// negative targets receive an adversarial update to down-weight incorrect predictions.
+func (p *PredictionTable) Train(
+	key, target []byte,
+	ctx ContextMatrix,
+	lr float64,
+	negatives [][]byte,
+) (PredictionEntry, error) {
 	if lr <= 0 {
 		lr = 0.01
 	}
+	deepCtx := deepenContextMatrix(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	entry, ok := p.entries[encodeKey(key)]
 	if !ok {
 		return PredictionEntry{}, errPredictionEntryNotFound
 	}
-	targetEncoded := base64.StdEncoding.EncodeToString(target)
-	for idx := range entry.Values {
-		expected := -1.0
-		if entry.Values[idx].Value == targetEncoded {
-			expected = 1.0
+	entry.WindowHints = mergeWindowHints(entry.WindowHints, ctx)
+	targetEncoded := encodeKey(target)
+	idx := ensurePredictionValueIndex(entry, targetEncoded)
+	if idx < 0 {
+		return PredictionEntry{}, fmt.Errorf("invalid_prediction_target")
+	}
+	score := entry.Values[idx].BaseProbability + applyContextWeights(deepCtx, entry.Values[idx].ContextWeights)
+	pred := sigmoid(score)
+	err := 1.0 - pred
+	entry.Values[idx].BaseProbability = clampScore(entry.Values[idx].BaseProbability + lr*err)
+	entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, deepCtx, lr*err)
+	entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
+	adversarialValues := normalizeNegativeValues(negatives, targetEncoded)
+	if len(adversarialValues) > 0 {
+		for _, encodedValue := range adversarialValues {
+			negIdx := ensurePredictionValueIndex(entry, encodedValue)
+			if negIdx < 0 {
+				continue
+			}
+			negScore := entry.Values[negIdx].BaseProbability + applyContextWeights(deepCtx, entry.Values[negIdx].ContextWeights)
+			negPred := sigmoid(negScore)
+			delta := -negPred
+			entry.Values[negIdx].BaseProbability = clampScore(entry.Values[negIdx].BaseProbability + lr*delta)
+			entry.Values[negIdx].ContextWeights = adjustContextWeights(entry.Values[negIdx].ContextWeights, deepCtx, lr*delta)
+			entry.Values[negIdx].LastUpdatedEpoch = time.Now().Unix()
 		}
-		score := entry.Values[idx].BaseProbability + applyContextWeights(ctx, entry.Values[idx].ContextWeights)
-		err := expected - score
-		entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + lr*err)
-		entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, ctx, lr*err)
-		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	}
 	entry.UpdatedAt = time.Now().UTC()
-	if err := p.persistLocked(); err != nil {
-		return *entry, err
-	}
+	p.markDirtyLocked(entry.Key)
 	return *entry, nil
 }
 
@@ -532,6 +1245,7 @@ func (p *PredictionTable) ApplyContextAdjustment(key []byte, ctx ContextMatrix, 
 	if mode == "" {
 		mode = "bias"
 	}
+	deepCtx := deepenContextMatrix(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	entry, ok := p.entries[encodeKey(key)]
@@ -539,19 +1253,17 @@ func (p *PredictionTable) ApplyContextAdjustment(key []byte, ctx ContextMatrix, 
 		return PredictionEntry{}, errPredictionEntryNotFound
 	}
 	for idx := range entry.Values {
-		bias := applyContextWeights(ctx, entry.Values[idx].ContextWeights) * strength
+		bias := applyContextWeights(deepCtx, entry.Values[idx].ContextWeights) * strength
 		switch mode {
 		case "scale", "multiply":
-			entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability * (1 + bias))
+			entry.Values[idx].BaseProbability = entry.Values[idx].BaseProbability * (1 + bias)
 		default:
-			entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + bias)
+			entry.Values[idx].BaseProbability = entry.Values[idx].BaseProbability + bias
 		}
 		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	}
 	entry.UpdatedAt = time.Now().UTC()
-	if err := p.persistLocked(); err != nil {
-		return *entry, err
-	}
+	p.markDirtyLocked(entry.Key)
 	return *entry, nil
 }
 
@@ -584,6 +1296,60 @@ func adjustContextWeights(weights []ContextWeight, ctx ContextMatrix, delta floa
 	return weights
 }
 
+func ensurePredictionValueIndex(entry *PredictionEntry, encodedValue string) int {
+	if encodedValue == "" {
+		return -1
+	}
+	for idx := range entry.Values {
+		if entry.Values[idx].Value == encodedValue {
+			return idx
+		}
+	}
+	entry.Values = append(entry.Values, PredictionValue{
+		Value:            encodedValue,
+		BaseProbability:  0.05,
+		ContextWeights:   nil,
+		LastUpdatedEpoch: time.Now().Unix(),
+	})
+	return len(entry.Values) - 1
+}
+
+func normalizeNegativeValues(values [][]byte, skipEncoded string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	results := make([]string, 0, len(values))
+	for _, raw := range values {
+		if len(raw) == 0 {
+			continue
+		}
+		encoded := encodeKey(raw)
+		if encoded == "" || encoded == skipEncoded {
+			continue
+		}
+		if _, exists := seen[encoded]; exists {
+			continue
+		}
+		seen[encoded] = struct{}{}
+		results = append(results, encoded)
+	}
+	return results
+}
+
+func clampScore(value float64) float64 {
+	switch {
+	case math.IsNaN(value):
+		return 0
+	case value > maxPredictionScoreMagnitude:
+		return maxPredictionScoreMagnitude
+	case value < -maxPredictionScoreMagnitude:
+		return -maxPredictionScoreMagnitude
+	default:
+		return value
+	}
+}
+
 func sortPredictionResults(results []PredictionResult) {
 	if len(results) <= 1 {
 		return
@@ -608,6 +1374,16 @@ func clampProbability(value float64) float64 {
 	default:
 		return value
 	}
+}
+
+func sigmoid(x float64) float64 {
+	// Stable sigmoid to avoid overflow for large magnitudes.
+	if x >= 0 {
+		z := math.Exp(-x)
+		return 1 / (1 + z)
+	}
+	z := math.Exp(x)
+	return z / (1 + z)
 }
 
 func encodeKey(key []byte) string {
@@ -837,6 +1613,41 @@ func (p *PredictionTable) Benchmark(samples, vectorLen int) map[string]time.Dura
 	return BenchmarkMerger(samples, vectorLen)
 }
 
+type contextMatrixPayload struct {
+	Rows    ContextMatrix `json:"rows"`
+	Matrix  ContextMatrix `json:"matrix"`
+	Weights []float64     `json:"weights"`
+}
+
+func applyContextMatrixWeights(rows ContextMatrix, weights []float64) ContextMatrix {
+	if len(rows) == 0 || len(weights) == 0 {
+		return rows
+	}
+	limit := len(rows)
+	if len(weights) < limit {
+		limit = len(weights)
+	}
+	for idx := 0; idx < limit; idx++ {
+		weight := weights[idx]
+		if math.IsNaN(weight) || math.IsInf(weight, 0) {
+			continue
+		}
+		if weight < 0 {
+			weight = 0
+		} else if weight > 2 {
+			weight = 2
+		}
+		if weight == 1 {
+			continue
+		}
+		row := rows[idx]
+		for i := range row {
+			row[i] *= weight
+		}
+	}
+	return rows
+}
+
 func parseContextMatrixArg(raw string) (ContextMatrix, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
@@ -845,11 +1656,37 @@ func parseContextMatrixArg(raw string) (ContextMatrix, error) {
 	if err != nil {
 		return nil, err
 	}
-	var matrix ContextMatrix
-	if err := json.Unmarshal(data, &matrix); err != nil {
-		return nil, err
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, nil
 	}
-	return matrix, nil
+	switch trimmed[0] {
+	case '[':
+		var matrix ContextMatrix
+		if err := json.Unmarshal(trimmed, &matrix); err != nil {
+			return nil, err
+		}
+		return matrix, nil
+	case '{':
+		var payload contextMatrixPayload
+		if err := json.Unmarshal(trimmed, &payload); err != nil {
+			return nil, err
+		}
+		rows := payload.Rows
+		if len(rows) == 0 {
+			rows = payload.Matrix
+		}
+		if len(rows) == 0 {
+			return nil, nil
+		}
+		return applyContextMatrixWeights(rows, payload.Weights), nil
+	default:
+		var matrix ContextMatrix
+		if err := json.Unmarshal(trimmed, &matrix); err != nil {
+			return nil, err
+		}
+		return matrix, nil
+	}
 }
 
 func parseWindowMatrixArg(raw string) ([][]float64, error) {

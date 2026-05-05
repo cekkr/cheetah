@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -40,13 +41,14 @@ type ringNode struct {
 
 // ForkScheduler deterministically maps prefix forks across a hash ring.
 type ForkScheduler struct {
-	mu          sync.RWMutex
-	persistPath string
-	topology    ClusterTopology
-	ring        []ringNode
-	stats       map[string]uint64
-	overrides   map[string]string
-	samples     map[string][]byte
+	mu              sync.RWMutex
+	persistPath     string
+	topology        ClusterTopology
+	ring            []ringNode
+	stats           map[string]uint64
+	overrides       map[string]string
+	samples         map[string][]byte
+	trackStandalone bool
 }
 
 func newForkScheduler(dbPath string) *ForkScheduler {
@@ -57,9 +59,10 @@ func newForkScheduler(dbPath string) *ForkScheduler {
 			Version:           1,
 			ReplicationFactor: 1,
 		},
-		stats:     make(map[string]uint64),
-		overrides: make(map[string]string),
-		samples:   make(map[string][]byte),
+		stats:           make(map[string]uint64),
+		overrides:       make(map[string]string),
+		samples:         make(map[string][]byte),
+		trackStandalone: shouldTrackStandaloneForks(),
 	}
 	_ = fs.load()
 	fs.rebuildRingLocked()
@@ -152,17 +155,17 @@ func (fs *ForkScheduler) UpdateTopology(topo ClusterTopology) error {
 
 // AssignFork returns the node ordering for the provided prefix window.
 func (fs *ForkScheduler) AssignFork(prefix []byte) ForkAssignment {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	forkID := deriveForkID(prefix)
-	if len(prefix) > 0 {
-		fs.samples[forkID] = append([]byte{}, prefix...)
-	}
+	fs.mu.RLock()
+	shouldRecord := fs.trackStandalone || fs.hasRoutingEntriesLocked()
 	nodes := fs.walkRingLocked(prefix, fs.topology.ReplicationFactor)
 	if target, ok := fs.overrides[forkID]; ok && target != "" {
 		nodes = []string{target}
 	}
-	fs.stats[forkID]++
+	fs.mu.RUnlock()
+	if shouldRecord {
+		fs.recordForkObservation(forkID, prefix)
+	}
 	return ForkAssignment{
 		ForkID:  forkID,
 		NodeIDs: nodes,
@@ -269,4 +272,49 @@ func (fs *ForkScheduler) ObservedPrefix(forkID string) []byte {
 		return append([]byte{}, prefix...)
 	}
 	return nil
+}
+
+func (fs *ForkScheduler) recordForkObservation(forkID string, prefix []byte) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.stats == nil {
+		fs.stats = make(map[string]uint64)
+	}
+	fs.stats[forkID]++
+	if len(prefix) == 0 {
+		return
+	}
+	if fs.samples == nil {
+		fs.samples = make(map[string][]byte)
+	}
+	fs.samples[forkID] = append([]byte{}, prefix...)
+}
+
+func (fs *ForkScheduler) ObservingEnabled() bool {
+	if fs == nil {
+		return false
+	}
+	if fs.trackStandalone {
+		return true
+	}
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	return fs.hasRoutingEntriesLocked()
+}
+
+func (fs *ForkScheduler) hasRoutingEntriesLocked() bool {
+	return len(fs.ring) > 0 || len(fs.overrides) > 0
+}
+
+func shouldTrackStandaloneForks() bool {
+	raw := strings.TrimSpace(os.Getenv("CHEETAH_TRACK_STANDALONE_FORKS"))
+	if raw == "" {
+		return false
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

@@ -28,7 +28,7 @@ func main() {
 	defer engine.Close() // Assicura che tutti i DB siano chiusi all'uscita
 
 	// Avvia il server TCP in una goroutine separata
-	server := NewTCPServer(cfg.ListenAddr, engine)
+	server := NewTCPServer(cfg.ListenAddr, engine, cfg.TCPKeepAliveSeconds)
 	go func() {
 		if err := server.Start(); err != nil {
 			logErrorf("TCP Server failed: %v", err)

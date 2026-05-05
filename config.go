@@ -11,11 +11,12 @@ import (
 
 // Config describes server-wide settings loaded from config.ini/environment variables.
 type Config struct {
-	ListenAddr       string
-	DataDir          string
-	DefaultDatabase  string
-	MaxPairTables    int
-	DatabaseDefaults DatabaseConfig
+	ListenAddr          string
+	DataDir             string
+	DefaultDatabase     string
+	MaxPairTables       int
+	TCPKeepAliveSeconds int
+	DatabaseDefaults    DatabaseConfig
 }
 
 // DatabaseConfig holds concrete per-database tunables.
@@ -34,9 +35,10 @@ type DatabaseOverrides struct {
 
 func defaultConfig() Config {
 	return Config{
-		ListenAddr:      "0.0.0.0:4455",
-		DataDir:         "cheetah_data",
-		DefaultDatabase: "default",
+		ListenAddr:          "0.0.0.0:4455",
+		DataDir:             "cheetah_data",
+		DefaultDatabase:     "default",
+		TCPKeepAliveSeconds: 60,
 		DatabaseDefaults: DatabaseConfig{
 			PairIndexBytes:      1,
 			PayloadCacheEntries: defaultPayloadCacheEntries,
@@ -100,6 +102,8 @@ func assignConfigValue(section, key, val string, cfg *Config) {
 			if val != "" {
 				cfg.DefaultDatabase = val
 			}
+		case "keepalive_seconds", "tcp_keepalive_seconds":
+			cfg.TCPKeepAliveSeconds = parseIntAllowZero(val, cfg.TCPKeepAliveSeconds)
 		}
 	case "database":
 		switch key {
@@ -177,6 +181,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("CHEETAH_DEFAULT_DB")); v != "" {
 		cfg.DefaultDatabase = v
 	}
+	if v := parseIntAllowZero(os.Getenv("CHEETAH_TCP_KEEPALIVE_SECONDS"), cfg.TCPKeepAliveSeconds); v >= 0 {
+		cfg.TCPKeepAliveSeconds = v
+	}
 	if v := parsePositiveInt(os.Getenv("CHEETAH_PAIR_INDEX_BYTES")); v > 0 {
 		cfg.DatabaseDefaults.PairIndexBytes = v
 	}
@@ -220,6 +227,9 @@ func (cfg *Config) normalize() {
 	}
 	if cfg.MaxPairTables < 0 {
 		cfg.MaxPairTables = 0
+	}
+	if cfg.TCPKeepAliveSeconds < 0 {
+		cfg.TCPKeepAliveSeconds = 0
 	}
 }
 

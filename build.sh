@@ -15,9 +15,7 @@ SCRIPT_DIR=$(
 )
 cd "$SCRIPT_DIR"
 
-OUTPUT_NAME="cheetah-server.exe"
-GO_OS=${GOOS:-windows}
-GO_ARCH=${GOARCH:-amd64}
+OUTPUT_BASENAME="cheetah-server"
 CLEAN=0
 VERBOSE=0
 
@@ -70,8 +68,18 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
+HOST_GO_OS=$(go env GOOS)
+HOST_GO_ARCH=$(go env GOARCH)
+GO_OS=${GOOS:-$HOST_GO_OS}
+GO_ARCH=${GOARCH:-$HOST_GO_ARCH}
+
+OUTPUT_NAME="$OUTPUT_BASENAME"
+if [[ "$GO_OS" == "windows" ]]; then
+  OUTPUT_NAME="${OUTPUT_BASENAME}.exe"
+fi
+
 if [[ $CLEAN -eq 1 ]]; then
-  rm -f "$OUTPUT_NAME" "${OUTPUT_NAME%.exe}"
+  rm -f "$OUTPUT_BASENAME" "${OUTPUT_BASENAME}.exe"
 fi
 
 BUILD_CMD=(env GOOS="$GO_OS" GOARCH="$GO_ARCH" go build)

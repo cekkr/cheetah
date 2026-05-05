@@ -145,6 +145,9 @@ type FileManager struct {
 	policyStop    chan struct{}
 	policyWG      sync.WaitGroup
 	cachePressure atomic.Int32
+	limitCh       chan struct{}
+	limitStop     chan struct{}
+	limitWG       sync.WaitGroup
 }
 
 func NewFileManager(limit int, monitor *ResourceMonitor) *FileManager {
@@ -158,6 +161,7 @@ func NewFileManager(limit int, monitor *ResourceMonitor) *FileManager {
 	}
 	manager.startFlusher()
 	manager.startPolicyLoop()
+	manager.startLimiter()
 	return manager
 }
 
@@ -166,13 +170,29 @@ func (fm *FileManager) register(file *ManagedFile) {
 }
 
 func (fm *FileManager) handleOpened() {
+	if fm == nil {
+		return
+	}
 	fm.openHandles.Add(1)
-	fm.enforceLimit()
+	fm.requestLimitCheck()
 }
 
 func (fm *FileManager) handleClosed() {
 	if fm.openHandles.Load() > 0 {
 		fm.openHandles.Add(-1)
+	}
+}
+
+func (fm *FileManager) requestLimitCheck() {
+	if fm == nil || fm.limit <= 0 || fm.limitCh == nil {
+		return
+	}
+	if int(fm.openHandles.Load()) <= fm.limit {
+		return
+	}
+	select {
+	case fm.limitCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -203,6 +223,16 @@ func (fm *FileManager) startPolicyLoop() {
 	go fm.policyLoop(interval)
 }
 
+func (fm *FileManager) startLimiter() {
+	if fm == nil || fm.limit <= 0 {
+		return
+	}
+	fm.limitCh = make(chan struct{}, 1)
+	fm.limitStop = make(chan struct{})
+	fm.limitWG.Add(1)
+	go fm.limitLoop()
+}
+
 func (fm *FileManager) policyLoop(interval time.Duration) {
 	defer fm.policyWG.Done()
 	ticker := time.NewTicker(interval)
@@ -212,6 +242,18 @@ func (fm *FileManager) policyLoop(interval time.Duration) {
 		case now := <-ticker.C:
 			fm.applyGlobalPolicy(now)
 		case <-fm.policyStop:
+			return
+		}
+	}
+}
+
+func (fm *FileManager) limitLoop() {
+	defer fm.limitWG.Done()
+	for {
+		select {
+		case <-fm.limitCh:
+			fm.enforceLimit()
+		case <-fm.limitStop:
 			return
 		}
 	}
@@ -231,6 +273,7 @@ func (fm *FileManager) applyGlobalPolicy(now time.Time) {
 		file.applyCachePolicy(now, cfg, pressure)
 		return true
 	})
+	fm.releaseIdleHandles(now)
 }
 
 func (fm *FileManager) memoryPressureActive() bool {
@@ -250,6 +293,53 @@ func (fm *FileManager) memoryPressureActive() bool {
 		return false
 	}
 	return fm.cachePressure.Load() == 1
+}
+
+func (fm *FileManager) releaseIdleHandles(now time.Time) {
+	if fm == nil || fm.limit <= 0 {
+		return
+	}
+	idleTTL := fm.policy.idleTTL
+	if idleTTL <= 0 {
+		return
+	}
+	type candidate struct {
+		file *ManagedFile
+		last int64
+	}
+	var candidates []candidate
+	fm.files.Range(func(_, value interface{}) bool {
+		file, ok := value.(*ManagedFile)
+		if !ok || file == nil {
+			return true
+		}
+		last := file.lastUsed.Load()
+		if last == 0 {
+			return true
+		}
+		candidates = append(candidates, candidate{file: file, last: last})
+		return true
+	})
+	if len(candidates) == 0 {
+		return
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].last < candidates[j].last })
+	maxRelease := fm.limit / 8
+	if maxRelease <= 0 {
+		maxRelease = 1
+	}
+	if maxRelease > len(candidates) {
+		maxRelease = len(candidates)
+	}
+	released := 0
+	for _, cand := range candidates {
+		if released >= maxRelease {
+			break
+		}
+		if cand.file.closeHandleIfIdleSince(now, idleTTL) {
+			released++
+		}
+	}
 }
 
 func (fm *FileManager) policyConfig() cachePolicyConfig {
@@ -294,6 +384,10 @@ func (fm *FileManager) Close() {
 		DisableCache: true,
 		CloseHandles: true,
 	})
+	if fm.limitStop != nil {
+		close(fm.limitStop)
+	}
+	fm.limitWG.Wait()
 	if fm.policyStop != nil {
 		close(fm.policyStop)
 	}
@@ -357,8 +451,8 @@ func (fm *FileManager) ForceCheckpoint(opts FileCheckpointOptions) int {
 	if fm == nil {
 		return 0
 	}
-	now := time.Now().UnixNano()
-	var flushed int
+	now := time.Now()
+	var targets []*ManagedFile
 	fm.files.Range(func(_, value interface{}) bool {
 		file, ok := value.(*ManagedFile)
 		if !ok || file == nil {
@@ -366,22 +460,76 @@ func (fm *FileManager) ForceCheckpoint(opts FileCheckpointOptions) int {
 		}
 		if opts.IdleThreshold > 0 {
 			last := file.lastUsed.Load()
-			if last != 0 && now-last < opts.IdleThreshold.Nanoseconds() {
-				return true
+			if last != 0 {
+				if now.Sub(time.Unix(0, last)) < opts.IdleThreshold {
+					return true
+				}
 			}
 		}
-		if opts.DisableCache {
-			file.DisableCache()
-		} else {
-			file.Flush()
+		if fm.shouldCheckpointFile(file, opts) {
+			targets = append(targets, file)
 		}
-		if opts.CloseHandles {
-			file.forceCloseHandle()
-		}
-		flushed++
 		return true
 	})
-	return flushed
+	if len(targets) == 0 {
+		return 0
+	}
+	workers := fm.flushWorkers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	jobs := make(chan *ManagedFile, workers)
+	var processed atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for file := range jobs {
+				fm.checkpointFile(file, opts)
+				processed.Add(1)
+			}
+		}()
+	}
+	for _, file := range targets {
+		jobs <- file
+	}
+	close(jobs)
+	wg.Wait()
+	return int(processed.Load())
+}
+
+func (fm *FileManager) shouldCheckpointFile(file *ManagedFile, opts FileCheckpointOptions) bool {
+	if file == nil {
+		return false
+	}
+	if opts.DisableCache && file.cacheEnabled.Load() {
+		return true
+	}
+	if opts.CloseHandles {
+		return true
+	}
+	if file.cacheEnabled.Load() && file.hasPendingChanges() {
+		return true
+	}
+	return false
+}
+
+func (fm *FileManager) checkpointFile(file *ManagedFile, opts FileCheckpointOptions) {
+	if file == nil {
+		return
+	}
+	if opts.DisableCache {
+		file.DisableCache()
+	} else if file.cacheEnabled.Load() && file.hasPendingChanges() {
+		file.Flush()
+	}
+	if opts.CloseHandles {
+		file.forceCloseHandle()
+	}
 }
 
 type sectorEntry struct {
@@ -512,17 +660,7 @@ func (mf *ManagedFile) canCloseHandle() bool {
 }
 
 func (mf *ManagedFile) closeHandleIfIdle() bool {
-	mf.handleMu.Lock()
-	defer mf.handleMu.Unlock()
-	if mf.file == nil || mf.refCount.Load() > 0 {
-		return false
-	}
-	mf.file.Close()
-	mf.file = nil
-	if mf.manager != nil {
-		mf.manager.handleClosed()
-	}
-	return true
+	return mf.closeHandle(true)
 }
 
 func (mf *ManagedFile) forceCloseHandle() {
@@ -536,6 +674,73 @@ func (mf *ManagedFile) forceCloseHandle() {
 	if mf.manager != nil {
 		mf.manager.handleClosed()
 	}
+}
+
+func (mf *ManagedFile) closeHandle(force bool) bool {
+	if mf == nil {
+		return false
+	}
+	mf.handleMu.Lock()
+	defer mf.handleMu.Unlock()
+	if mf.file == nil || mf.refCount.Load() > 0 {
+		return false
+	}
+	if !force && mf.hasPendingChanges() {
+		return false
+	}
+	mf.file.Close()
+	mf.file = nil
+	if mf.manager != nil {
+		mf.manager.handleClosed()
+	}
+	return true
+}
+
+func (mf *ManagedFile) closeHandleIfIdleSince(now time.Time, idle time.Duration) bool {
+	if mf == nil || idle <= 0 {
+		return false
+	}
+	last := mf.lastUsed.Load()
+	if last == 0 {
+		return false
+	}
+	if now.Sub(time.Unix(0, last)) < idle {
+		return false
+	}
+	return mf.closeHandle(false)
+}
+
+func (mf *ManagedFile) hasPendingChanges() bool {
+	if mf == nil || !mf.cacheEnabled.Load() {
+		return false
+	}
+	if mf.hasPendingFlushes() {
+		return true
+	}
+	return mf.hasDirtySectors()
+}
+
+func (mf *ManagedFile) hasPendingFlushes() bool {
+	if mf == nil {
+		return false
+	}
+	mf.pendingMu.Lock()
+	defer mf.pendingMu.Unlock()
+	return len(mf.pending) > 0
+}
+
+func (mf *ManagedFile) hasDirtySectors() bool {
+	if mf == nil || !mf.cacheEnabled.Load() {
+		return false
+	}
+	mf.cacheMu.RLock()
+	defer mf.cacheMu.RUnlock()
+	for _, entry := range mf.sectors {
+		if entry != nil && entry.dirty {
+			return true
+		}
+	}
+	return false
 }
 
 func (mf *ManagedFile) ReadAt(p []byte, off int64) (int, error) {
@@ -765,33 +970,94 @@ func (mf *ManagedFile) queueFlush(key uint64) {
 }
 
 func (mf *ManagedFile) flushSector(key uint64) {
+	mf.flushSectorInternal(key, false)
+}
+
+func (mf *ManagedFile) flushSectorImmediate(key uint64) {
+	mf.flushSectorInternal(key, true)
+}
+
+func (mf *ManagedFile) flushSectorInternal(key uint64, force bool) {
+	for {
+		delay, hasData := mf.flushDelayForKey(key)
+		if !hasData {
+			mf.clearPendingKey(key)
+			return
+		}
+		if force || delay <= 0 {
+			break
+		}
+		time.Sleep(delay)
+	}
+
 	if err := mf.ensureHandle(); err != nil {
+		mf.clearPendingKey(key)
 		return
 	}
 	mf.cacheMu.RLock()
 	entry, ok := mf.sectors[key]
 	dirty := ok && entry.dirty
 	var buf []byte
+	var flushedWrite int64
 	if dirty {
+		flushedWrite = atomic.LoadInt64(&entry.lastWrite)
 		buf = append([]byte(nil), entry.data...)
 	}
 	mf.cacheMu.RUnlock()
 	if !dirty {
-		mf.pendingMu.Lock()
-		delete(mf.pending, key)
-		mf.pendingMu.Unlock()
+		mf.clearPendingKey(key)
 		return
 	}
 	_, err := mf.file.WriteAt(buf, int64(key)*mf.sectorSize)
+	needsRetry := false
 	if err == nil {
 		mf.cacheMu.Lock()
 		if entry, ok := mf.sectors[key]; ok {
-			entry.dirty = false
+			if atomic.LoadInt64(&entry.lastWrite) == flushedWrite {
+				entry.dirty = false
+			} else if entry.dirty {
+				needsRetry = true
+			}
 		}
 		mf.cacheMu.Unlock()
+	} else {
+		needsRetry = true
 	}
+	mf.clearPendingKey(key)
+	if needsRetry {
+		mf.queueFlush(key)
+	}
+}
+
+func (mf *ManagedFile) flushDelayForKey(key uint64) (time.Duration, bool) {
+	if mf == nil {
+		return 0, false
+	}
+	mf.cacheMu.RLock()
+	entry, ok := mf.sectors[key]
+	if !ok || entry == nil || !entry.dirty {
+		mf.cacheMu.RUnlock()
+		return 0, false
+	}
+	var delay time.Duration
+	if mf.opts.FlushInterval > 0 {
+		last := atomic.LoadInt64(&entry.lastWrite)
+		if last > 0 {
+			elapsed := time.Since(time.Unix(0, last))
+			if elapsed < mf.opts.FlushInterval {
+				delay = mf.opts.FlushInterval - elapsed
+			}
+		}
+	}
+	mf.cacheMu.RUnlock()
+	return delay, true
+}
+
+func (mf *ManagedFile) clearPendingKey(key uint64) {
 	mf.pendingMu.Lock()
-	delete(mf.pending, key)
+	if mf.pending != nil {
+		delete(mf.pending, key)
+	}
 	mf.pendingMu.Unlock()
 }
 
@@ -811,7 +1077,7 @@ func (mf *ManagedFile) Flush() {
 	}
 	mf.cacheMu.RUnlock()
 	for _, key := range dirtyKeys {
-		mf.flushSector(key)
+		mf.flushSectorImmediate(key)
 	}
 	if mf.file != nil {
 		_ = mf.file.Sync()
@@ -938,7 +1204,7 @@ func (mf *ManagedFile) applyCachePolicy(now time.Time, cfg cachePolicyConfig, me
 }
 
 func (mf *ManagedFile) flushAndDrop(key uint64) bool {
-	mf.flushSector(key)
+	mf.flushSectorImmediate(key)
 	mf.cacheMu.Lock()
 	defer mf.cacheMu.Unlock()
 	if entry, ok := mf.sectors[key]; ok {
@@ -1067,6 +1333,13 @@ func (ma *movingAverage) add(amount float64, now time.Time, window time.Duration
 
 func min64(a, b int64) int64 {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
 		return a
 	}
 	return b

@@ -29,6 +29,7 @@ const (
 	FlagIsTerminal          = 1 << 0
 	FlagHasChild            = 1 << 1
 	FlagHasJump             = 1 << 2
+	FlagHidden              = 1 << 3
 )
 
 // ValueLocationIndex rappresenta il puntatore da 5 byte al valore.
