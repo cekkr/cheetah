@@ -1546,6 +1546,22 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response = formatPairSummaryResponse(summary)
+	case command == "GRAPH_NODE_SET":
+		response, err = db.handleGraphNodeSet(args)
+	case command == "GRAPH_NODE_GET":
+		response, err = db.handleGraphNodeGet(args)
+	case command == "GRAPH_NODE_DEL":
+		response, err = db.handleGraphNodeDel(args)
+	case command == "GRAPH_EDGE_SET":
+		response, err = db.handleGraphEdgeSet(args)
+	case command == "GRAPH_EDGE_GET":
+		response, err = db.handleGraphEdgeGet(args)
+	case command == "GRAPH_EDGE_DEL":
+		response, err = db.handleGraphEdgeDel(args)
+	case command == "GRAPH_NEIGHBORS":
+		response, err = db.handleGraphNeighbors(args)
+	case command == "GRAPH_QUERY":
+		response, err = db.handleGraphQuery(args)
 	case command == "CLUSTER_UPDATE":
 		response, err = db.handleClusterUpdate(args)
 	case command == "CLUSTER_STATUS":

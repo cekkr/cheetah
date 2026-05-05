@@ -125,6 +125,17 @@ PAIR_REDUCE_STATUS <job_id>     # report reducer job progress/state
 PAIR_REDUCE_FETCH <job_id>      # fetch reducer results once completed (PENDING while running)
 PAIR_SUMMARY <prefix> [depth] [branch_limit] [include_hidden=1]
                                 # aggregate namespace statistics (payload totals, branch fan-out)
+GRAPH_NODE_SET id=<node> [labels=a,b] [props=<base64 json>]
+                                # upsert a graph node record
+GRAPH_NODE_GET id=<node>
+GRAPH_NODE_DEL id=<node> [cascade=1]
+GRAPH_EDGE_SET from=<node> to=<node> [type=<edge>] [weight=<float>] [directed=0|1]
+                                # upsert a typed edge + adjacency indexes
+GRAPH_EDGE_GET from=<node> to=<node> [type=<edge>] [directed=0|1]
+GRAPH_EDGE_DEL from=<node> to=<node> [type=<edge>] [directed=0|1]
+GRAPH_NEIGHBORS id=<node> [direction=out|in|both] [type=<edge>] [limit=<n>] [cursor=<token>]
+                                # stream adjacency pages backed by trie prefixes
+GRAPH_QUERY MATCH (...) ...     # graph pattern query (see syntax below)
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry
 RECYCLE <value_size>            # report recycle stats per table
@@ -150,6 +161,22 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
   branch digests returned (default: 32) and `include_hidden=1` to count hidden terminals. This is the entry point for data-centric statistics—e.g.,
   estimating hot prefixes before launching GPU reducers or precomputing rolling hashes described in
   the tree-indexing section below.
+- Graph storage is indexed in four isolated namespaces (`node`, `edge`, `adj/out`, `adj/in`) so
+  node/edge writes do not force full graph scans. `GRAPH_NEIGHBORS` and `GRAPH_QUERY` always execute
+  as prefix scans over adjacency indexes.
+- `GRAPH_QUERY` currently accepts a strict high-performance grammar:
+
+  ```text
+  MATCH (<left-node>)-[:<edge_type>]->(<right-node>)
+  [WHERE <predicate> [AND <predicate> ...]]
+  [RETURN edges|nodes|paths|count]
+  [LIMIT <n>]
+  [CURSOR <token>]
+  ```
+
+  Node expressions support `*` or `id='value'` (optionally `label='value'`). Predicates support
+  `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, and `edge.weight`. The left node must
+  be anchored by ID to keep execution index-backed.
 - `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`)
   to rebuild a specific database with narrower trie nodes or a different payload-cache budget without
   editing `config.ini`.
