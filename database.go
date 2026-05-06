@@ -1560,6 +1560,8 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response, err = db.handleGraphEdgeDel(args)
 	case command == "GRAPH_NEIGHBORS":
 		response, err = db.handleGraphNeighbors(args)
+	case command == "GRAPH_NEIGHBOR_TYPES":
+		response, err = db.handleGraphNeighborTypes(args)
 	case command == "GRAPH_QUERY":
 		response, err = db.handleGraphQuery(args)
 	case command == "CLUSTER_UPDATE":
@@ -1762,46 +1764,46 @@ func nextCursorForPrefix(prefix []byte, cursor []byte) ([]byte, bool) {
 }
 
 type pairSummaryAccumulator struct {
-	prefix       []byte
-	depthLimit   int
-	branchLimit  int
+	prefix        []byte
+	depthLimit    int
+	branchLimit   int
 	includeHidden bool
-	mu           sync.Mutex
-	branches     map[string]*pairSummaryBranch
-	terminalCnt  int64
-	totalBytes   int64
-	minPayload   uint32
-	maxPayload   uint32
-	minKey       uint64
-	maxKey       uint64
-	maxDepth     int
-	selfTerminal bool
+	mu            sync.Mutex
+	branches      map[string]*pairSummaryBranch
+	terminalCnt   int64
+	totalBytes    int64
+	minPayload    uint32
+	maxPayload    uint32
+	minKey        uint64
+	maxKey        uint64
+	maxDepth      int
+	selfTerminal  bool
 }
 
 type pairScanAccumulator struct {
-	cursor  []byte
-	limit   int
+	cursor        []byte
+	limit         int
 	includeHidden bool
-	mu      sync.Mutex
-	results []PairScanResult
-	count   atomic.Int64
+	mu            sync.Mutex
+	results       []PairScanResult
+	count         atomic.Int64
 }
 
 func newPairScanAccumulator(limit int, cursor []byte, includeHidden bool) *pairScanAccumulator {
 	return &pairScanAccumulator{
-		cursor: append([]byte{}, cursor...),
-		limit:  limit,
+		cursor:        append([]byte{}, cursor...),
+		limit:         limit,
 		includeHidden: includeHidden,
 	}
 }
 
 func newPairSummaryAccumulator(prefix []byte, depthLimit int, branchLimit int, includeHidden bool) *pairSummaryAccumulator {
 	return &pairSummaryAccumulator{
-		prefix:      append([]byte{}, prefix...),
-		depthLimit:  depthLimit,
-		branchLimit: branchLimit,
+		prefix:        append([]byte{}, prefix...),
+		depthLimit:    depthLimit,
+		branchLimit:   branchLimit,
 		includeHidden: includeHidden,
-		branches:    make(map[string]*pairSummaryBranch),
+		branches:      make(map[string]*pairSummaryBranch),
 	}
 }
 

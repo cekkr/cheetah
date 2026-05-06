@@ -62,9 +62,16 @@ type graphEdgePayload struct {
 	Weight   float64 `json:"weight"`
 }
 
+type graphNeighborTypePayload struct {
+	Type     string  `json:"type"`
+	Count    int     `json:"count"`
+	Weighted float64 `json:"weighted,omitempty"`
+}
+
 type modelBundle struct {
 	RelationPrior       map[string]float64
 	SourceRelationPrior map[string]map[string]float64
+	RelationTargetPrior map[string]map[string]float64
 	RelationPresence    map[string]int
 	RelationPair        map[string]map[string]int
 	RelationConditional map[string]map[string]float64
@@ -227,18 +234,18 @@ func run(cfg config) error {
 	implicitScores := make([]labeledScore, 0, len(candidates))
 	featureLatency := make([]time.Duration, 0, len(candidates))
 
-	featureCache := map[string][]string{}
+	featureCache := map[string]map[string]float64{}
 	for idx, c := range candidates {
 		probScore := probabilityModelScore(c.edge, models)
 		probScores = append(probScores, labeledScore{Label: c.label, Score: probScore})
 
 		before := time.Now()
-		rels, err := sourceRelations(client, c.edge.From, cfg.NeighborLimit, cfg.PredictionUseFeatureCache, featureCache)
+		relWeights, err := sourceRelationWeights(client, c.edge.From, cfg.NeighborLimit, cfg.PredictionUseFeatureCache, featureCache)
 		if err != nil {
 			return fmt.Errorf("feature extraction failed at candidate %d: %w", idx, err)
 		}
 		featureLatency = append(featureLatency, time.Since(before))
-		implicitScore := implicitCorrelationScore(c.edge, rels, models)
+		implicitScore := implicitCorrelationScore(c.edge, relWeights, models)
 		implicitScores = append(implicitScores, labeledScore{Label: c.label, Score: implicitScore})
 	}
 	predictionDuration := time.Since(predStart)
@@ -481,6 +488,7 @@ func buildModels(train []nellEdge) modelBundle {
 	sourceRelationSet := map[string]map[string]struct{}{}
 	knownEdgeSet := map[string]struct{}{}
 	relationTargetsSet := map[string]map[string]struct{}{}
+	relationTargetFreq := map[string]map[string]int{}
 	allNodeSet := map[string]struct{}{}
 
 	entityCategories := map[string]map[string]float64{}
@@ -519,6 +527,10 @@ func buildModels(train []nellEdge) modelBundle {
 			relationTargetsSet[edge.Relation] = map[string]struct{}{}
 		}
 		relationTargetsSet[edge.Relation][edge.To] = struct{}{}
+		if _, ok := relationTargetFreq[edge.Relation]; !ok {
+			relationTargetFreq[edge.Relation] = map[string]int{}
+		}
+		relationTargetFreq[edge.Relation][edge.To]++
 
 		if edge.Relation != "generalizations" {
 			cats := entityCategories[edge.To]
@@ -594,6 +606,7 @@ func buildModels(train []nellEdge) modelBundle {
 	}
 
 	relationTargets := map[string][]string{}
+	relationTargetPrior := map[string]map[string]float64{}
 	for rel, set := range relationTargetsSet {
 		targets := make([]string, 0, len(set))
 		for target := range set {
@@ -601,6 +614,16 @@ func buildModels(train []nellEdge) modelBundle {
 		}
 		sort.Strings(targets)
 		relationTargets[rel] = targets
+		total := 0
+		for _, cnt := range relationTargetFreq[rel] {
+			total += cnt
+		}
+		if total > 0 {
+			relationTargetPrior[rel] = map[string]float64{}
+			for target, cnt := range relationTargetFreq[rel] {
+				relationTargetPrior[rel][target] = float64(cnt) / float64(total)
+			}
+		}
 	}
 
 	allNodes := make([]string, 0, len(allNodeSet))
@@ -612,6 +635,7 @@ func buildModels(train []nellEdge) modelBundle {
 	return modelBundle{
 		RelationPrior:       relationPrior,
 		SourceRelationPrior: sourcePrior,
+		RelationTargetPrior: relationTargetPrior,
 		RelationPresence:    relationPresence,
 		RelationPair:        relationPair,
 		RelationConditional: relationConditional,
@@ -660,29 +684,35 @@ func buildEvaluationCandidates(holdout []nellEdge, models modelBundle, negatives
 }
 
 func probabilityModelScore(edge nellEdge, models modelBundle) float64 {
-	score := models.RelationPrior[edge.Relation]
+	prior := models.RelationPrior[edge.Relation]
+	score := prior
 	if srcRel, ok := models.SourceRelationPrior[edge.From]; ok {
 		if srcScore, ok := srcRel[edge.Relation]; ok {
-			score = 0.65*srcScore + 0.35*score
+			score = 0.60*srcScore + 0.40*prior
+		}
+	}
+	if relTargets, ok := models.RelationTargetPrior[edge.Relation]; ok {
+		if targetScore, ok := relTargets[edge.To]; ok {
+			score = 0.75*score + 0.25*targetScore
 		}
 	}
 	return clamp01(score)
 }
 
-func implicitCorrelationScore(edge nellEdge, sourceRelations []string, models modelBundle) float64 {
+func implicitCorrelationScore(edge nellEdge, sourceRelations map[string]float64, models modelBundle) float64 {
 	contextScore := 0.0
-	contextCount := 0
-	for _, rel := range sourceRelations {
+	contextWeight := 0.0
+	for rel, relWeight := range sourceRelations {
 		if rel == edge.Relation {
 			continue
 		}
 		if cond, ok := models.RelationConditional[rel][edge.Relation]; ok {
-			contextScore += cond
-			contextCount++
+			contextScore += relWeight * cond
+			contextWeight += relWeight
 		}
 	}
-	if contextCount > 0 {
-		contextScore /= float64(contextCount)
+	if contextWeight > 0 {
+		contextScore /= contextWeight
 	}
 
 	categoryScore := 0.0
@@ -696,18 +726,25 @@ func implicitCorrelationScore(edge nellEdge, sourceRelations []string, models mo
 		}
 	}
 
+	targetScore := 0.0
+	if relTargets, ok := models.RelationTargetPrior[edge.Relation]; ok {
+		if score, ok := relTargets[edge.To]; ok {
+			targetScore = score
+		}
+	}
+
 	prior := probabilityModelScore(edge, models)
-	score := 0.55*contextScore + 0.30*categoryScore + 0.15*prior
+	score := 0.45*contextScore + 0.25*categoryScore + 0.20*targetScore + 0.10*prior
 	return clamp01(score)
 }
 
-func sourceRelations(client *cheetahClient, sourceID string, limit int, useCache bool, cache map[string][]string) ([]string, error) {
+func sourceRelationWeights(client *cheetahClient, sourceID string, limit int, useCache bool, cache map[string]map[string]float64) (map[string]float64, error) {
 	if useCache {
 		if cached, ok := cache[sourceID]; ok {
 			return cached, nil
 		}
 	}
-	cmd := fmt.Sprintf("GRAPH_NEIGHBORS id=%s direction=out limit=%d", sourceID, limit)
+	cmd := fmt.Sprintf("GRAPH_NEIGHBOR_TYPES id=%s direction=out limit=%d weighted=0", sourceID, limit)
 	resp, err := client.exec(cmd)
 	if err != nil {
 		return nil, err
@@ -723,26 +760,28 @@ func sourceRelations(client *cheetahClient, sourceID string, limit int, useCache
 	if err != nil {
 		return nil, err
 	}
-	var edges []graphEdgePayload
-	if err := json.Unmarshal(decoded, &edges); err != nil {
+	var relCounts []graphNeighborTypePayload
+	if err := json.Unmarshal(decoded, &relCounts); err != nil {
 		return nil, err
 	}
-	set := map[string]struct{}{}
-	for _, edge := range edges {
-		if edge.Type == "" {
+	weights := make(map[string]float64, len(relCounts))
+	total := 0.0
+	for _, item := range relCounts {
+		if item.Type == "" || item.Count <= 0 {
 			continue
 		}
-		set[edge.Type] = struct{}{}
+		total += float64(item.Count)
+		weights[item.Type] += float64(item.Count)
 	}
-	rels := make([]string, 0, len(set))
-	for rel := range set {
-		rels = append(rels, rel)
+	if total > 0 {
+		for rel := range weights {
+			weights[rel] /= total
+		}
 	}
-	sort.Strings(rels)
 	if useCache {
-		cache[sourceID] = rels
+		cache[sourceID] = weights
 	}
-	return rels, nil
+	return weights, nil
 }
 
 func benchmarkQueries(client *cheetahClient, nodes []string, count int, limit int, rng *rand.Rand) ([]time.Duration, error) {
@@ -753,7 +792,7 @@ func benchmarkQueries(client *cheetahClient, nodes []string, count int, limit in
 	for i := 0; i < count; i++ {
 		node := nodes[rng.Intn(len(nodes))]
 		start := time.Now()
-		if _, err := client.exec(fmt.Sprintf("GRAPH_NEIGHBORS id=%s direction=out limit=%d", node, limit)); err != nil {
+		if _, err := client.exec(fmt.Sprintf("GRAPH_NEIGHBOR_TYPES id=%s direction=out limit=%d weighted=0", node, limit)); err != nil {
 			return durations, err
 		}
 		durations = append(durations, time.Since(start))

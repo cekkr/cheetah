@@ -19,7 +19,7 @@ It performs three things end-to-end:
 ## Metrics produced
 
 - Ingest edges/sec.
-- `GRAPH_NEIGHBORS` latency p50/p95/p99.
+- `GRAPH_NEIGHBOR_TYPES` latency p50/p95/p99.
 - Prediction throughput.
 - Probability model validity: `AUC`, `Average Precision`, `Precision@100`.
 - Implicit-correlation model validity: `AUC`, `Average Precision`, `Precision@100`.

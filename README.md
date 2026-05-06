@@ -135,6 +135,8 @@ GRAPH_EDGE_GET from=<node> to=<node> [type=<edge>] [directed=0|1]
 GRAPH_EDGE_DEL from=<node> to=<node> [type=<edge>] [directed=0|1]
 GRAPH_NEIGHBORS id=<node> [direction=out|in|both] [type=<edge>] [limit=<n>] [cursor=<token>]
                                 # stream adjacency pages backed by trie prefixes
+GRAPH_NEIGHBOR_TYPES id=<node> [direction=out|in|both] [limit=<n>] [cursor=<token>] [weighted=0|1]
+                                # compact relation histogram for fast graph feature extraction
 GRAPH_QUERY MATCH (...) ...     # graph pattern query (see syntax below)
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry

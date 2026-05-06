@@ -87,6 +87,12 @@ type graphPathView struct {
 	Weight float64 `json:"weight"`
 }
 
+type graphRelationTypeCount struct {
+	Type     string  `json:"type"`
+	Count    int     `json:"count"`
+	Weighted float64 `json:"weighted,omitempty"`
+}
+
 var graphWherePredicatePattern = regexp.MustCompile(`(?i)^(from|to|edge)\.(id|type|weight|label)\s*(=|!=|>=|<=|>|<)\s*(.+)$`)
 
 func (db *Database) handleGraphNodeSet(args string) (string, error) {
@@ -382,6 +388,65 @@ func (db *Database) handleGraphNeighbors(args string) (string, error) {
 			merged = merged[:limit]
 		}
 		return graphFormatEdgesResponse(merged, nil)
+	default:
+		return "ERROR,invalid_direction", nil
+	}
+}
+
+func (db *Database) handleGraphNeighborTypes(args string) (string, error) {
+	params := parseKeyValueArgs(args)
+	nodeID := graphNormalizeID(params["id"])
+	if nodeID == "" {
+		return "ERROR,graph_neighbor_types_requires_id", nil
+	}
+	direction := strings.ToLower(strings.TrimSpace(params["direction"]))
+	if direction == "" {
+		direction = "out"
+	}
+	limit := graphDefaultLimit
+	if raw := strings.TrimSpace(params["limit"]); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return "ERROR,invalid_limit", nil
+		}
+		limit = parsed
+	}
+	limit = graphNormalizeLimit(limit)
+	cursor, err := graphParseCursorToken(params["cursor"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_cursor:%v", err), nil
+	}
+	weighted := parseBoolFlag(params["weighted"])
+
+	switch direction {
+	case "out":
+		prefix := graphAdjOutScanPrefix(nodeID, "")
+		counts, nextCursor, err := db.graphScanNeighborTypes(prefix, limit, cursor, "out", weighted)
+		if err != nil {
+			return "", err
+		}
+		return graphFormatNeighborTypesResponse(counts, nextCursor)
+	case "in":
+		prefix := graphAdjInScanPrefix(nodeID, "")
+		counts, nextCursor, err := db.graphScanNeighborTypes(prefix, limit, cursor, "in", weighted)
+		if err != nil {
+			return "", err
+		}
+		return graphFormatNeighborTypesResponse(counts, nextCursor)
+	case "both":
+		if len(cursor) > 0 {
+			return "ERROR,cursor_not_supported_with_direction_both", nil
+		}
+		outCounts, _, err := db.graphScanNeighborTypes(graphAdjOutScanPrefix(nodeID, ""), limit, nil, "out", weighted)
+		if err != nil {
+			return "", err
+		}
+		inCounts, _, err := db.graphScanNeighborTypes(graphAdjInScanPrefix(nodeID, ""), limit, nil, "in", weighted)
+		if err != nil {
+			return "", err
+		}
+		merged := mergeGraphNeighborTypeCounts(outCounts, inCounts)
+		return graphFormatNeighborTypesResponse(merged, nil)
 	default:
 		return "ERROR,invalid_direction", nil
 	}
@@ -1338,12 +1403,132 @@ func (db *Database) graphScanAdjacency(
 	return out, nil, nil
 }
 
+func (db *Database) graphScanNeighborTypes(
+	prefix []byte,
+	limit int,
+	cursor []byte,
+	direction string,
+	weighted bool,
+) ([]graphRelationTypeCount, []byte, error) {
+	limit = graphNormalizeLimit(limit)
+	results, nextCursor, err := db.PairScanWithOptions(prefix, limit, cursor, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	buckets := make(map[string]*graphRelationTypeCount, len(results))
+	for _, res := range results {
+		relType, ok := graphRelationFromAdjacencyKey(res.Value, direction)
+		if !ok || relType == "" {
+			continue
+		}
+		bucket, exists := buckets[relType]
+		if !exists {
+			bucket = &graphRelationTypeCount{Type: relType}
+			buckets[relType] = bucket
+		}
+		bucket.Count++
+		if weighted {
+			edgePairKey, err := db.readValuePayload(res.Key)
+			if err != nil || len(edgePairKey) == 0 {
+				continue
+			}
+			edge, found, err := db.graphGetEdgeByPairKey(edgePairKey)
+			if err != nil || !found {
+				continue
+			}
+			bucket.Weighted += edge.Weight
+		}
+	}
+	counts := make([]graphRelationTypeCount, 0, len(buckets))
+	for _, bucket := range buckets {
+		counts = append(counts, *bucket)
+	}
+	sort.Slice(counts, func(i, j int) bool {
+		if counts[i].Count == counts[j].Count {
+			if counts[i].Weighted == counts[j].Weighted {
+				return counts[i].Type < counts[j].Type
+			}
+			return counts[i].Weighted > counts[j].Weighted
+		}
+		return counts[i].Count > counts[j].Count
+	})
+	return counts, nextCursor, nil
+}
+
+func graphRelationFromAdjacencyKey(raw []byte, direction string) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	text := string(raw)
+	var trimmed string
+	switch direction {
+	case "out":
+		if !strings.HasPrefix(text, graphAdjOutPrefix) {
+			return "", false
+		}
+		trimmed = strings.TrimPrefix(text, graphAdjOutPrefix)
+	case "in":
+		if !strings.HasPrefix(text, graphAdjInPrefix) {
+			return "", false
+		}
+		trimmed = strings.TrimPrefix(text, graphAdjInPrefix)
+	default:
+		return "", false
+	}
+	parts := strings.Split(trimmed, "/")
+	if len(parts) < 4 {
+		return "", false
+	}
+	relEncoded := parts[1]
+	decoded, err := base64.RawURLEncoding.DecodeString(relEncoded)
+	if err != nil {
+		return "", false
+	}
+	return string(decoded), true
+}
+
+func mergeGraphNeighborTypeCounts(left []graphRelationTypeCount, right []graphRelationTypeCount) []graphRelationTypeCount {
+	merged := make(map[string]graphRelationTypeCount, len(left)+len(right))
+	for _, item := range left {
+		merged[item.Type] = item
+	}
+	for _, item := range right {
+		existing := merged[item.Type]
+		existing.Type = item.Type
+		existing.Count += item.Count
+		existing.Weighted += item.Weighted
+		merged[item.Type] = existing
+	}
+	out := make([]graphRelationTypeCount, 0, len(merged))
+	for _, item := range merged {
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count == out[j].Count {
+			if out[i].Weighted == out[j].Weighted {
+				return out[i].Type < out[j].Type
+			}
+			return out[i].Weighted > out[j].Weighted
+		}
+		return out[i].Count > out[j].Count
+	})
+	return out
+}
+
 func graphFormatEdgesResponse(edges []GraphEdgeRecord, nextCursor []byte) (string, error) {
 	payload, err := graphEncodeJSON(edges)
 	if err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("SUCCESS,count=%d,next_cursor=%s,payload=%s", len(edges), graphCursorToken(nextCursor), payload), nil
+}
+
+func graphFormatNeighborTypesResponse(counts []graphRelationTypeCount, nextCursor []byte) (string, error) {
+	payload, err := graphEncodeJSON(counts)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SUCCESS,count=%d,next_cursor=%s,payload=%s", len(counts), graphCursorToken(nextCursor), payload), nil
 }
 
 func graphEncodeJSON(value interface{}) (string, error) {
