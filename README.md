@@ -118,7 +118,7 @@ PAIR_SET_HIDDEN <hex_prefix> <payload>
 PAIR_SCAN <prefix> [limit] [cursor] [include_hidden=1]
                                 # stream ordered namespace slices (cursors supported)
 PAIR_REDUCE <mode> <prefix> [limit] [cursor] [include_hidden=1]
-                                # stream reducer payloads (counts/probabilities/etc.)
+                                # stream reducer payloads (counts/probabilities/degree/triangle/pagerank_seed/etc.)
 PAIR_REDUCE_ASYNC <mode> <prefix> [limit] [cursor]
                                 # enqueue reducer job and return a job identifier
 PAIR_REDUCE_STATUS <job_id>     # report reducer job progress/state
@@ -131,10 +131,14 @@ GRAPH_NODE_GET id=<node>
 GRAPH_NODE_DEL id=<node> [cascade=1]
 GRAPH_EDGE_SET from=<node> to=<node> [type=<edge>] [weight=<float>] [directed=0|1]
                                 # upsert a typed edge + adjacency indexes
+GRAPH_EDGE_SET_BATCH items=<base64 json> [continue_on_error=0|1] [type=<edge>] [directed=0|1]
+                                # bulk graph edge upsert in one command
 GRAPH_EDGE_GET from=<node> to=<node> [type=<edge>] [directed=0|1]
 GRAPH_EDGE_DEL from=<node> to=<node> [type=<edge>] [directed=0|1]
 GRAPH_NEIGHBORS id=<node> [direction=out|in|both] [type=<edge>] [limit=<n>] [cursor=<token>]
                                 # stream adjacency pages backed by trie prefixes
+GRAPH_DEGREE id=<node> [direction=out|in|both] [type=<edge|*>] [weighted=0|1]
+                                # fast degree/weighted-degree stats
 GRAPH_NEIGHBOR_TYPES id=<node> [direction=out|in|both] [limit=<n>] [cursor=<token>] [weighted=0|1]
                                 # compact relation histogram for fast graph feature extraction
 GRAPH_QUERY MATCH (...) ...     # graph pattern query (see syntax below)
@@ -166,19 +170,26 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
 - Graph storage is indexed in four isolated namespaces (`node`, `edge`, `adj/out`, `adj/in`) so
   node/edge writes do not force full graph scans. `GRAPH_NEIGHBORS` and `GRAPH_QUERY` always execute
   as prefix scans over adjacency indexes.
-- `GRAPH_QUERY` currently accepts a strict high-performance grammar:
+- `GRAPH_QUERY` supports bounded multi-hop traversal with pruning/cost controls:
 
   ```text
   MATCH (<left-node>)-[:<edge_type>]->(<right-node>)
   [WHERE <predicate> [AND <predicate> ...]]
+  [HOPS <max>|<min>..<max>]
+  [BRANCH_LIMIT <n>]
+  [COST_LIMIT <float>]
   [RETURN edges|nodes|paths|count]
   [LIMIT <n>]
   [CURSOR <token>]
   ```
 
   Node expressions support `*` or `id='value'` (optionally `label='value'`). Predicates support
-  `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, and `edge.weight`. The left node must
-  be anchored by ID to keep execution index-backed.
+  `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, `edge.weight`, and
+  `edge.props.<prop_key>`. The left node must be anchored by ID to keep execution index-backed.
+  `edge.props.<prop_key> = <literal>` predicates use a secondary index namespace
+  (`graph/idx/<prop>/<value>/...`) for fast filtering.
+- Reducer modes `degree`, `triangle`, and `pagerank_seed` operate directly on graph adjacency
+  namespaces (`adj/out` / `adj/in`) so graph statistics can stream without full edge hydration.
 - `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`)
   to rebuild a specific database with narrower trie nodes or a different payload-cache budget without
   editing `config.ini`.

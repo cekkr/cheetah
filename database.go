@@ -649,11 +649,58 @@ func (db *Database) insertThroughJump(tableID uint32, parent *PairTable, branchI
 		}
 		return db.insertPairAt(node.NextTableID, key, offset, absKey, hidden)
 	}
+	if common > 0 {
+		return db.splitJumpWithCommonPrefix(node, common, remainder[common:], absKey, hidden)
+	}
 	childID, err := db.splitJumpIntoChild(parent, branchIndex, entry, node, common)
 	if err != nil {
 		return err
 	}
 	return db.insertPairAt(childID, key, offset+common, absKey, hidden)
+}
+
+func (db *Database) splitJumpWithCommonPrefix(node *JumpNode, common int, newTail []byte, absKey uint64, hidden bool) error {
+	if node == nil {
+		return fmt.Errorf("nil_jump_node")
+	}
+	if common <= 0 || common >= len(node.Bytes) {
+		return fmt.Errorf("invalid_common_prefix")
+	}
+	childID, err := db.getNewPairTableID()
+	if err != nil {
+		return err
+	}
+	oldTail := append([]byte{}, node.Bytes[common:]...)
+	if len(oldTail) == 0 {
+		return fmt.Errorf("invalid_jump_split_state")
+	}
+	if err := db.insertSuffixWithContinuation(
+		childID,
+		oldTail,
+		node.HasTerminal,
+		node.TerminalKey,
+		node.HiddenTerminal,
+		node.NextTableID,
+	); err != nil {
+		return err
+	}
+	if len(newTail) > 0 {
+		if err := db.insertSuffixWithContinuation(childID, newTail, true, absKey, hidden, 0); err != nil {
+			return err
+		}
+	}
+	node.Bytes = append([]byte{}, node.Bytes[:common]...)
+	node.NextTableID = childID
+	if len(newTail) == 0 {
+		node.HasTerminal = true
+		node.HiddenTerminal = hidden
+		node.TerminalKey = absKey
+	} else {
+		node.HasTerminal = false
+		node.HiddenTerminal = false
+		node.TerminalKey = 0
+	}
+	return db.writeJump(node)
 }
 
 func (db *Database) splitJumpIntoChild(parent *PairTable, branchIndex uint32, entry []byte, node *JumpNode, splitOffset int) (uint32, error) {
@@ -864,6 +911,7 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 			jumpBytes := node.Bytes
 			path = append(path, jumpBytes...)
 			remaining := targetLen - offset
+			prefixWithinJump := remaining <= len(jumpBytes)
 			switch {
 			case remaining > len(jumpBytes):
 				if !bytes.Equal(jumpBytes, pref[offset:offset+len(jumpBytes)]) {
@@ -876,13 +924,15 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 				}
 				offset += remaining
 				if remaining < len(jumpBytes) {
-					pref = append(pref, jumpBytes[remaining:]...)
+					suffix := jumpBytes[remaining:]
+					pref = append(pref, suffix...)
+					offset += len(suffix)
 				}
 			default:
 				pref = append(pref, jumpBytes...)
 				offset += len(jumpBytes)
 			}
-			if offset == targetLen && acc != nil && node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
+			if acc != nil && prefixWithinJump && node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
 				acc.add(append([]byte{}, path...), node.TerminalKey)
 			}
 			if node.NextTableID == 0 {
@@ -958,6 +1008,7 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 			jumpBytes := node.Bytes
 			path = append(path, jumpBytes...)
 			remaining := targetLen - offset
+			prefixWithinJump := remaining <= len(jumpBytes)
 			switch {
 			case remaining > len(jumpBytes):
 				if !bytes.Equal(jumpBytes, pref[offset:offset+len(jumpBytes)]) {
@@ -970,13 +1021,15 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 				}
 				offset += remaining
 				if remaining < len(jumpBytes) {
-					pref = append(pref, jumpBytes[remaining:]...)
+					suffix := jumpBytes[remaining:]
+					pref = append(pref, suffix...)
+					offset += len(suffix)
 				}
 			default:
 				pref = append(pref, jumpBytes...)
 				offset += len(jumpBytes)
 			}
-			if offset == targetLen && node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
+			if prefixWithinJump && node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
 				if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), node.TerminalKey); err != nil {
 					return 0, path, err
 				}
@@ -1554,12 +1607,16 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response, err = db.handleGraphNodeDel(args)
 	case command == "GRAPH_EDGE_SET":
 		response, err = db.handleGraphEdgeSet(args)
+	case command == "GRAPH_EDGE_SET_BATCH":
+		response, err = db.handleGraphEdgeSetBatch(args)
 	case command == "GRAPH_EDGE_GET":
 		response, err = db.handleGraphEdgeGet(args)
 	case command == "GRAPH_EDGE_DEL":
 		response, err = db.handleGraphEdgeDel(args)
 	case command == "GRAPH_NEIGHBORS":
 		response, err = db.handleGraphNeighbors(args)
+	case command == "GRAPH_DEGREE":
+		response, err = db.handleGraphDegree(args)
 	case command == "GRAPH_NEIGHBOR_TYPES":
 		response, err = db.handleGraphNeighborTypes(args)
 	case command == "GRAPH_QUERY":

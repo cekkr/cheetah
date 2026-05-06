@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +35,13 @@ type config struct {
 	RandSeed                  int64
 	NeighborLimit             int
 	QueryBenchCount           int
+	IngestBatchSize           int
+	SkipIngest                bool
+	ImplicitRerankTopK        int
+	ImplicitRerankAlpha       float64
+	WriteReports              bool
+	ReportDir                 string
+	ReportTag                 string
 	PredictionUseFeatureCache bool
 	Verbose                   bool
 }
@@ -66,6 +74,14 @@ type graphNeighborTypePayload struct {
 	Type     string  `json:"type"`
 	Count    int     `json:"count"`
 	Weighted float64 `json:"weighted,omitempty"`
+}
+
+type graphEdgeBatchItem struct {
+	From     string   `json:"from"`
+	To       string   `json:"to"`
+	Type     string   `json:"type"`
+	Weight   *float64 `json:"weight,omitempty"`
+	Directed *bool    `json:"directed,omitempty"`
 }
 
 type modelBundle struct {
@@ -101,14 +117,30 @@ type summaryReport struct {
 	ProbabilityAUC        float64 `json:"probability_auc"`
 	ProbabilityAP         float64 `json:"probability_average_precision"`
 	ProbabilityPAt100     float64 `json:"probability_precision_at_100"`
+	ImplicitBaseAUC       float64 `json:"implicit_base_auc"`
+	ImplicitBaseAP        float64 `json:"implicit_base_average_precision"`
+	ImplicitBasePAt100    float64 `json:"implicit_base_precision_at_100"`
 	ImplicitAUC           float64 `json:"implicit_auc"`
 	ImplicitAP            float64 `json:"implicit_average_precision"`
 	ImplicitPAt100        float64 `json:"implicit_precision_at_100"`
+	ImplicitRerankTopK    int     `json:"implicit_rerank_topk"`
+	ImplicitRerankAlpha   float64 `json:"implicit_rerank_alpha"`
 	PredictionSeconds     float64 `json:"prediction_seconds"`
 	PredictionPerSecond   float64 `json:"prediction_per_second"`
 	PredictionCandidates  int     `json:"prediction_candidates"`
 	FeatureQueries        int     `json:"feature_queries"`
 	FeatureQueryP95Millis float64 `json:"feature_query_p95_ms"`
+	RawProbabilityAUC     float64 `json:"raw_probability_auc"`
+	RawProbabilityAP      float64 `json:"raw_probability_average_precision"`
+	RawProbabilityCount   int     `json:"raw_probability_count"`
+}
+
+type reportArtifact struct {
+	TimestampUTC string        `json:"timestamp_utc"`
+	Database     string        `json:"database"`
+	Dataset      string        `json:"dataset"`
+	Config       config        `json:"config"`
+	Summary      summaryReport `json:"summary"`
 }
 
 func main() {
@@ -135,6 +167,13 @@ func parseFlags() config {
 	flag.Int64Var(&cfg.RandSeed, "seed", 42, "Random seed for split and negative sampling")
 	flag.IntVar(&cfg.NeighborLimit, "neighbor-limit", 1024, "Neighbor query limit for feature extraction")
 	flag.IntVar(&cfg.QueryBenchCount, "query-bench", 1500, "Number of query benchmark calls")
+	flag.IntVar(&cfg.IngestBatchSize, "ingest-batch-size", 128, "Graph edge batch size for GRAPH_EDGE_SET_BATCH (<=1 disables batching)")
+	flag.BoolVar(&cfg.SkipIngest, "skip-ingest", false, "Skip GRAPH_EDGE_SET ingestion (reuse already ingested graph data)")
+	flag.IntVar(&cfg.ImplicitRerankTopK, "implicit-rerank-topk", 1000, "Top-K implicit predictions to rerank in stage 2")
+	flag.Float64Var(&cfg.ImplicitRerankAlpha, "implicit-rerank-alpha", 0.40, "Stage-2 rerank blend: alpha*implicit + (1-alpha)*probability")
+	flag.BoolVar(&cfg.WriteReports, "write-reports", true, "Persist JSON + CSV metric reports to --report-dir")
+	flag.StringVar(&cfg.ReportDir, "report-dir", "demo/graph-nell/reports", "Directory where report artifacts are written")
+	flag.StringVar(&cfg.ReportTag, "report-tag", "", "Optional suffix added to report filenames")
 	flag.BoolVar(&cfg.PredictionUseFeatureCache, "feature-cache", true, "Cache source-node feature queries")
 	flag.BoolVar(&cfg.Verbose, "v", false, "Verbose progress logs")
 	flag.Parse()
@@ -158,6 +197,21 @@ func parseFlags() config {
 	}
 	if cfg.NeighborLimit > 4096 {
 		cfg.NeighborLimit = 4096
+	}
+	if cfg.IngestBatchSize < 1 {
+		cfg.IngestBatchSize = 1
+	}
+	if cfg.IngestBatchSize > 4096 {
+		cfg.IngestBatchSize = 4096
+	}
+	if cfg.ImplicitRerankTopK < 0 {
+		cfg.ImplicitRerankTopK = 0
+	}
+	if cfg.ImplicitRerankAlpha < 0 {
+		cfg.ImplicitRerankAlpha = 0
+	}
+	if cfg.ImplicitRerankAlpha > 1 {
+		cfg.ImplicitRerankAlpha = 1
 	}
 	return cfg
 }
@@ -208,11 +262,16 @@ func run(cfg config) error {
 		return err
 	}
 
-	ingestStart := time.Now()
-	if err := ingestEdges(client, trainEdges, cfg); err != nil {
-		return err
+	ingestDuration := time.Duration(0)
+	if cfg.SkipIngest {
+		fmt.Println("Skipping ingestion (--skip-ingest); using current graph state in Cheetah.")
+	} else {
+		ingestStart := time.Now()
+		if err := ingestEdges(client, trainEdges, cfg); err != nil {
+			return err
+		}
+		ingestDuration = time.Since(ingestStart)
 	}
-	ingestDuration := time.Since(ingestStart)
 
 	models := buildModels(trainEdges)
 	if len(models.RelationTargets) == 0 {
@@ -231,7 +290,7 @@ func run(cfg config) error {
 
 	predStart := time.Now()
 	probScores := make([]labeledScore, 0, len(candidates))
-	implicitScores := make([]labeledScore, 0, len(candidates))
+	implicitBaseScores := make([]labeledScore, 0, len(candidates))
 	featureLatency := make([]time.Duration, 0, len(candidates))
 
 	featureCache := map[string]map[string]float64{}
@@ -246,9 +305,16 @@ func run(cfg config) error {
 		}
 		featureLatency = append(featureLatency, time.Since(before))
 		implicitScore := implicitCorrelationScore(c.edge, relWeights, models)
-		implicitScores = append(implicitScores, labeledScore{Label: c.label, Score: implicitScore})
+		implicitBaseScores = append(implicitBaseScores, labeledScore{Label: c.label, Score: implicitScore})
 	}
 	predictionDuration := time.Since(predStart)
+	implicitScores := rerankImplicitTopK(implicitBaseScores, probScores, cfg.ImplicitRerankTopK, cfg.ImplicitRerankAlpha)
+	rawProbAUC := 0.0
+	rawProbAP := 0.0
+	if len(probLabels) > 0 {
+		rawProbAUC = rocAUC(probLabels)
+		rawProbAP = averagePrecision(probLabels)
+	}
 
 	report := summaryReport{
 		DatasetRows:           rawRows,
@@ -264,17 +330,33 @@ func run(cfg config) error {
 		ProbabilityAUC:        rocAUC(probScores),
 		ProbabilityAP:         averagePrecision(probScores),
 		ProbabilityPAt100:     precisionAtK(probScores, 100),
+		ImplicitBaseAUC:       rocAUC(implicitBaseScores),
+		ImplicitBaseAP:        averagePrecision(implicitBaseScores),
+		ImplicitBasePAt100:    precisionAtK(implicitBaseScores, 100),
 		ImplicitAUC:           rocAUC(implicitScores),
 		ImplicitAP:            averagePrecision(implicitScores),
 		ImplicitPAt100:        precisionAtK(implicitScores, 100),
+		ImplicitRerankTopK:    cfg.ImplicitRerankTopK,
+		ImplicitRerankAlpha:   cfg.ImplicitRerankAlpha,
 		PredictionSeconds:     predictionDuration.Seconds(),
 		PredictionPerSecond:   rate(len(candidates), predictionDuration),
 		PredictionCandidates:  len(candidates),
 		FeatureQueries:        len(featureLatency),
 		FeatureQueryP95Millis: durationPercentileMillis(featureLatency, 0.95),
+		RawProbabilityAUC:     rawProbAUC,
+		RawProbabilityAP:      rawProbAP,
+		RawProbabilityCount:   len(probLabels),
 	}
 
 	printReport(report, probLabels)
+	if cfg.WriteReports {
+		if jsonPath, csvPath, err := writeReportArtifacts(cfg, report); err != nil {
+			return err
+		} else {
+			fmt.Printf("Report JSON: %s\n", jsonPath)
+			fmt.Printf("Report CSV: %s\n", csvPath)
+		}
+	}
 
 	fmt.Printf("Total demo wall time: %.2fs\n", time.Since(start).Seconds())
 	return nil
@@ -454,27 +536,61 @@ func ingestEdges(client *cheetahClient, edges []nellEdge, cfg config) error {
 	if len(edges) < progressEvery {
 		progressEvery = 1000
 	}
-	for i, edge := range edges {
-		cmd := fmt.Sprintf(
-			"GRAPH_EDGE_SET from=%s to=%s type=%s weight=%.6f directed=1",
-			edge.From,
-			edge.To,
-			edge.Relation,
-			edge.Probability,
-		)
-		if _, err := client.exec(cmd); err != nil {
-			return fmt.Errorf(
-				"ingest failed at row %d relation=%s from=%s to=%s weight=%.6f: %w",
-				i+1,
-				edge.Relation,
+	batchSize := cfg.IngestBatchSize
+	if batchSize <= 1 {
+		for i, edge := range edges {
+			cmd := fmt.Sprintf(
+				"GRAPH_EDGE_SET from=%s to=%s type=%s weight=%.6f directed=1",
 				edge.From,
 				edge.To,
+				edge.Relation,
 				edge.Probability,
-				err,
 			)
+			if _, err := client.exec(cmd); err != nil {
+				return fmt.Errorf(
+					"ingest failed at row %d relation=%s from=%s to=%s weight=%.6f: %w",
+					i+1,
+					edge.Relation,
+					edge.From,
+					edge.To,
+					edge.Probability,
+					err,
+				)
+			}
+			if cfg.Verbose && (i+1)%progressEvery == 0 {
+				fmt.Printf("Ingested %d/%d edges\n", i+1, len(edges))
+			}
 		}
-		if cfg.Verbose && (i+1)%progressEvery == 0 {
-			fmt.Printf("Ingested %d/%d edges\n", i+1, len(edges))
+		return nil
+	}
+
+	directed := true
+	for i := 0; i < len(edges); i += batchSize {
+		end := i + batchSize
+		if end > len(edges) {
+			end = len(edges)
+		}
+		items := make([]graphEdgeBatchItem, 0, end-i)
+		for _, edge := range edges[i:end] {
+			weight := edge.Probability
+			items = append(items, graphEdgeBatchItem{
+				From:     edge.From,
+				To:       edge.To,
+				Type:     edge.Relation,
+				Weight:   &weight,
+				Directed: &directed,
+			})
+		}
+		payload, err := json.Marshal(items)
+		if err != nil {
+			return err
+		}
+		cmd := "GRAPH_EDGE_SET_BATCH items=" + base64.StdEncoding.EncodeToString(payload) + " continue_on_error=0"
+		if _, err := client.exec(cmd); err != nil {
+			return fmt.Errorf("batch ingest failed at rows %d-%d: %w", i+1, end, err)
+		}
+		if cfg.Verbose && end%progressEvery == 0 {
+			fmt.Printf("Ingested %d/%d edges\n", end, len(edges))
 		}
 	}
 	return nil
@@ -817,16 +933,158 @@ func printReport(report summaryReport, probLabels []labeledScore) {
 	fmt.Printf("Prediction throughput: %.2f candidates/s (n=%d, %.2fs)\n", report.PredictionPerSecond, report.PredictionCandidates, report.PredictionSeconds)
 
 	fmt.Printf("Probability model: AUC=%.4f AP=%.4f P@100=%.4f\n", report.ProbabilityAUC, report.ProbabilityAP, report.ProbabilityPAt100)
-	fmt.Printf("Implicit-correlation model: AUC=%.4f AP=%.4f P@100=%.4f\n", report.ImplicitAUC, report.ImplicitAP, report.ImplicitPAt100)
+	fmt.Printf("Implicit base: AUC=%.4f AP=%.4f P@100=%.4f\n", report.ImplicitBaseAUC, report.ImplicitBaseAP, report.ImplicitBasePAt100)
+	fmt.Printf(
+		"Implicit reranked(topk=%d alpha=%.2f): AUC=%.4f AP=%.4f P@100=%.4f\n",
+		report.ImplicitRerankTopK,
+		report.ImplicitRerankAlpha,
+		report.ImplicitAUC,
+		report.ImplicitAP,
+		report.ImplicitPAt100,
+	)
 
 	if len(probLabels) > 0 {
-		fmt.Printf("Raw NELL probability validity (action label): AUC=%.4f AP=%.4f (n=%d)\n", rocAUC(probLabels), averagePrecision(probLabels), len(probLabels))
+		fmt.Printf("Raw NELL probability validity (action label): AUC=%.4f AP=%.4f (n=%d)\n", report.RawProbabilityAUC, report.RawProbabilityAP, report.RawProbabilityCount)
 	}
 
 	jsonBytes, err := json.MarshalIndent(report, "", "  ")
 	if err == nil {
 		fmt.Println(string(jsonBytes))
 	}
+}
+
+func rerankImplicitTopK(base []labeledScore, prob []labeledScore, topK int, alpha float64) []labeledScore {
+	if len(base) == 0 || len(prob) == 0 || len(base) != len(prob) || topK <= 0 {
+		out := make([]labeledScore, len(base))
+		copy(out, base)
+		return out
+	}
+	if alpha < 0 {
+		alpha = 0
+	}
+	if alpha > 1 {
+		alpha = 1
+	}
+	out := make([]labeledScore, len(base))
+	copy(out, base)
+	indices := make([]int, len(base))
+	for i := range indices {
+		indices[i] = i
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		left := base[indices[i]]
+		right := base[indices[j]]
+		if left.Score == right.Score {
+			return left.Label > right.Label
+		}
+		return left.Score > right.Score
+	})
+	if topK > len(indices) {
+		topK = len(indices)
+	}
+	for _, idx := range indices[:topK] {
+		out[idx].Score = clamp01(alpha*base[idx].Score + (1-alpha)*prob[idx].Score)
+	}
+	return out
+}
+
+func writeReportArtifacts(cfg config, report summaryReport) (string, string, error) {
+	if err := os.MkdirAll(cfg.ReportDir, 0755); err != nil {
+		return "", "", err
+	}
+	now := time.Now().UTC()
+	stamp := now.Format("20060102-150405")
+	tag := sanitizeToken(cfg.ReportTag)
+	baseName := fmt.Sprintf("graph_nell_%s_%s", stamp, sanitizeToken(cfg.Database))
+	if tag != "" {
+		baseName += "_" + tag
+	}
+
+	artifact := reportArtifact{
+		TimestampUTC: now.Format(time.RFC3339),
+		Database:     cfg.Database,
+		Dataset:      cfg.DatasetPath,
+		Config:       cfg,
+		Summary:      report,
+	}
+	jsonPath := filepath.Join(cfg.ReportDir, baseName+".json")
+	jsonBytes, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(jsonPath, jsonBytes, 0644); err != nil {
+		return "", "", err
+	}
+
+	csvPath := filepath.Join(cfg.ReportDir, "metrics.csv")
+	writeHeader := false
+	if _, err := os.Stat(csvPath); errors.Is(err, os.ErrNotExist) {
+		writeHeader = true
+	}
+	file, err := os.OpenFile(csvPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return "", "", err
+	}
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	if writeHeader {
+		header := []string{
+			"timestamp_utc", "database", "dataset",
+			"dataset_rows", "positive_edges", "training_edges", "holdout_positive_edges",
+			"ingest_seconds", "ingest_edges_per_second",
+			"query_count", "query_p50_ms", "query_p95_ms", "query_p99_ms",
+			"feature_query_p95_ms", "prediction_seconds", "prediction_per_second", "prediction_candidates",
+			"prob_auc", "prob_ap", "prob_p100",
+			"implicit_base_auc", "implicit_base_ap", "implicit_base_p100",
+			"implicit_auc", "implicit_ap", "implicit_p100",
+			"implicit_rerank_topk", "implicit_rerank_alpha",
+			"raw_prob_auc", "raw_prob_ap", "raw_prob_count",
+		}
+		if err := writer.Write(header); err != nil {
+			return "", "", err
+		}
+	}
+	row := []string{
+		now.Format(time.RFC3339),
+		cfg.Database,
+		cfg.DatasetPath,
+		strconv.Itoa(report.DatasetRows),
+		strconv.Itoa(report.PositiveEdges),
+		strconv.Itoa(report.TrainingEdges),
+		strconv.Itoa(report.HoldoutPositiveEdges),
+		fmt.Sprintf("%.6f", report.IngestSeconds),
+		fmt.Sprintf("%.6f", report.IngestEdgesPerSecond),
+		strconv.Itoa(report.QueryBenchCount),
+		fmt.Sprintf("%.6f", report.QueryP50Millis),
+		fmt.Sprintf("%.6f", report.QueryP95Millis),
+		fmt.Sprintf("%.6f", report.QueryP99Millis),
+		fmt.Sprintf("%.6f", report.FeatureQueryP95Millis),
+		fmt.Sprintf("%.6f", report.PredictionSeconds),
+		fmt.Sprintf("%.6f", report.PredictionPerSecond),
+		strconv.Itoa(report.PredictionCandidates),
+		fmt.Sprintf("%.6f", report.ProbabilityAUC),
+		fmt.Sprintf("%.6f", report.ProbabilityAP),
+		fmt.Sprintf("%.6f", report.ProbabilityPAt100),
+		fmt.Sprintf("%.6f", report.ImplicitBaseAUC),
+		fmt.Sprintf("%.6f", report.ImplicitBaseAP),
+		fmt.Sprintf("%.6f", report.ImplicitBasePAt100),
+		fmt.Sprintf("%.6f", report.ImplicitAUC),
+		fmt.Sprintf("%.6f", report.ImplicitAP),
+		fmt.Sprintf("%.6f", report.ImplicitPAt100),
+		strconv.Itoa(report.ImplicitRerankTopK),
+		fmt.Sprintf("%.6f", report.ImplicitRerankAlpha),
+		fmt.Sprintf("%.6f", report.RawProbabilityAUC),
+		fmt.Sprintf("%.6f", report.RawProbabilityAP),
+		strconv.Itoa(report.RawProbabilityCount),
+	}
+	if err := writer.Write(row); err != nil {
+		return "", "", err
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return "", "", err
+	}
+	return jsonPath, csvPath, nil
 }
 
 func sanitizeToken(raw string) string {

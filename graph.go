@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -19,10 +20,16 @@ const (
 	graphEdgePrefix      = "\x02ge:"
 	graphAdjOutPrefix    = "\x03go:"
 	graphAdjInPrefix     = "\x04gi:"
+	graphEdgeIndexPrefix = "graph/idx/"
 	graphDefaultLimit    = 128
 	graphDefaultScanPage = 256
 	graphMaxLimit        = 2048
 	graphMaxScanPages    = 64
+	graphDefaultMinHops  = 1
+	graphDefaultMaxHops  = 1
+	graphMaxHops         = 16
+	graphDefaultBranch   = 128
+	graphMaxBranch       = 4096
 )
 
 type GraphNodeRecord struct {
@@ -64,20 +71,27 @@ type graphQueryPredicate struct {
 	Scope       string
 	Field       string
 	Op          string
+	PropPath    []string
 	StringValue string
 	NumberValue float64
 	IsNumber    bool
+	BoolValue   bool
+	IsBool      bool
 }
 
 type graphQueryPlan struct {
-	Direction string
-	EdgeType  string
-	Left      graphQueryNodePattern
-	Right     graphQueryNodePattern
-	Where     []graphQueryPredicate
-	Return    graphQueryReturnMode
-	Limit     int
-	Cursor    []byte
+	Direction   string
+	EdgeType    string
+	Left        graphQueryNodePattern
+	Right       graphQueryNodePattern
+	Where       []graphQueryPredicate
+	MinHops     int
+	MaxHops     int
+	BranchLimit int
+	CostLimit   float64
+	Return      graphQueryReturnMode
+	Limit       int
+	Cursor      []byte
 }
 
 type graphPathView struct {
@@ -93,7 +107,32 @@ type graphRelationTypeCount struct {
 	Weighted float64 `json:"weighted,omitempty"`
 }
 
-var graphWherePredicatePattern = regexp.MustCompile(`(?i)^(from|to|edge)\.(id|type|weight|label)\s*(=|!=|>=|<=|>|<)\s*(.+)$`)
+type graphEdgeSetRequest struct {
+	From            string
+	To              string
+	Type            string
+	Directed        bool
+	Weight          float64
+	Props           map[string]interface{}
+	AutoCreateNodes bool
+}
+
+type graphEdgeSetBatchItem struct {
+	From       string                 `json:"from"`
+	To         string                 `json:"to"`
+	Type       string                 `json:"type,omitempty"`
+	Directed   *bool                  `json:"directed,omitempty"`
+	Weight     *float64               `json:"weight,omitempty"`
+	Props      map[string]interface{} `json:"props,omitempty"`
+	AutoCreate *bool                  `json:"autocreate,omitempty"`
+}
+
+type graphBatchError struct {
+	Index int    `json:"index"`
+	Error string `json:"error"`
+}
+
+var graphWherePredicatePattern = regexp.MustCompile(`(?i)^(from|to|edge)\.([a-z0-9_.]+)\s*(=|!=|>=|<=|>|<)\s*(.+)$`)
 
 func (db *Database) handleGraphNodeSet(args string) (string, error) {
 	params := parseKeyValueArgs(args)
@@ -178,10 +217,141 @@ func (db *Database) handleGraphNodeDel(args string) (string, error) {
 
 func (db *Database) handleGraphEdgeSet(args string) (string, error) {
 	params := parseKeyValueArgs(args)
+	request, errResp, err := graphBuildEdgeSetRequestFromParams(params)
+	if errResp != "" {
+		return errResp, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	edgeID, _, err := db.graphUpsertEdge(request)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SUCCESS,edge_set,id=%s", edgeID), nil
+}
+
+func (db *Database) handleGraphEdgeSetBatch(args string) (string, error) {
+	params := parseKeyValueArgs(args)
+	rawItems := strings.TrimSpace(params["items"])
+	if rawItems == "" {
+		rawItems = strings.TrimSpace(params["json"])
+	}
+	if rawItems == "" {
+		return "ERROR,graph_edge_set_batch_requires_items", nil
+	}
+
+	defaultReq := graphEdgeSetRequest{
+		Type:            graphNormalizeEdgeType(params["type"]),
+		Directed:        true,
+		Weight:          1.0,
+		AutoCreateNodes: true,
+	}
+	if raw := strings.TrimSpace(params["directed"]); raw != "" {
+		defaultReq.Directed = parseBoolFlag(raw)
+	}
+	if raw := strings.TrimSpace(params["weight"]); raw != "" {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return "ERROR,invalid_weight", nil
+		}
+		defaultReq.Weight = parsed
+	}
+	if props, err := graphParseProps(params["props"]); err != nil {
+		return fmt.Sprintf("ERROR,invalid_props:%v", err), nil
+	} else {
+		defaultReq.Props = props
+	}
+	if raw := strings.TrimSpace(params["autocreate"]); raw != "" {
+		defaultReq.AutoCreateNodes = parseBoolFlag(raw)
+	}
+	if raw := strings.TrimSpace(params["ensure_nodes"]); raw != "" {
+		defaultReq.AutoCreateNodes = parseBoolFlag(raw)
+	}
+
+	continueOnError := parseBoolFlag(params["continue_on_error"]) || parseBoolFlag(params["continueonerror"])
+
+	data, err := graphDecodeMaybeBase64JSON(rawItems)
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_items:%v", err), nil
+	}
+	var items []graphEdgeSetBatchItem
+	if err := json.Unmarshal(data, &items); err != nil {
+		return fmt.Sprintf("ERROR,invalid_items:%v", err), nil
+	}
+	if len(items) == 0 {
+		return "ERROR,graph_edge_set_batch_requires_nonempty_items", nil
+	}
+
+	applied := 0
+	created := 0
+	updated := 0
+	batchErrs := make([]graphBatchError, 0)
+	for idx, item := range items {
+		req := defaultReq
+		if from := graphNormalizeID(item.From); from != "" {
+			req.From = from
+		}
+		if to := graphNormalizeID(item.To); to != "" {
+			req.To = to
+		}
+		if typ := graphNormalizeEdgeType(item.Type); typ != "" {
+			req.Type = typ
+		}
+		if item.Directed != nil {
+			req.Directed = *item.Directed
+		}
+		if item.Weight != nil {
+			req.Weight = *item.Weight
+		}
+		if item.Props != nil {
+			req.Props = item.Props
+		}
+		if item.AutoCreate != nil {
+			req.AutoCreateNodes = *item.AutoCreate
+		}
+		_, existed, err := db.graphUpsertEdge(req)
+		if err != nil {
+			batchErrs = append(batchErrs, graphBatchError{Index: idx, Error: err.Error()})
+			if !continueOnError {
+				payload, _ := graphEncodeJSON(batchErrs)
+				return fmt.Sprintf("ERROR,graph_edge_set_batch_failed,applied=%d,payload=%s", applied, payload), nil
+			}
+			continue
+		}
+		applied++
+		if existed {
+			updated++
+		} else {
+			created++
+		}
+	}
+	if len(batchErrs) > 0 {
+		payload, _ := graphEncodeJSON(batchErrs)
+		return fmt.Sprintf(
+			"SUCCESS,requested=%d,applied=%d,created=%d,updated=%d,failed=%d,payload=%s",
+			len(items),
+			applied,
+			created,
+			updated,
+			len(batchErrs),
+			payload,
+		), nil
+	}
+	return fmt.Sprintf(
+		"SUCCESS,requested=%d,applied=%d,created=%d,updated=%d,failed=0",
+		len(items),
+		applied,
+		created,
+		updated,
+	), nil
+}
+
+func graphBuildEdgeSetRequestFromParams(params map[string]string) (graphEdgeSetRequest, string, error) {
 	fromID := graphNormalizeID(params["from"])
 	toID := graphNormalizeID(params["to"])
 	if fromID == "" || toID == "" {
-		return "ERROR,graph_edge_set_requires_from_and_to", nil
+		return graphEdgeSetRequest{}, "ERROR,graph_edge_set_requires_from_and_to", nil
 	}
 	edgeType := graphNormalizeEdgeType(params["type"])
 	directed := true
@@ -192,13 +362,13 @@ func (db *Database) handleGraphEdgeSet(args string) (string, error) {
 	if raw := strings.TrimSpace(params["weight"]); raw != "" {
 		parsed, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
-			return "ERROR,invalid_weight", nil
+			return graphEdgeSetRequest{}, "ERROR,invalid_weight", nil
 		}
 		weight = parsed
 	}
 	props, err := graphParseProps(params["props"])
 	if err != nil {
-		return fmt.Sprintf("ERROR,invalid_props:%v", err), nil
+		return graphEdgeSetRequest{}, fmt.Sprintf("ERROR,invalid_props:%v", err), nil
 	}
 	autoCreateNodes := true
 	if raw := strings.TrimSpace(params["autocreate"]); raw != "" {
@@ -207,25 +377,68 @@ func (db *Database) handleGraphEdgeSet(args string) (string, error) {
 	if raw := strings.TrimSpace(params["ensure_nodes"]); raw != "" {
 		autoCreateNodes = parseBoolFlag(raw)
 	}
-	if autoCreateNodes {
+	return graphEdgeSetRequest{
+		From:            fromID,
+		To:              toID,
+		Type:            edgeType,
+		Directed:        directed,
+		Weight:          weight,
+		Props:           props,
+		AutoCreateNodes: autoCreateNodes,
+	}, "", nil
+}
+
+func graphDecodeMaybeBase64JSON(raw string) ([]byte, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty_payload")
+	}
+	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+		return []byte(trimmed), nil
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
+		return decoded, nil
+	}
+	decoded, err := base64.RawStdEncoding.DecodeString(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
+
+func (db *Database) graphUpsertEdge(request graphEdgeSetRequest) (string, bool, error) {
+	fromID := graphNormalizeID(request.From)
+	toID := graphNormalizeID(request.To)
+	if fromID == "" || toID == "" {
+		return "", false, fmt.Errorf("graph_edge_set_requires_from_and_to")
+	}
+	edgeType := graphNormalizeEdgeType(request.Type)
+	directed := request.Directed
+	weight := request.Weight
+	if math.IsNaN(weight) || math.IsInf(weight, 0) {
+		weight = 1.0
+	}
+
+	if request.AutoCreateNodes {
 		if err := db.graphEnsureNode(fromID); err != nil {
-			return "", err
+			return "", false, err
 		}
 		if err := db.graphEnsureNode(toID); err != nil {
-			return "", err
+			return "", false, err
 		}
 	} else {
 		if _, ok, err := db.graphGetNode(fromID); err != nil {
-			return "", err
+			return "", false, err
 		} else if !ok {
-			return "ERROR,from_node_not_found", nil
+			return "", false, fmt.Errorf("from_node_not_found")
 		}
 		if _, ok, err := db.graphGetNode(toID); err != nil {
-			return "", err
+			return "", false, err
 		} else if !ok {
-			return "ERROR,to_node_not_found", nil
+			return "", false, fmt.Errorf("to_node_not_found")
 		}
 	}
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	edgeID := graphEdgeID(fromID, toID, edgeType, directed)
 	record := GraphEdgeRecord{
@@ -235,22 +448,34 @@ func (db *Database) handleGraphEdgeSet(args string) (string, error) {
 		Type:      edgeType,
 		Directed:  directed,
 		Weight:    weight,
-		Props:     props,
+		Props:     request.Props,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	existed := false
+	var existingRecord GraphEdgeRecord
 	if existing, found, err := db.graphGetEdge(fromID, toID, edgeType, directed); err != nil {
-		return "", err
+		return "", false, err
 	} else if found {
+		existed = true
+		existingRecord = existing
 		record.CreatedAt = existing.CreatedAt
-		if props == nil {
+		if request.Props == nil {
 			record.Props = existing.Props
 		}
 	}
 	if err := db.graphPutEdge(record); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return fmt.Sprintf("SUCCESS,edge_set,id=%s", edgeID), nil
+	if existed {
+		if err := db.graphDeleteEdgePropertyIndexes(existingRecord); err != nil {
+			return "", false, err
+		}
+	}
+	if err := db.graphPutEdgePropertyIndexes(record); err != nil {
+		return "", false, err
+	}
+	return edgeID, existed, nil
 }
 
 func (db *Database) handleGraphEdgeGet(args string) (string, error) {
@@ -393,6 +618,78 @@ func (db *Database) handleGraphNeighbors(args string) (string, error) {
 	}
 }
 
+func (db *Database) handleGraphDegree(args string) (string, error) {
+	params := parseKeyValueArgs(args)
+	nodeID := graphNormalizeID(params["id"])
+	if nodeID == "" {
+		return "ERROR,graph_degree_requires_id", nil
+	}
+	direction := strings.ToLower(strings.TrimSpace(params["direction"]))
+	if direction == "" {
+		direction = "out"
+	}
+	edgeType := graphNormalizeEdgeType(params["type"])
+	if edgeType == "*" {
+		edgeType = ""
+	}
+	weighted := parseBoolFlag(params["weighted"])
+
+	totalCount := 0
+	totalWeight := 0.0
+	collect := func(prefix []byte) error {
+		count, weight, err := db.graphCountAdjacencyPrefix(prefix, weighted)
+		if err != nil {
+			return err
+		}
+		totalCount += count
+		totalWeight += weight
+		return nil
+	}
+	switch direction {
+	case "out":
+		if err := collect(graphAdjOutScanPrefix(nodeID, edgeType)); err != nil {
+			return "", err
+		}
+	case "in":
+		if err := collect(graphAdjInScanPrefix(nodeID, edgeType)); err != nil {
+			return "", err
+		}
+	case "both":
+		if err := collect(graphAdjOutScanPrefix(nodeID, edgeType)); err != nil {
+			return "", err
+		}
+		if err := collect(graphAdjInScanPrefix(nodeID, edgeType)); err != nil {
+			return "", err
+		}
+	default:
+		return "ERROR,invalid_direction", nil
+	}
+	if weighted {
+		return fmt.Sprintf(
+			"SUCCESS,id=%s,direction=%s,type=%s,degree=%d,weighted_degree=%.6f",
+			nodeID,
+			direction,
+			graphDegreeTypeLabel(edgeType),
+			totalCount,
+			totalWeight,
+		), nil
+	}
+	return fmt.Sprintf(
+		"SUCCESS,id=%s,direction=%s,type=%s,degree=%d",
+		nodeID,
+		direction,
+		graphDegreeTypeLabel(edgeType),
+		totalCount,
+	), nil
+}
+
+func graphDegreeTypeLabel(edgeType string) string {
+	if edgeType == "" {
+		return "*"
+	}
+	return edgeType
+}
+
 func (db *Database) handleGraphNeighborTypes(args string) (string, error) {
 	params := parseKeyValueArgs(args)
 	nodeID := graphNormalizeID(params["id"])
@@ -512,10 +809,42 @@ func (db *Database) executeGraphQuery(plan *graphQueryPlan) ([]GraphEdgeRecord, 
 	if plan == nil {
 		return nil, nil, fmt.Errorf("nil plan")
 	}
+	if plan.MinHops < 1 {
+		plan.MinHops = graphDefaultMinHops
+	}
+	if plan.MaxHops < plan.MinHops {
+		plan.MaxHops = plan.MinHops
+	}
+	if plan.MaxHops > graphMaxHops {
+		plan.MaxHops = graphMaxHops
+	}
+	if plan.BranchLimit <= 0 {
+		plan.BranchLimit = graphDefaultBranch
+	}
+	if plan.BranchLimit > graphMaxBranch {
+		plan.BranchLimit = graphMaxBranch
+	}
+	if plan.MaxHops > 1 && len(plan.Cursor) > 0 {
+		return nil, nil, fmt.Errorf("cursor_not_supported_for_multihop")
+	}
+	if plan.MaxHops <= 1 {
+		return db.executeGraphQuerySingleHop(plan)
+	}
+	return db.executeGraphQueryMultiHop(plan)
+}
+
+func (db *Database) executeGraphQuerySingleHop(plan *graphQueryPlan) ([]GraphEdgeRecord, []byte, error) {
 	limit := graphNormalizeLimit(plan.Limit)
 	edgeType := plan.EdgeType
 	var prefix []byte
 	var rightIDFilter string
+	candidateSet, hasIndexFilter, err := db.graphIndexedEdgeCandidates(plan.Where)
+	if err != nil {
+		return nil, nil, err
+	}
+	if hasIndexFilter && len(candidateSet) == 0 {
+		return nil, nil, nil
+	}
 	switch plan.Direction {
 	case "out":
 		prefix = graphAdjOutScanPrefix(plan.Left.ID, edgeType)
@@ -530,6 +859,11 @@ func (db *Database) executeGraphQuery(plan *graphQueryPlan) ([]GraphEdgeRecord, 
 	filter := func(edge *GraphEdgeRecord) bool {
 		if edge == nil {
 			return false
+		}
+		if hasIndexFilter {
+			if _, ok := candidateSet[edge.ID]; !ok {
+				return false
+			}
 		}
 		if rightIDFilter != "" {
 			if plan.Direction == "out" && edge.To != rightIDFilter {
@@ -558,6 +892,161 @@ func (db *Database) executeGraphQuery(plan *graphQueryPlan) ([]GraphEdgeRecord, 
 		return true
 	}
 	return db.graphScanAdjacency(prefix, limit, plan.Cursor, filter)
+}
+
+type graphTraversalState struct {
+	Node    string
+	Hops    int
+	Cost    float64
+	Visited map[string]struct{}
+}
+
+type graphTraversalCandidate struct {
+	Edge     GraphEdgeRecord
+	NextNode string
+	NextCost float64
+}
+
+func (db *Database) executeGraphQueryMultiHop(plan *graphQueryPlan) ([]GraphEdgeRecord, []byte, error) {
+	limit := graphNormalizeLimit(plan.Limit)
+	if limit <= 0 {
+		limit = graphDefaultLimit
+	}
+	candidateSet, hasIndexFilter, err := db.graphIndexedEdgeCandidates(plan.Where)
+	if err != nil {
+		return nil, nil, err
+	}
+	if hasIndexFilter && len(candidateSet) == 0 {
+		return nil, nil, nil
+	}
+	nodeCache := map[string]*GraphNodeRecord{}
+	if !db.graphMatchNodePattern(plan.Left.ID, plan.Left, nodeCache) {
+		return nil, nil, nil
+	}
+	results := make([]GraphEdgeRecord, 0, limit)
+	seenTerminal := make(map[string]struct{}, limit*2)
+	queue := make([]graphTraversalState, 0, graphDefaultLimit)
+	queue = append(queue, graphTraversalState{
+		Node:    plan.Left.ID,
+		Hops:    0,
+		Cost:    0,
+		Visited: map[string]struct{}{plan.Left.ID: {}},
+	})
+
+	for len(queue) > 0 && len(results) < limit {
+		state := queue[0]
+		queue = queue[1:]
+		if state.Hops >= plan.MaxHops {
+			continue
+		}
+
+		adjPrefix := graphAdjOutScanPrefix(state.Node, plan.EdgeType)
+		if plan.Direction == "in" {
+			adjPrefix = graphAdjInScanPrefix(state.Node, plan.EdgeType)
+		}
+		branchFetch := plan.BranchLimit
+		if branchFetch < graphDefaultScanPage {
+			branchFetch = graphDefaultScanPage
+		}
+		edges, _, err := db.graphScanAdjacency(adjPrefix, branchFetch, nil, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(edges) == 0 {
+			continue
+		}
+
+		candidates := make([]graphTraversalCandidate, 0, len(edges))
+		for _, edge := range edges {
+			if hasIndexFilter {
+				if _, ok := candidateSet[edge.ID]; !ok {
+					continue
+				}
+			}
+			nextNode := edge.To
+			if plan.Direction == "in" {
+				nextNode = edge.From
+			}
+			nextHops := state.Hops + 1
+			stepCost := graphEdgeTraversalCost(edge.Weight)
+			if math.IsInf(stepCost, 1) {
+				continue
+			}
+			nextCost := state.Cost + stepCost
+			if plan.CostLimit > 0 && nextCost > plan.CostLimit {
+				continue
+			}
+
+			edgePassesWhere := true
+			for _, pred := range plan.Where {
+				ok, predErr := db.graphEvaluatePredicate(&edge, pred, nodeCache)
+				if predErr != nil || !ok {
+					edgePassesWhere = false
+					break
+				}
+			}
+			if !edgePassesWhere {
+				continue
+			}
+
+			if nextHops >= plan.MinHops {
+				if db.graphMatchNodePattern(nextNode, plan.Right, nodeCache) {
+					terminalKey := fmt.Sprintf("%s|%d", edge.ID, nextHops)
+					if _, exists := seenTerminal[terminalKey]; !exists {
+						seenTerminal[terminalKey] = struct{}{}
+						results = append(results, edge)
+						if len(results) >= limit {
+							break
+						}
+					}
+				}
+			}
+
+			if nextHops < plan.MaxHops {
+				if _, seen := state.Visited[nextNode]; seen {
+					continue
+				}
+				candidates = append(candidates, graphTraversalCandidate{
+					Edge:     edge,
+					NextNode: nextNode,
+					NextCost: nextCost,
+				})
+			}
+		}
+		if len(results) >= limit {
+			break
+		}
+
+		if len(candidates) == 0 {
+			continue
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].Edge.Weight == candidates[j].Edge.Weight {
+				if candidates[i].NextCost == candidates[j].NextCost {
+					return candidates[i].NextNode < candidates[j].NextNode
+				}
+				return candidates[i].NextCost < candidates[j].NextCost
+			}
+			return candidates[i].Edge.Weight > candidates[j].Edge.Weight
+		})
+		if len(candidates) > plan.BranchLimit {
+			candidates = candidates[:plan.BranchLimit]
+		}
+		for _, cand := range candidates {
+			nextVisited := make(map[string]struct{}, len(state.Visited)+1)
+			for key := range state.Visited {
+				nextVisited[key] = struct{}{}
+			}
+			nextVisited[cand.NextNode] = struct{}{}
+			queue = append(queue, graphTraversalState{
+				Node:    cand.NextNode,
+				Hops:    state.Hops + 1,
+				Cost:    cand.NextCost,
+				Visited: nextVisited,
+			})
+		}
+	}
+	return results, nil, nil
 }
 
 func parseGraphQuery(raw string) (*graphQueryPlan, error) {
@@ -626,18 +1115,26 @@ func parseGraphQuery(raw string) (*graphQueryPlan, error) {
 	}
 	idx = nextIdx
 	plan := &graphQueryPlan{
-		Direction: direction,
-		EdgeType:  edgeType,
-		Left:      leftNode,
-		Right:     rightNode,
-		Return:    graphReturnEdges,
-		Limit:     graphDefaultLimit,
+		Direction:   direction,
+		EdgeType:    edgeType,
+		Left:        leftNode,
+		Right:       rightNode,
+		MinHops:     graphDefaultMinHops,
+		MaxHops:     graphDefaultMaxHops,
+		BranchLimit: graphDefaultBranch,
+		CostLimit:   0,
+		Return:      graphReturnEdges,
+		Limit:       graphDefaultLimit,
 	}
 
 	rest := strings.TrimSpace(trimmed[idx:])
 	if rest != "" {
 		// Clause order is fixed for deterministic parsing and execution planning.
-		whereClause, afterWhere, err := graphConsumeClause(rest, "WHERE", []string{"RETURN", "LIMIT", "CURSOR"})
+		whereClause, afterWhere, err := graphConsumeClause(
+			rest,
+			"WHERE",
+			[]string{"HOPS", "BRANCH_LIMIT", "BRANCH", "COST_LIMIT", "COST", "RETURN", "LIMIT", "CURSOR"},
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -649,6 +1146,49 @@ func parseGraphQuery(raw string) (*graphQueryPlan, error) {
 			plan.Where = preds
 		}
 		rest = afterWhere
+
+		hopsClause, afterHops, err := graphConsumeClause(rest, "HOPS", []string{"BRANCH_LIMIT", "BRANCH", "COST_LIMIT", "COST", "RETURN", "LIMIT", "CURSOR"})
+		if err != nil {
+			return nil, err
+		}
+		if hopsClause != "" {
+			minHops, maxHops, err := parseGraphHopBounds(hopsClause)
+			if err != nil {
+				return nil, err
+			}
+			plan.MinHops = minHops
+			plan.MaxHops = maxHops
+		}
+		rest = afterHops
+
+		branchClause, afterBranch, err := graphConsumeAnyClause(rest, []string{"BRANCH_LIMIT", "BRANCH"}, []string{"COST_LIMIT", "COST", "RETURN", "LIMIT", "CURSOR"})
+		if err != nil {
+			return nil, err
+		}
+		if branchClause != "" {
+			branchLimit, err := strconv.Atoi(strings.TrimSpace(branchClause))
+			if err != nil {
+				return nil, fmt.Errorf("invalid_branch_limit")
+			}
+			plan.BranchLimit = graphNormalizeBranchLimit(branchLimit)
+		}
+		rest = afterBranch
+
+		costClause, afterCost, err := graphConsumeAnyClause(rest, []string{"COST_LIMIT", "COST"}, []string{"RETURN", "LIMIT", "CURSOR"})
+		if err != nil {
+			return nil, err
+		}
+		if costClause != "" {
+			costLimit, err := strconv.ParseFloat(strings.TrimSpace(costClause), 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid_cost_limit")
+			}
+			if costLimit < 0 || math.IsNaN(costLimit) || math.IsInf(costLimit, 0) {
+				return nil, fmt.Errorf("invalid_cost_limit")
+			}
+			plan.CostLimit = costLimit
+		}
+		rest = afterCost
 
 		returnClause, afterReturn, err := graphConsumeClause(rest, "RETURN", []string{"LIMIT", "CURSOR"})
 		if err != nil {
@@ -777,29 +1317,93 @@ func parseGraphWhereClause(raw string) ([]graphQueryPredicate, error) {
 			return nil, fmt.Errorf("invalid_predicate:%s", part)
 		}
 		scope := strings.ToLower(matches[1])
-		field := strings.ToLower(matches[2])
+		fieldExprRaw := strings.TrimSpace(matches[2])
+		fieldExpr := strings.ToLower(fieldExprRaw)
 		op := matches[3]
 		literal := strings.TrimSpace(matches[4])
 		pred := graphQueryPredicate{
 			Scope: scope,
-			Field: field,
 			Op:    op,
 		}
-		switch field {
-		case "weight":
-			value, err := strconv.ParseFloat(graphUnquote(literal), 64)
-			if err != nil {
-				return nil, fmt.Errorf("invalid_weight_predicate")
+		switch scope {
+		case "edge":
+			switch {
+			case fieldExpr == "type":
+				pred.Field = "type"
+				if op != "=" && op != "!=" {
+					return nil, fmt.Errorf("string_predicates_only_support_equal_or_not_equal")
+				}
+				pred.StringValue = graphUnquote(literal)
+			case fieldExpr == "weight":
+				pred.Field = "weight"
+				value, err := strconv.ParseFloat(graphUnquote(literal), 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid_weight_predicate")
+				}
+				pred.IsNumber = true
+				pred.NumberValue = value
+			case strings.HasPrefix(fieldExpr, "props."):
+				pred.Field = "prop"
+				propPath := fieldExprRaw[len("props."):]
+				segments := graphNormalizePropertyPath(propPath)
+				if len(segments) == 0 {
+					return nil, fmt.Errorf("invalid_property_predicate")
+				}
+				pred.PropPath = segments
+				if op == ">" || op == ">=" || op == "<" || op == "<=" {
+					value, err := strconv.ParseFloat(graphUnquote(literal), 64)
+					if err != nil {
+						return nil, fmt.Errorf("invalid_property_numeric_predicate")
+					}
+					pred.IsNumber = true
+					pred.NumberValue = value
+				} else {
+					parsedTypedLiteral := false
+					if !graphIsQuotedLiteral(literal) {
+						if value, err := strconv.ParseFloat(graphUnquote(literal), 64); err == nil {
+							pred.IsNumber = true
+							pred.NumberValue = value
+							parsedTypedLiteral = true
+						}
+						if !parsedTypedLiteral {
+							switch strings.ToLower(strings.TrimSpace(literal)) {
+							case "true":
+								pred.IsBool = true
+								pred.BoolValue = true
+								parsedTypedLiteral = true
+							case "false":
+								pred.IsBool = true
+								pred.BoolValue = false
+								parsedTypedLiteral = true
+							}
+						}
+					}
+					if !parsedTypedLiteral {
+						pred.StringValue = graphUnquote(literal)
+					}
+				}
+			default:
+				return nil, fmt.Errorf("unsupported_predicate_field:%s", fieldExpr)
 			}
-			pred.IsNumber = true
-			pred.NumberValue = value
-		case "id", "type", "label":
-			if op != "=" && op != "!=" {
-				return nil, fmt.Errorf("string_predicates_only_support_equal_or_not_equal")
+		case "from", "to":
+			switch fieldExpr {
+			case "id":
+				pred.Field = "id"
+				if op != "=" && op != "!=" {
+					return nil, fmt.Errorf("string_predicates_only_support_equal_or_not_equal")
+				}
+				pred.StringValue = graphUnquote(literal)
+			case "label":
+				pred.Field = "label"
+				if op != "=" && op != "!=" {
+					return nil, fmt.Errorf("string_predicates_only_support_equal_or_not_equal")
+				}
+				pred.StringValue = graphUnquote(literal)
+			default:
+				return nil, fmt.Errorf("unsupported_predicate_field:%s", fieldExpr)
 			}
-			pred.StringValue = graphUnquote(literal)
 		default:
-			return nil, fmt.Errorf("unsupported_predicate_field:%s", field)
+			return nil, fmt.Errorf("unsupported_scope")
 		}
 		preds = append(preds, pred)
 	}
@@ -903,6 +1507,92 @@ func graphConsumeClause(raw string, keyword string, stopKeywords []string) (stri
 		return "", "", fmt.Errorf("internal_clause_parse_error")
 	}
 	return value, next, nil
+}
+
+func graphConsumeAnyClause(raw string, keywords []string, stopKeywords []string) (string, string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", nil
+	}
+	for _, keyword := range keywords {
+		value, next, err := graphConsumeClause(trimmed, keyword, stopKeywords)
+		if err != nil {
+			return "", "", err
+		}
+		if strings.TrimSpace(next) != trimmed || value != "" {
+			return value, next, nil
+		}
+	}
+	return "", trimmed, nil
+}
+
+func parseGraphHopBounds(raw string) (int, int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, 0, fmt.Errorf("hops_clause_requires_value")
+	}
+	normalize := func(minHops int, maxHops int) (int, int, error) {
+		if minHops < 1 || maxHops < 1 {
+			return 0, 0, fmt.Errorf("invalid_hops")
+		}
+		if minHops > maxHops {
+			return 0, 0, fmt.Errorf("invalid_hops")
+		}
+		if maxHops > graphMaxHops {
+			maxHops = graphMaxHops
+		}
+		return minHops, maxHops, nil
+	}
+	if strings.Contains(value, "..") {
+		parts := strings.SplitN(value, "..", 2)
+		if len(parts) != 2 {
+			return 0, 0, fmt.Errorf("invalid_hops")
+		}
+		minHops, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid_hops")
+		}
+		maxHops, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid_hops")
+		}
+		return normalize(minHops, maxHops)
+	}
+	if strings.Count(value, "-") == 1 && !strings.HasPrefix(value, "-") {
+		parts := strings.SplitN(value, "-", 2)
+		minHops, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid_hops")
+		}
+		maxHops, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid_hops")
+		}
+		return normalize(minHops, maxHops)
+	}
+	maxHops, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid_hops")
+	}
+	return normalize(1, maxHops)
+}
+
+func graphNormalizeBranchLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return graphDefaultBranch
+	case limit > graphMaxBranch:
+		return graphMaxBranch
+	default:
+		return limit
+	}
+}
+
+func graphEdgeTraversalCost(weight float64) float64 {
+	if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+		return math.Inf(1)
+	}
+	return 1.0 / weight
 }
 
 func graphFindKeyword(raw string, keyword string) int {
@@ -1028,6 +1718,226 @@ func graphUnquote(raw string) string {
 	return trimmed
 }
 
+func graphIsQuotedLiteral(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) < 2 {
+		return false
+	}
+	return (trimmed[0] == '\'' && trimmed[len(trimmed)-1] == '\'') || (trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"')
+}
+
+func graphNormalizePropertyPath(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ".")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func graphLookupPropertyValue(props map[string]interface{}, path []string) (interface{}, bool) {
+	if len(path) == 0 || props == nil {
+		return nil, false
+	}
+	var current interface{} = props
+	for _, segment := range path {
+		obj, ok := current.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		next, ok := obj[segment]
+		if !ok {
+			return nil, false
+		}
+		current = next
+	}
+	return current, true
+}
+
+func graphValueAsFloat(value interface{}) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return 0, false
+		}
+		return typed, true
+	case float32:
+		v := float64(typed)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, false
+		}
+		return v, true
+	case int:
+		return float64(typed), true
+	case int8:
+		return float64(typed), true
+	case int16:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case uint:
+		return float64(typed), true
+	case uint8:
+		return float64(typed), true
+	case uint16:
+		return float64(typed), true
+	case uint32:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return 0, false
+		}
+		return parsed, true
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+func graphValueAsBool(value interface{}) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
+}
+
+func graphPropertyValueAsString(value interface{}) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	default:
+		if number, ok := graphValueAsFloat(value); ok {
+			return strconv.FormatFloat(number, 'f', -1, 64)
+		}
+		return fmt.Sprintf("%v", value)
+	}
+}
+
+func (db *Database) graphIndexedEdgeCandidates(predicates []graphQueryPredicate) (map[string]struct{}, bool, error) {
+	if len(predicates) == 0 {
+		return nil, false, nil
+	}
+	var indexedPredicates []graphQueryPredicate
+	for _, pred := range predicates {
+		if pred.Scope != "edge" || pred.Field != "prop" || pred.Op != "=" {
+			continue
+		}
+		if len(pred.PropPath) != 1 {
+			continue
+		}
+		if !(pred.IsNumber || pred.IsBool || pred.StringValue != "") {
+			continue
+		}
+		indexedPredicates = append(indexedPredicates, pred)
+	}
+	if len(indexedPredicates) == 0 {
+		return nil, false, nil
+	}
+	var candidateSet map[string]struct{}
+	for _, pred := range indexedPredicates {
+		token := ""
+		switch {
+		case pred.IsNumber:
+			token = "n:" + strconv.FormatFloat(pred.NumberValue, 'f', -1, 64)
+		case pred.IsBool:
+			if pred.BoolValue {
+				token = "b:1"
+			} else {
+				token = "b:0"
+			}
+		default:
+			token = "s:" + pred.StringValue
+		}
+		indexMatches, err := db.graphScanIndexedEdgeIDs(pred.PropPath[0], token)
+		if err != nil {
+			return nil, true, err
+		}
+		if candidateSet == nil {
+			candidateSet = indexMatches
+			continue
+		}
+		for edgeID := range candidateSet {
+			if _, ok := indexMatches[edgeID]; !ok {
+				delete(candidateSet, edgeID)
+			}
+		}
+		if len(candidateSet) == 0 {
+			return candidateSet, true, nil
+		}
+	}
+	return candidateSet, true, nil
+}
+
+func (db *Database) graphScanIndexedEdgeIDs(propKey string, valueToken string) (map[string]struct{}, error) {
+	prefix := graphEdgeIndexScanPrefix(propKey, valueToken)
+	out := make(map[string]struct{})
+	cursor := []byte(nil)
+	for pages := 0; pages < graphMaxScanPages*8; pages++ {
+		results, nextCursor, err := db.PairScanWithOptions(prefix, graphDefaultScanPage, cursor, true)
+		if err != nil {
+			return nil, err
+		}
+		if len(results) == 0 {
+			return out, nil
+		}
+		for _, result := range results {
+			value := string(result.Value)
+			if !strings.HasPrefix(value, graphEdgeIndexPrefix) {
+				continue
+			}
+			parts := strings.Split(value, "/")
+			if len(parts) < 4 {
+				continue
+			}
+			edgeIDEncoded := parts[len(parts)-1]
+			decoded, err := base64.RawURLEncoding.DecodeString(edgeIDEncoded)
+			if err != nil {
+				continue
+			}
+			out[string(decoded)] = struct{}{}
+		}
+		if len(nextCursor) == 0 || len(results) < graphDefaultScanPage {
+			return out, nil
+		}
+		cursor = nextCursor
+	}
+	return out, nil
+}
+
 func (db *Database) graphMatchNodePattern(nodeID string, pattern graphQueryNodePattern, cache map[string]*GraphNodeRecord) bool {
 	if pattern.Wildcard {
 		return true
@@ -1061,6 +1971,34 @@ func (db *Database) graphEvaluatePredicate(edge *GraphEdgeRecord, pred graphQuer
 			return graphCompareString(edge.Type, pred.Op, pred.StringValue), nil
 		case "weight":
 			return graphCompareFloat(edge.Weight, pred.Op, pred.NumberValue), nil
+		case "prop":
+			propValue, ok := graphLookupPropertyValue(edge.Props, pred.PropPath)
+			if !ok {
+				if pred.Op == "!=" {
+					return true, nil
+				}
+				return false, nil
+			}
+			if pred.IsNumber {
+				actual, ok := graphValueAsFloat(propValue)
+				if !ok {
+					return false, nil
+				}
+				return graphCompareFloat(actual, pred.Op, pred.NumberValue), nil
+			}
+			if pred.IsBool {
+				actual, ok := graphValueAsBool(propValue)
+				if !ok {
+					return false, nil
+				}
+				expected := pred.BoolValue
+				if pred.Op == "!=" {
+					return actual != expected, nil
+				}
+				return actual == expected, nil
+			}
+			actual := graphPropertyValueAsString(propValue)
+			return graphCompareString(actual, pred.Op, pred.StringValue), nil
 		default:
 			return false, fmt.Errorf("unsupported_edge_predicate")
 		}
@@ -1205,6 +2143,9 @@ func (db *Database) graphGetEdgeByPairKey(pairKey []byte) (GraphEdgeRecord, bool
 }
 
 func (db *Database) graphDeleteEdge(record GraphEdgeRecord) error {
+	if err := db.graphDeleteEdgePropertyIndexes(record); err != nil {
+		return err
+	}
 	edgeKey := graphEdgePairKey(record.From, record.To, record.Type, record.Directed)
 	_, err := db.graphDeletePairAndPayload(edgeKey)
 	if err != nil {
@@ -1217,6 +2158,127 @@ func (db *Database) graphDeleteEdge(record GraphEdgeRecord) error {
 		return err
 	}
 	return nil
+}
+
+func (db *Database) graphPutEdgePropertyIndexes(record GraphEdgeRecord) error {
+	entries := graphBuildEdgeIndexEntries(record)
+	if len(entries) == 0 {
+		return nil
+	}
+	edgeKey := graphEdgePairKey(record.From, record.To, record.Type, record.Directed)
+	for _, pairKey := range entries {
+		if _, err := db.graphUpsertPairPayload(pairKey, edgeKey, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *Database) graphDeleteEdgePropertyIndexes(record GraphEdgeRecord) error {
+	entries := graphBuildEdgeIndexEntries(record)
+	if len(entries) == 0 {
+		return nil
+	}
+	for _, pairKey := range entries {
+		if _, err := db.graphDeletePairAndPayload(pairKey); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func graphBuildEdgeIndexEntries(record GraphEdgeRecord) [][]byte {
+	if record.Props == nil || len(record.Props) == 0 {
+		return nil
+	}
+	edgeID := record.ID
+	if edgeID == "" {
+		edgeID = graphEdgeID(record.From, record.To, record.Type, record.Directed)
+	}
+	keys := make([][]byte, 0, len(record.Props))
+	for propKey, rawValue := range record.Props {
+		propKey = strings.TrimSpace(propKey)
+		if propKey == "" {
+			continue
+		}
+		token, ok := graphCanonicalPropertyToken(rawValue)
+		if !ok {
+			continue
+		}
+		keys = append(keys, graphEdgeIndexPairKey(propKey, token, edgeID))
+	}
+	return keys
+}
+
+func graphEdgeIndexPairKey(propKey string, valueToken string, edgeID string) []byte {
+	return []byte(
+		graphEdgeIndexPrefix +
+			graphEncodeSegment(propKey) +
+			"/" +
+			graphEncodeSegment(valueToken) +
+			"/" +
+			graphEncodeSegment(edgeID),
+	)
+}
+
+func graphEdgeIndexScanPrefix(propKey string, valueToken string) []byte {
+	return []byte(
+		graphEdgeIndexPrefix +
+			graphEncodeSegment(propKey) +
+			"/" +
+			graphEncodeSegment(valueToken) +
+			"/",
+	)
+}
+
+func graphCanonicalPropertyToken(value interface{}) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return "s:" + typed, true
+	case bool:
+		if typed {
+			return "b:1", true
+		}
+		return "b:0", true
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return "", false
+		}
+		return "n:" + strconv.FormatFloat(typed, 'f', -1, 64), true
+	case float32:
+		v := float64(typed)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return "", false
+		}
+		return "n:" + strconv.FormatFloat(v, 'f', -1, 64), true
+	case int:
+		return "n:" + strconv.FormatInt(int64(typed), 10), true
+	case int8:
+		return "n:" + strconv.FormatInt(int64(typed), 10), true
+	case int16:
+		return "n:" + strconv.FormatInt(int64(typed), 10), true
+	case int32:
+		return "n:" + strconv.FormatInt(int64(typed), 10), true
+	case int64:
+		return "n:" + strconv.FormatInt(typed, 10), true
+	case uint:
+		return "n:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint8:
+		return "n:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint16:
+		return "n:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint32:
+		return "n:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint64:
+		return "n:" + strconv.FormatUint(typed, 10), true
+	case json.Number:
+		if parsed, err := typed.Float64(); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
+			return "n:" + strconv.FormatFloat(parsed, 'f', -1, 64), true
+		}
+		return "", false
+	default:
+		return "", false
+	}
 }
 
 func (db *Database) graphDeleteNodeEdges(nodeID string) error {
@@ -1401,6 +2463,45 @@ func (db *Database) graphScanAdjacency(
 		currentCursor = nextCursor
 	}
 	return out, nil, nil
+}
+
+func (db *Database) graphCountAdjacencyPrefix(prefix []byte, weighted bool) (int, float64, error) {
+	limit := graphDefaultScanPage
+	var cursor []byte
+	totalCount := 0
+	totalWeight := 0.0
+	pageCount := 0
+	for {
+		results, nextCursor, err := db.PairScanWithOptions(prefix, limit, cursor, true)
+		if err != nil {
+			return totalCount, totalWeight, err
+		}
+		if len(results) == 0 {
+			return totalCount, totalWeight, nil
+		}
+		totalCount += len(results)
+		if weighted {
+			for _, res := range results {
+				edgePairKey, err := db.readValuePayload(res.Key)
+				if err != nil || len(edgePairKey) == 0 {
+					continue
+				}
+				edge, found, err := db.graphGetEdgeByPairKey(edgePairKey)
+				if err != nil || !found {
+					continue
+				}
+				totalWeight += edge.Weight
+			}
+		}
+		pageCount++
+		if len(nextCursor) == 0 || len(results) < limit {
+			return totalCount, totalWeight, nil
+		}
+		if pageCount >= graphMaxScanPages*32 {
+			return totalCount, totalWeight, nil
+		}
+		cursor = nextCursor
+	}
 }
 
 func (db *Database) graphScanNeighborTypes(
