@@ -12,12 +12,12 @@ import (
 var errJumpNodeMissing = errors.New("jump_node_missing")
 
 type JumpNode struct {
-	ID          uint32
-	Bytes       []byte
-	HasTerminal bool
+	ID             uint32
+	Bytes          []byte
+	HasTerminal    bool
 	HiddenTerminal bool
-	TerminalKey uint64
-	NextTableID uint32
+	TerminalKey    uint64
+	NextTableID    uint32
 }
 
 func (db *Database) loadNextJumpID() error {
@@ -51,12 +51,12 @@ func (db *Database) createJump(bytes []byte, hasTerminal bool, terminalKey uint6
 		return 0, err
 	}
 	node := &JumpNode{
-		ID:          id,
-		Bytes:       append([]byte{}, bytes...),
-		HasTerminal: hasTerminal,
+		ID:             id,
+		Bytes:          append([]byte{}, bytes...),
+		HasTerminal:    hasTerminal,
 		HiddenTerminal: terminalHidden && hasTerminal,
-		TerminalKey: terminalKey,
-		NextTableID: nextTableID,
+		TerminalKey:    terminalKey,
+		NextTableID:    nextTableID,
 	}
 	if err := db.writeJump(node); err != nil {
 		return 0, err
@@ -287,12 +287,12 @@ func (db *Database) loadJumpFromLegacyFileLocked(id uint32) (*JumpNode, error) {
 	offset += 8
 	nextTableID := binary.BigEndian.Uint32(data[offset : offset+4])
 	return &JumpNode{
-		ID:          id,
-		Bytes:       bytes,
-		HasTerminal: (flags & 0x01) != 0,
+		ID:             id,
+		Bytes:          bytes,
+		HasTerminal:    (flags & 0x01) != 0,
 		HiddenTerminal: (flags & 0x04) != 0,
-		TerminalKey: terminalKey,
-		NextTableID: nextTableID,
+		TerminalKey:    terminalKey,
+		NextTableID:    nextTableID,
 	}, nil
 }
 
@@ -362,11 +362,11 @@ func decodeJumpAt(reader io.ReaderAt, offset int64, id uint32) (*JumpNode, error
 	offsetInt += 8
 	nextTableID := binary.BigEndian.Uint32(entry[offsetInt : offsetInt+4])
 	return &JumpNode{
-		ID:          id,
-		Bytes:       bytes,
-		HasTerminal: (flags & 0x01) != 0,
+		ID:             id,
+		Bytes:          bytes,
+		HasTerminal:    (flags & 0x01) != 0,
 		HiddenTerminal: (flags & 0x04) != 0,
-		TerminalKey: terminalKey,
-		NextTableID: nextTableID,
+		TerminalKey:    terminalKey,
+		NextTableID:    nextTableID,
 	}, nil
 }

@@ -20,16 +20,16 @@ const (
 	RecycleCounterSize = 2
 
 	// Pair Table (TreeTable)
-	PairEntryKeySize        = 6
-	PairEntryChildSize      = 4
-	PairEntrySize           = 1 + PairEntryKeySize + PairEntryChildSize
-	PairTableIDSize         = 4 // 4 bytes per l'ID di una tabella pair (uint32)
-	PairTableNumByteCombos  = 1 // Quante combinazioni di byte per file (1 = 256 entrate)
+	PairEntryKeySize          = 6
+	PairEntryChildSize        = 4
+	PairEntrySize             = 1 + PairEntryKeySize + PairEntryChildSize
+	PairTableIDSize           = 4 // 4 bytes per l'ID di una tabella pair (uint32)
+	PairTableNumByteCombos    = 1 // Quante combinazioni di byte per file (1 = 256 entrate)
 	PairTablePreallocatedSize = PairTableNumByteCombos * 256 * PairEntrySize
-	FlagIsTerminal          = 1 << 0
-	FlagHasChild            = 1 << 1
-	FlagHasJump             = 1 << 2
-	FlagHidden              = 1 << 3
+	FlagIsTerminal            = 1 << 0
+	FlagHasChild              = 1 << 1
+	FlagHasJump               = 1 << 2
+	FlagHidden                = 1 << 3
 )
 
 // ValueLocationIndex rappresenta il puntatore da 5 byte al valore.

@@ -1,4 +1,4 @@
-﻿// tables.go
+// tables.go
 package main
 
 import (

@@ -450,4 +450,3 @@ func parseKey(resp string) (uint64, error) {
 	}
 	return key, nil
 }
-

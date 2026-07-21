@@ -57,8 +57,8 @@ continuation metadata, and concept caches:
   lookups never re-open SQLite or object stores.
 - When benchmarking reducers, export `CHEETAHDB_BENCH=1` and run
   `go test -run TestCheetahDBBenchmark -count=1 -v` for reproducible throughput snapshots.
-- Keep `cheetah-db/AI_REFERENCE.md` handy for cache-sizing tables, tmux/screen launch recipes, and
-  namespace troubleshooting tips when you run sustained ingest/eval loops.
+- See [`AGENTS.md`](AGENTS.md) for cache-sizing guidance, launch recipes, and namespace
+  troubleshooting notes when you run sustained ingest/eval loops.
 
 ## Memory & SSD Guidelines
 
@@ -77,8 +77,7 @@ continuation metadata, and concept caches:
 ## Building & Running
 
 ```bash
-cd cheetah-db
-bash build.sh              # produces ./cheetah-server
+bash build.sh              # produces ./cheetah-server (or: go build -o cheetah-server .)
 ./cheetah-server           # interactive CLI + TCP listener
 # or launch headless
 CHEETAH_HEADLESS=1 ./cheetah-server
@@ -144,7 +143,8 @@ GRAPH_NEIGHBOR_TYPES id=<node> [direction=out|in|both] [limit=<n>] [cursor=<toke
 GRAPH_QUERY MATCH (...) ...     # graph pattern query (see syntax below)
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry
-RECYCLE <value_size>            # report recycle stats per table
+FILE_CHECKPOINT [IDLE=<dur>] [DROP_CACHE] [CLOSE_HANDLES]
+                                # force-flush dirty sectors / release idle handles mid-run
 SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
 LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (optionally capped)
 ```
@@ -152,7 +152,8 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
 - Prefix strings (`ctx:`, `ctxv:`, `prob:2`, etc.) are treated as raw bytes; encode binary prefixes
   as `x<HEX>`.
 - `PAIR_SCAN` replies include `items=<hex_prefix>:<abs_key>` pairs plus `next_cursor=<token>` when
-  additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue. Add `include_hidden=1` to return hidden terminals.
+  additional pages remain. Reissue `PAIR_SCAN <prefix> <limit> <token>` (over both CLI and TCP) to
+  continue from that cursor. Add `include_hidden=1` to return hidden terminals.
 - `PAIR_REDUCE` includes inline base64 payloads so reducers can hydrate counters/probabilities
   without extra `READ` calls. Each response also includes `next_cursor` when more items exist.
 - `PAIR_REDUCE_ASYNC` is ideal for long-running reducers: it queues the request, returns a `job`
@@ -272,8 +273,8 @@ SUCCESS,key=1_deleted
   CLI for request/response payloads) and expose GPU-style probability merges:
 
   - `PREDICT_SET key=<prefix> value=<bytes> prob=<0-1> [weights=<base64 json>] [table=name]` stores a
-    candidate value for the given prefix. Context weights use the JSON schema documented in
-    `AI_REFERENCE.md` (encode the JSON blob, then pass it as base64).
+    candidate value for the given prefix. Context weights use the `ContextWeight` JSON schema defined
+    in [`prediction_table.go`](prediction_table.go) (encode the JSON blob, then pass it as base64).
   - `PREDICT_QUERY key=<prefix> [keys=a,b,c] [ctx=<base64 json>] [windows=<base64 json>]
     [key_windows=<base64 json>] [merge=avg|sum|max] [table=name]` evaluates one or many prefixes and
     merges their probability windows. `ctx` may be a base64-encoded JSON array (`[[...], ...]`) or an
@@ -318,8 +319,8 @@ SUCCESS,key=1_deleted
 
 - `PAIR_SCAN <prefix> [limit]` favors namespace exhaustiveness: `PAIR_SCAN ctx: 100` walks the first
   100 contexts alphabetically, while `PAIR_SCAN * 0` streams the entire trie.
-- `HotPathAdapter`-style integrations typically alternate `PAIR_SCAN` with `READ` to hydrate payloads;
-  keep a cache of `<value_size, table_id, entry_id>` tuples nearby when building custom adapters.
+- Client adapters typically alternate `PAIR_SCAN` with `READ` to hydrate payloads; keep a cache of
+  `<value_size, table_id, entry_id>` tuples nearby when building custom adapters.
 
 ## Reducer Hooks
 
@@ -342,50 +343,47 @@ SUCCESS,key=1_deleted
   `cheetah_db_benchmark_<timestamp>.log` so you can diff throughput across cache sizes or reducer
   tweaks.
 
-For deep operational checklists (tmux helpers, namespace triage, cache sizing matrices), see
-`AI_REFERENCE.md` in this directory.
+For the agent-facing operational map (file ownership, contracts, config/env reference, and known
+gaps), see [`AGENTS.md`](AGENTS.md) in this directory.
 
 ## Tree Indexing & Algorithmic Logic
 
 cheetah-db’s performance hinges on a deterministic, trie-backed index that treats every namespace or
-key prefix as a path through fixed-size `PairTable` nodes. Each node behaves like the `CharTreeNode`
-structure shown in `src/helpers/char_tree_similarity.py`: it has fixed-span children (one raw byte
-per hop by default, optionally two when configured), terminal
-flags, and in-memory counts that highlight “hot” substrings. While the helper library leans on that
-structure to compare strings (build a char tree, keep significant substrings, compute overlaps), the
-database applies the same idea to on-disk tables:
+key prefix as a path through fixed-size `PairTable` nodes. Each node has fixed-span children (one raw
+byte per hop by default, optionally two when configured) plus independent terminal/child/jump flags,
+so the same structure that indexes keys also highlights “hot” shared prefixes. The entry layout is
+defined in [`types.go`](types.go) and the traversal logic lives in [`database.go`](database.go) and
+[`pair_codec.go`](pair_codec.go):
 
 - Every namespace (e.g., `ctx:BERLIN`) is stored as raw bytes. Walking those bytes selects a slot
   inside the root pair table and either follows a child table ID or marks the node as terminal with
-  the absolute payload key. This mirrors the helper’s recursion where `CharTree` expands one
-  character at a time and records substring counts.
+  the absolute payload key. A single node can be both terminal and a parent, so `ctx:` and
+  `ctx:BERLIN` can both carry values.
 - `PAIR_SCAN` snapshots each node and streams children in lexical order, so namespace enumeration only
   touches the branches that exist. Nodes allocate exactly `∑_{i=1..pair_index_bytes} 256^i` slots
   (256 entries when indexing a single byte, 256 + 65,536 entries when indexing two bytes), so the
-  engine can seek directly via `branchIndex * PairEntrySize` with no heap allocations—the storage
-  equivalent of how `CharTree.from_text` iterates substrings without rebuilding prefixes.
+  engine can seek directly via `branchIndex * PairEntrySize` with no heap allocations.
 - Jump nodes collapse unique suffixes into a compact segment so single-key branches no longer
   allocate entire tables. `PAIR_SET` writes the remainder of a key into a jump node whenever a branch
   has no siblings, and the node is split automatically if a later key shares part of that suffix. On
   deletions the engine rechecks whether a child table now has only one branch and promotes it back
   into a jump when possible, keeping disk usage proportional to the number of active prefixes.
 - `PAIR_REDUCE` executes reducers while it walks the trie. As soon as a branch is materialized, the
-  reducer can hydrate payloads (`readValuePayload`) and emit inline aggregates. This is conceptually
-  the same as weighting recurring substrings in `substring_multiset_similarity`: we take advantage of
+  reducer can hydrate payloads (`readValuePayload`) and emit inline aggregates, taking advantage of
   prefix locality to amortize disk reads and to reuse cached payloads when sibling prefixes live in
   the same tables.
-- Future performance work leverages this “tree indexing” foundation: we can precompute namespace
-  statistics (counts, rolling hashes, Top-K summaries) and branch-local caches the same way
-  `char_tree_similarity.py` keeps only significant substrings. Because the layout guarantees stable
-  offsets, prefetchers or GPU-backed reducers can schedule precise `ReadAt` calls without scanning.
+- Future performance work leverages this “tree indexing” foundation: precompute namespace statistics
+  (counts, rolling hashes, Top-K summaries) and branch-local caches. Because the layout guarantees
+  stable offsets, prefetchers or GPU-backed reducers can schedule precise `ReadAt` calls without
+  scanning.
 - `PAIR_SUMMARY` is the first tooling pass for that roadmap: it reuses the same tree walk to report
-  per-namespace totals and per-branch counts without shipping every payload back to Python. Passing
+  per-namespace totals and per-branch counts without hydrating every payload. Passing
   `PAIR_SUMMARY ctx: 2 64`, for example, shows the hottest two-depth prefixes (capped at 64
   branches) while also returning min/max payload sizes—perfect for prioritizing which contexts to
-  mirror into GPU reducers or char-tree similarity scans.
+  mirror into GPU reducers or similarity scans.
 
 Treating namespace keys as traversable trees keeps INSERT/READ latency tied to fixed math instead of
-variable-length scans. It also gives future tooling (fuzzy namespace matching, char-tree-style
-similarity lookups, or trie-level compression) a solid footing because the invariants mirror the
-pure-Python helper: branch per configured byte-span, attach metadata where a path terminates, and stream the
-structure without rebuilding it in memory.
+variable-length scans. It also gives future tooling (fuzzy namespace matching, prefix-similarity
+lookups, or trie-level compression) a solid footing because the invariants hold everywhere: branch
+per configured byte-span, attach metadata where a path terminates, and stream the structure without
+rebuilding it in memory.
