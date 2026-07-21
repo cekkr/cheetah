@@ -67,3 +67,28 @@ go run ./demo/graph-nell --max-rows 50000 --max-ingest-edges 30000 --query-bench
   - destination category compatibility,
   - relation/source probability priors.
 - Stage-2 reranking blends top-K implicit scores with probability priors to raise head precision (`P@100`) without discarding graph-context signals globally.
+
+## Tests
+
+`main_test.go` covers this demo at two levels:
+
+- **Unit tests** (fast, hermetic, run in the normal sweep) for the evaluation and loader math — ranking
+  metrics (`AUC`/`AP`/`P@K`), model building, holdout split, dataset parsing, rerank blending, and token
+  normalization:
+
+  ```bash
+  go test ./demo/graph-nell
+  ```
+
+- **End-to-end real-execution test** that builds the root `cheetahdb` server, boots it headless on an
+  ephemeral port with an isolated data dir, drives the full ingest → query → predict pipeline over TCP
+  against a small synthetic NELL dataset, and asserts on the returned report plus a post-run
+  `GRAPH_QUERY`. It is gated so the default sweep stays fast and needs no running server or real dataset:
+
+  ```bash
+  CHEETAH_NELL_E2E=1 go test -run TestGraphNELLEndToEnd -count=1 -v ./demo/graph-nell
+  ```
+
+Ingest note: early NELL edges introduce many new nodes, so ingest is new-node/new-file bound
+(~30–40 edges/s) and only reaches ~600+ edges/s once nodes are reused. Keep automated runs to a few
+hundred edges; use `--max-ingest-edges` / `--max-rows` to bound manual runs against the real dataset.

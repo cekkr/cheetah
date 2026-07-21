@@ -506,9 +506,20 @@ reference only; do not implement features here.
 A benchmark/evaluation **client** (`package main`) that drives a running `cheetah-server` over TCP
 against the NELL dataset. [`main.go`](demo/graph-nell/main.go) ingests edges via `GRAPH_EDGE_SET_BATCH`,
 benchmarks `GRAPH_NEIGHBOR_TYPES`, and scores probability/implicit-correlation prediction quality;
+`run(cfg)` returns the `summaryReport` (so a test can assert on it) while `main` just prints it.
 [`run.sh`](demo/graph-nell/run.sh) and [`README.md`](demo/graph-nell/README.md) document flags;
 `reports/` holds committed JSON/CSV run artifacts. Uses
 [`studies/datasets/bkisiel_aaai10_08m.100.SSFeedback.csv`](studies/datasets/bkisiel_aaai10_08m.100.SSFeedback.csv).
+
+[`main_test.go`](demo/graph-nell/main_test.go) adds two layers of coverage: (a) fast, hermetic **unit
+tests** for the evaluation/loader math (`rocAUC`/`averagePrecision`/`precisionAtK`, `buildModels`,
+`splitEdges`, `loadNELLEdges`, `rerankImplicitTopK`, token helpers) that run in the normal `go test`
+sweep, and (b) `TestGraphNELLEndToEnd` — a **real-execution** test gated behind `CHEETAH_NELL_E2E=1`
+that builds the root `cheetahdb` binary, boots it headless on an ephemeral port with an isolated data
+dir, drives the full `run()` pipeline over TCP against a small synthetic NELL dataset, and asserts on
+the returned report plus a direct post-run `GRAPH_QUERY`. Perf note learned here: early NELL edges are
+node-diverse, so ingest is new-node/new-file bound (~30–40 edges/s) and only reaches ~600+ edges/s once
+nodes are reused — keep automated runs to a few hundred edges.
 
 ### Runtime / generated (never edited or committed)
 
@@ -699,6 +710,13 @@ go run ./demo/graph-nell --host 127.0.0.1 --port 4455 --database graph_nell_demo
   --dataset studies/datasets/bkisiel_aaai10_08m.100.SSFeedback.csv
 ```
 
+Run the automated end-to-end graph pipeline test instead — it builds and boots the server itself
+(no manual server, no big dataset; it generates a small synthetic one) and asserts on the result:
+
+```bash
+CHEETAH_NELL_E2E=1 go test -run TestGraphNELLEndToEnd -count=1 -v ./demo/graph-nell
+```
+
 Debug: set `CHEETAH_LOG_LEVEL=3` (or `debug`) for command/reducer/trie traces; call `SYSTEM_STATS`
 for live CPU/IO/cache metrics; `LOG_FLUSH` to dump the in-memory log ring; `FILE_CHECKPOINT` to force
 a mid-run flush.
@@ -726,6 +744,9 @@ Environment variables read by the server (all verified in-tree):
 - **Cluster:** `CHEETAH_NODE_ID`, `CHEETAH_TRACK_STANDALONE_FORKS`.
 - **Benchmark (test only):** `CHEETAHDB_BENCH`, `CHEETAHDB_BENCH_DURATION`,
   `CHEETAHDB_BENCH_WORKERS`, `CHEETAHDB_BENCH_VALUE_SIZE`.
+- **Demo end-to-end (test only):** `CHEETAH_NELL_E2E=1` gates
+  [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go), which builds + boots the server and drives
+  the demo over TCP. Read by the test harness, **not** by the server.
 
 `DBSLM_*` and `CHEETAH_REDUCE_*`/`CHEETAH_PAIR_REGISTER_*`/`CHEETAH_PREDICT_INHERIT_ASYNC` variables
 seen in old docs are **client-side**; the server does not read them.
@@ -744,10 +765,14 @@ seen in old docs are **client-side**; the server does not read them.
 | Multi-hop bounds + cost limits | [`TestGraphQueryMultiHopBoundsAndCost`](graph_test.go) |
 | Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](graph_test.go) |
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](graph_test.go) |
+| Graph-NELL demo eval/loader math (AUC/AP/P@K, models, split, loader) | [`TestRankingMetrics`/`TestBuildModels`/`TestLoadNELLEdges`/…](demo/graph-nell/main_test.go) |
+| End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
 
 **Known test gaps:** no focused coverage for jump-node split/promote cycles, prediction-table
 train/inherit, cluster scheduling/gossip, the payload/managed-file caches, or cursor pagination edge
-cases. Add tests alongside changes in those areas.
+cases. Add tests alongside changes in those areas. The graph subsystem now has both in-process unit
+coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over TCP
+([`demo/graph-nell/main_test.go`](demo/graph-nell/main_test.go)).
 
 ---
 

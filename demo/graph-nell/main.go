@@ -145,7 +145,7 @@ type reportArtifact struct {
 
 func main() {
 	cfg := parseFlags()
-	if err := run(cfg); err != nil {
+	if _, err := run(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
@@ -216,21 +216,21 @@ func parseFlags() config {
 	return cfg
 }
 
-func run(cfg config) error {
+func run(cfg config) (summaryReport, error) {
 	start := time.Now()
 	rng := rand.New(rand.NewSource(cfg.RandSeed))
 
 	edges, rawRows, probLabels, err := loadNELLEdges(cfg)
 	if err != nil {
-		return err
+		return summaryReport{}, err
 	}
 	if len(edges) == 0 {
-		return errors.New("no positive edges available after filtering")
+		return summaryReport{}, errors.New("no positive edges available after filtering")
 	}
 
 	trainEdges, holdoutPos := splitEdges(edges, cfg.HoldoutRatio, rng)
 	if len(trainEdges) == 0 {
-		return errors.New("training split is empty")
+		return summaryReport{}, errors.New("training split is empty")
 	}
 	if cfg.MaxIngestEdges > 0 && len(trainEdges) > cfg.MaxIngestEdges {
 		trainEdges = trainEdges[:cfg.MaxIngestEdges]
@@ -246,20 +246,20 @@ func run(cfg config) error {
 
 	client, err := newCheetahClient(cfg.Host, cfg.Port)
 	if err != nil {
-		return err
+		return summaryReport{}, err
 	}
 	defer client.Close()
 
 	if _, err := client.exec("DATABASE " + cfg.Database); err != nil {
-		return err
+		return summaryReport{}, err
 	}
 	if cfg.ResetDB {
 		if _, err := client.exec("RESET_DB " + cfg.Database); err != nil {
-			return err
+			return summaryReport{}, err
 		}
 	}
 	if _, err := client.exec("DATABASE " + cfg.Database); err != nil {
-		return err
+		return summaryReport{}, err
 	}
 
 	ingestDuration := time.Duration(0)
@@ -268,24 +268,24 @@ func run(cfg config) error {
 	} else {
 		ingestStart := time.Now()
 		if err := ingestEdges(client, trainEdges, cfg); err != nil {
-			return err
+			return summaryReport{}, err
 		}
 		ingestDuration = time.Since(ingestStart)
 	}
 
 	models := buildModels(trainEdges)
 	if len(models.RelationTargets) == 0 {
-		return errors.New("cannot evaluate without relation target pools")
+		return summaryReport{}, errors.New("cannot evaluate without relation target pools")
 	}
 
 	queryDurations, err := benchmarkQueries(client, models.AllNodes, cfg.QueryBenchCount, cfg.NeighborLimit, rng)
 	if err != nil {
-		return err
+		return summaryReport{}, err
 	}
 
 	candidates := buildEvaluationCandidates(holdoutPos, models, cfg.EvalNegativePerPositive, rng)
 	if len(candidates) == 0 {
-		return errors.New("evaluation candidate set is empty")
+		return summaryReport{}, errors.New("evaluation candidate set is empty")
 	}
 
 	predStart := time.Now()
@@ -301,7 +301,7 @@ func run(cfg config) error {
 		before := time.Now()
 		relWeights, err := sourceRelationWeights(client, c.edge.From, cfg.NeighborLimit, cfg.PredictionUseFeatureCache, featureCache)
 		if err != nil {
-			return fmt.Errorf("feature extraction failed at candidate %d: %w", idx, err)
+			return summaryReport{}, fmt.Errorf("feature extraction failed at candidate %d: %w", idx, err)
 		}
 		featureLatency = append(featureLatency, time.Since(before))
 		implicitScore := implicitCorrelationScore(c.edge, relWeights, models)
@@ -351,7 +351,7 @@ func run(cfg config) error {
 	printReport(report, probLabels)
 	if cfg.WriteReports {
 		if jsonPath, csvPath, err := writeReportArtifacts(cfg, report); err != nil {
-			return err
+			return summaryReport{}, err
 		} else {
 			fmt.Printf("Report JSON: %s\n", jsonPath)
 			fmt.Printf("Report CSV: %s\n", csvPath)
@@ -359,7 +359,7 @@ func run(cfg config) error {
 	}
 
 	fmt.Printf("Total demo wall time: %.2fs\n", time.Since(start).Seconds())
-	return nil
+	return report, nil
 }
 
 type evaluationCandidate struct {
