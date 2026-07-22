@@ -239,3 +239,81 @@ func TestPairSetGetDeleteRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// paginateScan percorre un prefisso pagina per pagina seguendo i cursori,
+// restituendo le chiavi nell'ordine in cui il client le riceve.
+func paginateScan(t *testing.T, db *Database, prefix string, limit int) []string {
+	t.Helper()
+	var cursor []byte
+	seen := make([]string, 0, 128)
+	for page := 0; ; page++ {
+		if page > 100000 {
+			t.Fatalf("pagination of %q did not terminate", prefix)
+		}
+		results, next, err := db.PairScanWithOptions([]byte(prefix), limit, cursor, false)
+		if err != nil {
+			t.Fatalf("PAIR_SCAN %q cursor=%q: %v", prefix, cursor, err)
+		}
+		if len(next) > 0 && len(results) != limit {
+			t.Fatalf("page %d of %q returned %d keys with a next cursor, want %d", page, prefix, len(results), limit)
+		}
+		for _, r := range results {
+			seen = append(seen, string(r.Value))
+		}
+		if len(next) == 0 {
+			return seen
+		}
+		cursor = next
+	}
+}
+
+// TestPairScanCursorPagination pretende che una scansione paginata restituisca
+// esattamente le stesse chiavi di una scansione unica, in ordine e senza
+// ripetizioni, qualunque sia la dimensione di pagina.
+//
+// La versione precedente fermava la visita appena raccolti limit risultati: i
+// worker però procedono in parallelo e in ordine arbitrario, quindi la pagina
+// conteneva limit chiavi qualsiasi, e tutte quelle non visitate che cadevano
+// sotto il cursore restituito sparivano per sempre. Con una pagina esattamente
+// piena il cursore era addirittura nullo e il client si fermava alla prima
+// pagina: su 3.000 chiavi con limit=7 se ne leggevano 7.
+func TestPairScanCursorPagination(t *testing.T) {
+	words := overlappingWords(t, 400)
+	want := append([]string{}, words...)
+	sort.Strings(want)
+
+	for _, stride := range []int{1, 2} {
+		t.Run(fmt.Sprintf("stride%d", stride), func(t *testing.T) {
+			db := newAdaptiveTestDB(t, stride, true, 4096)
+			for _, w := range words {
+				mustInsertPair(t, db, w)
+			}
+			for _, limit := range []int{1, 3, 37, len(words), len(words) + 10} {
+				got := paginateScan(t, db, "", limit)
+				for i := 1; i < len(got); i++ {
+					if got[i-1] >= got[i] {
+						t.Fatalf("limit %d: pages not strictly increasing at %d: %q then %q", limit, i, got[i-1], got[i])
+					}
+				}
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("limit %d: paginated %d keys, want %d", limit, len(got), len(want))
+				}
+			}
+
+			// Stesso contratto sotto un prefisso, incluso uno di lunghezza
+			// dispari (a stride 2 finisce a metà ramo).
+			for _, prefix := range []string{"a", "ab", "b"} {
+				expected := make([]string, 0, len(want))
+				for _, w := range want {
+					if strings.HasPrefix(w, prefix) {
+						expected = append(expected, w)
+					}
+				}
+				got := paginateScan(t, db, prefix, 5)
+				if fmt.Sprint(got) != fmt.Sprint(expected) {
+					t.Errorf("prefix %q: paginated %d keys, want %d", prefix, len(got), len(expected))
+				}
+			}
+		})
+	}
+}

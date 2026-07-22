@@ -95,8 +95,9 @@ namespace-specific parsing to the trie core.**
 
 ### Prune aggressively; degrade, don't stall
 
-Reducer and scan work is bounded by live CPU/IO telemetry
-([`ResourceMonitor.RecommendedWorkers`](resource_monitor.go)); the payload cache
+Reducer and summary work is bounded by live CPU/IO telemetry
+([`ResourceMonitor.RecommendedWorkers`](resource_monitor.go)), while a scan bounds itself by page
+(see [`collectPairEntries`](database.go)); the payload cache
 ([`cache.go`](cache.go)) and managed-file sector cache ([`file_manager.go`](file_manager.go)) shed
 memory under pressure; prediction training discards low-magnitude context weights
 ([`pruneEntryContextWeights`](prediction_table.go)). New heavy paths MUST cooperate with these back-off
@@ -302,12 +303,16 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
   (`PairTable.IsEmpty`), never per entry. High regression density; see
   [Prefix overlaps](#pitfall-jump-nodes).
 - **Scan / summary / reduce:** `PairScanWithOptions`, `PairSummaryWithOptions`, `handlePairReduce`,
-  `reduceWithPayload`, `parallelCollectPairEntries`, `parallelSummarizePairEntries`, `walkPairTable`,
-  `walkPairSummary`, prefix resolution (`resolveScanPrefix`/`resolveSummaryPrefix`,
-  `selectPairBranch`, `readBranchEntry`, `branchMatchesPartial`), cursor helpers
-  (`comparePrefixToCursor`, `nextCursorForPrefix`), accumulators, and the async reduce handlers.
-  Both parallel walks size their task queue on the branch fan-out and drain inline (`select` +
-  `default`) when it is full — a blocking send there deadlocked `PAIR_SUMMARY` forever.
+  `reduceWithPayload`, `collectPairEntries`/`walkPairTable` (scan),
+  `parallelSummarizePairEntries`/`walkPairSummary` (summary), prefix resolution
+  (`resolveScanPrefix`/`resolveSummaryPrefix`, `selectPairBranch`, `readBranchEntry`,
+  `branchMatchesPartial`), cursor helpers (`comparePrefixToCursor`, `nextCursorForPrefix`),
+  accumulators, and the async reduce handlers.
+- **The two walks are deliberately different.** A **scan** is ordered and sequential
+  (`orderedBranches` → smallest branch first) so it can stop as soon as the page is settled; a
+  **summary** has to visit everything anyway, so it stays parallel, sizing its task queue on the
+  branch fan-out and draining inline (`select` + `default`) when the queue is full — a blocking send
+  there deadlocked `PAIR_SUMMARY` forever.
 - **Handler glue:** `handlePredict*`, `handleCluster*`, `handleForkAssign`, `systemStatsResponse`,
   `buildForkTransferPayload`/`applyForkTransferPayload`, `parseFileCheckpointArgs`.
 - **Depends on:** every other core file. **Tests:** [`benchmark_test.go`](benchmark_test.go)
@@ -568,7 +573,9 @@ Scan/summary contracts that are independent of the container format:
 stride 1, for `PAIR_SCAN` and `PAIR_SUMMARY`), `TestPairScanPrefixParityAcrossStrides` (the same
 contract over ~300 prefixes of a deterministic random key set — it caught 141 wrong prefixes before
 the fix), and `TestPairSummaryDrainsSaturatedQueue` (the summary walk must finish with a task queue
-too small for the fan-out — the old blocking send hung there), and `TestPairSetGetDeleteRoundTrip`
+too small for the fan-out — the old blocking send hung there), `TestPairScanCursorPagination`
+(paginating a prefix returns exactly the keys of a single scan, in order, for page sizes from 1 to
+larger than the key set), and `TestPairSetGetDeleteRoundTrip`
 (set/get/delete/scan over the same overlapping key set: the stride-2 case fails whenever insert,
 lookup and delete disagree on which branch continues a key). Provides `mustInsertPair`, which writes
 a real payload because `PAIR_SUMMARY` reads value sizes, and `overlappingWords`.
@@ -645,6 +652,13 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Constraints:** cursor continuation is positional (`PAIR_SCAN <prefix> <limit> <cursor>`);
   `include_hidden=1` surfaces hidden terminals. **Gaps:** rolling-hash/Top-K digests are roadmap
   ([`NEXT_STEPS.md`](NEXT_STEPS.md)).
+- **A page is a page: complete, ordered, and resumable.** `PAIR_SCAN` keeps the smallest `limit+1`
+  keys above the cursor in a bounded heap and prunes any branch whose path already exceeds the
+  largest kept — a subtree can only contain keys ≥ its path, so the cut is sound whatever the visit
+  order. The walk therefore never stops on "enough results collected", which is what used to leave
+  holes: pages are exactly `limit` long until the last one, strictly increasing, and the next cursor
+  is set whenever (and only whenever) more keys exist. Anything that collects scan results must go
+  through `pairScanAccumulator.add`/`shouldPrune` rather than counting on its own.
 - **Prefixes are byte-granular, node chunks are not.** A prefix does not have to land on a node
   boundary: at stride 2 an odd-length prefix ends *inside* a branch, and a jump split can leave a
   1-byte branch mid-key. `resolveScanPrefix`/`resolveSummaryPrefix` therefore return the unconsumed
@@ -676,7 +690,8 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Flow & owners:** [`pair_format.go`](pair_format.go) (pin/guard) → [`database.go`](database.go)
   (`NewDatabase` resolves the format, `getPairTable` passes it) → [`tables.go`](tables.go)
   (`PairTable` container + `PopulatedBranchIndices`). Enumeration callers
-  (`walkPairTable`, `walkPairSummary`, `collectSingleBranchPath`) iterate populated branches only.
+  (`walkPairTable`, `walkPairSummary`, `collectSingleBranchPath`) iterate populated branches only
+  (the scan walk in key order, via `orderedBranches`).
 - **Tests:** [`pair_adaptive_test.go`](pair_adaptive_test.go), benchmark
   [`pair_adaptive_bench_test.go`](pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`).
 - **Constraints:** existing pre-format databases must be rebuilt (`RESET_DB`); there is no in-place
@@ -928,6 +943,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Set/get/delete/scan round trip over overlapping keys, both strides | [`TestPairSetGetDeleteRoundTrip`](pair_scan_test.go) |
 | Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](pair_scan_test.go) |
 | `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](pair_scan_test.go) |
+| Cursor pagination returns every key once, any page size | [`TestPairScanCursorPagination`](pair_scan_test.go) |
 | `ManagedFile` handle + sector-cache lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](file_manager_test.go) |
 | Throughput / concurrency under load | [`TestCheetahDBBenchmark`](benchmark_test.go) (gated by `CHEETAHDB_BENCH=1`) |
 | Graph edge lifecycle + query | [`TestGraphEdgeLifecycleAndQuery`](graph_test.go) |
@@ -996,11 +1012,6 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 <a id="known-gaps"></a>
 ### Known gaps
 
-- **Cursor pagination is lossy and nondeterministic past the first page.** A full paginated
-  `PAIR_SCAN` over 12k keys returned 11,727 / 11,727 / 11,726 / 11,705 across four runs on identical
-  data (parallel collection + limit/abort + cursor). Single-page scans are stable, and
-  `PAIR_SUMMARY` now traverses the whole trie without hanging, so an unpaginated summary is the
-  reliable way to count.
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](cluster_scheduler.go) `load`). Matches [`NEXT_STEPS.md`](NEXT_STEPS.md) #1.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the

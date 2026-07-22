@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
 	"container/list"
 	"encoding/base64"
 	"encoding/binary"
@@ -1768,15 +1769,14 @@ func (db *Database) PairScanWithOptions(prefix []byte, limit int, cursor []byte,
 		expandedPrefix = path
 		startTable = tableID
 		partialPrefix = partial
-		if acc.shouldStop() || (startTable == 0 && len(partialPrefix) == 0) {
+		if startTable == 0 && len(partialPrefix) == 0 {
 			results, nextCursor := acc.finalize(acc.limit)
 			return results, nextCursor, nil
 		}
 	} else {
 		expandedPrefix = nil
 	}
-	workerCount := db.recommendedWorkerCount(acc.limit, pairScanDefaultLimit)
-	if err := db.parallelCollectPairEntries(startTable, expandedPrefix, partialPrefix, workerCount, acc); err != nil {
+	if err := db.collectPairEntries(startTable, expandedPrefix, partialPrefix, acc); err != nil {
 		return nil, nil, err
 	}
 	results, nextCursor := acc.finalize(acc.limit)
@@ -1899,13 +1899,49 @@ type pairSummaryAccumulator struct {
 	selfTerminal  bool
 }
 
+// pairScanAccumulator tiene le limit+1 chiavi più piccole fra quelle maggiori
+// del cursore. Il +1 dice con certezza se esiste una pagina successiva; il
+// tetto di memoria resta quello di prima.
+//
+// Una pagina deve contenere *tutte* le chiavi fra il cursore e l'ultima che
+// restituisce. Fermare la visita al raggiungimento di limit risultati — come
+// faceva la versione precedente, per giunta da più worker in ordine arbitrario
+// — lascia buchi: le chiavi non visitate finiscono sotto il cursore della
+// pagina dopo e non le vede più nessuno. Qui la visita non si ferma mai per
+// "risultati raggiunti", pota per valore.
 type pairScanAccumulator struct {
 	cursor        []byte
 	limit         int
 	includeHidden bool
 	mu            sync.Mutex
-	results       []PairScanResult
-	count         atomic.Int64
+	top           pairScanTopHeap
+	// cutoff è una copia della chiave più grande fra quelle tenute, pubblicata
+	// solo quando il buffer è pieno.
+	cutoff atomic.Pointer[[]byte]
+}
+
+// pairScanTopHeap è un max-heap sulle chiavi: la radice è la più grande fra
+// quelle tenute, così superata la capacità si scarta subito la peggiore.
+type pairScanTopHeap []PairScanResult
+
+func (h pairScanTopHeap) Len() int { return len(h) }
+
+func (h pairScanTopHeap) Less(i, j int) bool {
+	return bytes.Compare(h[i].Value, h[j].Value) > 0
+}
+
+func (h pairScanTopHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *pairScanTopHeap) Push(x any) {
+	*h = append(*h, x.(PairScanResult))
+}
+
+func (h *pairScanTopHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
 }
 
 func newPairScanAccumulator(limit int, cursor []byte, includeHidden bool) *pairScanAccumulator {
@@ -2002,104 +2038,139 @@ func (a *pairSummaryAccumulator) finalize() *PairSummaryResult {
 	}
 }
 
-func (a *pairScanAccumulator) add(value []byte, key uint64) bool {
-	if len(a.cursor) > 0 && bytes.Compare(value, a.cursor) <= 0 {
-		return a.shouldStop()
+// capacity è quante chiavi vale la pena tenere: limit+1, oppure 0 (illimitato)
+// se non è stato chiesto un limite.
+func (a *pairScanAccumulator) capacity() int {
+	if a.limit <= 0 {
+		return 0
 	}
-	cp := append([]byte{}, value...)
+	return a.limit + 1
+}
+
+func (a *pairScanAccumulator) add(value []byte, key uint64) {
+	if len(a.cursor) > 0 && bytes.Compare(value, a.cursor) <= 0 {
+		return
+	}
+	if a.shouldPrune(value) {
+		return
+	}
 	a.mu.Lock()
-	a.results = append(a.results, PairScanResult{Value: cp, Key: key})
-	a.mu.Unlock()
-	a.count.Add(1)
-	return a.shouldStop()
+	defer a.mu.Unlock()
+	capacity := a.capacity()
+	if capacity > 0 && len(a.top) >= capacity && bytes.Compare(value, a.top[0].Value) >= 0 {
+		return
+	}
+	heap.Push(&a.top, PairScanResult{Value: append([]byte{}, value...), Key: key})
+	if capacity > 0 && len(a.top) > capacity {
+		heap.Pop(&a.top)
+	}
+	a.publishCutoffLocked()
+}
+
+func (a *pairScanAccumulator) publishCutoffLocked() {
+	capacity := a.capacity()
+	if capacity == 0 || len(a.top) < capacity {
+		a.cutoff.Store(nil)
+		return
+	}
+	cutoff := append([]byte{}, a.top[0].Value...)
+	a.cutoff.Store(&cutoff)
+}
+
+// shouldPrune dice se il sottoalbero che parte da value si può saltare: tutte
+// le sue chiavi hanno value come prefisso, quindi sono ≥ value, e se value
+// supera già la più grande delle limit+1 tenute nessuna di esse può entrare in
+// pagina. Il cutoff può solo scendere, quindi una potatura resta valida anche
+// dopo che il buffer si è ristretto.
+func (a *pairScanAccumulator) shouldPrune(value []byte) bool {
+	cutoff := a.cutoff.Load()
+	if cutoff == nil {
+		return false
+	}
+	return bytes.Compare(value, *cutoff) > 0
 }
 
 func (a *pairScanAccumulator) shouldInclude(hidden bool) bool {
 	return a.includeHidden || !hidden
 }
 
-func (a *pairScanAccumulator) shouldStop() bool {
-	if a.limit <= 0 {
-		return false
-	}
-	return int(a.count.Load()) >= a.limit
-}
-
 func (a *pairScanAccumulator) finalize(limit int) ([]PairScanResult, []byte) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.results) == 0 {
+	if len(a.top) == 0 {
 		return []PairScanResult{}, nil
 	}
-	sort.Slice(a.results, func(i, j int) bool {
-		return bytes.Compare(a.results[i].Value, a.results[j].Value) < 0
+	results := make([]PairScanResult, len(a.top))
+	copy(results, a.top)
+	sort.Slice(results, func(i, j int) bool {
+		return bytes.Compare(results[i].Value, results[j].Value) < 0
 	})
-	hasMore := limit > 0 && len(a.results) > limit
-	if limit > 0 && limit < len(a.results) {
-		a.results = a.results[:limit]
+	hasMore := limit > 0 && len(results) > limit
+	if limit > 0 && limit < len(results) {
+		results = results[:limit]
 	}
 	var nextCursor []byte
-	if hasMore && len(a.results) > 0 {
-		nextCursor = append([]byte{}, a.results[len(a.results)-1].Value...)
+	if hasMore {
+		nextCursor = append([]byte{}, results[len(results)-1].Value...)
 	}
-	return a.results, nextCursor
+	return results, nextCursor
 }
 
-func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, partial []byte, workers int, acc *pairScanAccumulator) error {
-	// Avoid deadlocks when a very dense table fans out more tasks than workers*buffer
-	// by sizing the queue to hold at least the maximum branch fan-out.
-	queueSize := workers * 4
-	if db.branchCodec.branchCount > queueSize {
-		queueSize = db.branchCodec.branchCount
-	}
-	// Add a little headroom so jumps/child tables can enqueue without blocking.
-	queueSize *= 2
-	if queueSize < 16 {
-		queueSize = 16
-	}
-	tasks := make(chan pairScanTask, queueSize)
-	var pending sync.WaitGroup
-	var workerWG sync.WaitGroup
-	var firstErr error
-	var errOnce sync.Once
-	var abort atomic.Bool
-
-	pending.Add(1)
-	var initialCursor []byte
+// collectPairEntries visita il sottoalbero in ordine di chiave e riempie
+// l'accumulatore della pagina. La visita è volutamente sequenziale: l'ordine è
+// ciò che rende efficace la potatura per cutoff, perché appena raccolte
+// limit+1 chiavi ogni ramo successivo è più grande dell'ultima tenuta e viene
+// saltato senza aprirlo — una pagina costa quanto la pagina, non quanto il
+// database.
+//
+// La versione precedente distribuiva la visita su più worker e, non potendosi
+// fermare in ordine, abortiva al raggiungimento di limit risultati qualsiasi:
+// è esattamente da lì che nascevano le pagine con buchi. PAIR_SUMMARY, che
+// deve comunque attraversare tutto, resta parallelo
+// (parallelSummarizePairEntries).
+func (db *Database) collectPairEntries(tableID uint32, prefix []byte, partial []byte, acc *pairScanAccumulator) error {
+	var cursor []byte
 	if len(acc.cursor) > 0 {
-		initialCursor = append([]byte{}, acc.cursor...)
+		cursor = append([]byte{}, acc.cursor...)
 	}
-	tasks <- pairScanTask{tableID: tableID, prefix: append([]byte{}, prefix...), cursor: initialCursor, partial: append([]byte{}, partial...)}
-	go func() {
-		pending.Wait()
-		close(tasks)
-	}()
+	return db.walkPairTable(pairScanTask{
+		tableID: tableID,
+		prefix:  append([]byte{}, prefix...),
+		cursor:  cursor,
+		partial: append([]byte{}, partial...),
+	}, acc)
+}
 
-	worker := func() {
-		defer workerWG.Done()
-		for task := range tasks {
-			if abort.Load() {
-				pending.Done()
-				continue
-			}
-			if err := db.walkPairTable(task, acc, &pending, tasks, &abort); err != nil {
-				errOnce.Do(func() {
-					firstErr = err
-					abort.Store(true)
-				})
-			}
+// orderedBranches restituisce i rami popolati in ordine di chiave. Gli indici
+// arrivano già ordinati per posizione, che coincide con l'ordine
+// lessicografico finché i chunk di un nodo hanno tutti la stessa larghezza; in
+// un nodo misto (stride 2 con un ramo corto lasciato da uno split di jump) no,
+// perché i rami da 1 byte occupano comunque gli indici bassi.
+func (db *Database) orderedBranches(indices []uint32) []pairBranchChunk {
+	branches := make([]pairBranchChunk, 0, len(indices))
+	mixed := false
+	narrow := db.branchCodec.offsets[db.branchCodec.chunkBytes]
+	for _, index := range indices {
+		chunk, ok := db.branchCodec.decode(index)
+		if !ok {
+			continue
 		}
+		if int(index) < narrow {
+			mixed = true
+		}
+		branches = append(branches, pairBranchChunk{index: index, chunk: chunk})
 	}
+	if mixed && narrow > 0 {
+		sort.Slice(branches, func(i, j int) bool {
+			return bytes.Compare(branches[i].chunk, branches[j].chunk) < 0
+		})
+	}
+	return branches
+}
 
-	for i := 0; i < workers; i++ {
-		workerWG.Add(1)
-		go worker()
-	}
-	workerWG.Wait()
-	if firstErr != nil {
-		return firstErr
-	}
-	return nil
+type pairBranchChunk struct {
+	index uint32
+	chunk []byte
 }
 
 func (db *Database) parallelSummarizePairEntries(tableID uint32, prefix []byte, partial []byte, workers int, acc *pairSummaryAccumulator) error {
@@ -2275,27 +2346,7 @@ func (db *Database) recordSummaryTerminal(acc *pairSummaryAccumulator, path []by
 	return nil
 }
 
-func (db *Database) walkPairTable(
-	task pairScanTask,
-	acc *pairScanAccumulator,
-	pending *sync.WaitGroup,
-	tasks chan<- pairScanTask,
-	abort *atomic.Bool,
-) error {
-	defer pending.Done()
-	enqueue := func(t pairScanTask) error {
-		if abort != nil && abort.Load() {
-			return nil
-		}
-		pending.Add(1)
-		select {
-		case tasks <- t:
-			return nil
-		default:
-			// Channel is saturated; process inline to avoid deadlock.
-			return db.walkPairTable(t, acc, pending, tasks, abort)
-		}
-	}
+func (db *Database) walkPairTable(task pairScanTask, acc *pairScanAccumulator) error {
 	cursor := task.cursor
 	if len(cursor) > 0 && len(task.prefix) > 0 {
 		cmp := comparePrefixToCursor(task.prefix, cursor)
@@ -2320,19 +2371,16 @@ func (db *Database) walkPairTable(
 		}
 		return err
 	}
-	for _, branch := range indices {
-		if abort != nil && abort.Load() {
-			return nil
-		}
+	for _, branch := range db.orderedBranches(indices) {
 		var entry []byte
 		var node *JumpNode
 		ready := false
 		for attempts := 0; attempts < maxJumpReloadAttempts; attempts++ {
-			entry, err = table.ReadEntry(branch)
+			entry, err = table.ReadEntry(branch.index)
 			if err != nil {
 				return err
 			}
-			if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
+			if !entryIsPopulated(entry) {
 				ready = true
 				break
 			}
@@ -2349,19 +2397,21 @@ func (db *Database) walkPairTable(
 			break
 		}
 		if !ready {
-			return fmt.Errorf("jump reload limit exceeded (scan walk table=%d branch=%d)", task.tableID, branch)
+			return fmt.Errorf("jump reload limit exceeded (scan walk table=%d branch=%d)", task.tableID, branch.index)
 		}
-		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
+		if !entryIsPopulated(entry) {
 			continue
 		}
-		chunk, ok := db.branchCodec.decode(branch)
-		if !ok {
+		if !branchMatchesPartial(branch.chunk, task.partial) {
 			continue
 		}
-		if !branchMatchesPartial(chunk, task.partial) {
-			continue
+		value := append(append([]byte{}, task.prefix...), branch.chunk...)
+		// Ogni chiave sotto questo ramo inizia per value, e i rami successivi
+		// sono ancora più grandi: superato il cutoff della pagina il nodo è
+		// finito.
+		if acc.shouldPrune(value) {
+			break
 		}
-		value := append(append([]byte{}, task.prefix...), chunk...)
 		childCursor := cursor
 		if childCursor != nil {
 			var skip bool
@@ -2371,18 +2421,15 @@ func (db *Database) walkPairTable(
 			}
 		}
 		if entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
-			if acc.add(value, decodeAbsoluteKey(entry)) && abort != nil && acc.limit > 0 {
-				abort.Store(true)
-				return nil
-			}
+			acc.add(value, decodeAbsoluteKey(entry))
 		}
 		if entryHasJump(entry) {
 			extended := append(append([]byte{}, value...), node.Bytes...)
+			if acc.shouldPrune(extended) {
+				continue
+			}
 			if node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
-				if acc.add(extended, node.TerminalKey) && abort != nil && acc.limit > 0 {
-					abort.Store(true)
-					return nil
-				}
+				acc.add(extended, node.TerminalKey)
 			}
 			jumpCursor := childCursor
 			if jumpCursor != nil {
@@ -2393,7 +2440,7 @@ func (db *Database) walkPairTable(
 				}
 			}
 			if node.NextTableID != 0 {
-				if err := enqueue(pairScanTask{tableID: node.NextTableID, prefix: extended, cursor: jumpCursor}); err != nil {
+				if err := db.walkPairTable(pairScanTask{tableID: node.NextTableID, prefix: extended, cursor: jumpCursor}, acc); err != nil {
 					return err
 				}
 			}
@@ -2404,7 +2451,7 @@ func (db *Database) walkPairTable(
 			if childID == 0 {
 				continue
 			}
-			if err := enqueue(pairScanTask{tableID: childID, prefix: append([]byte{}, value...), cursor: childCursor}); err != nil {
+			if err := db.walkPairTable(pairScanTask{tableID: childID, prefix: value, cursor: childCursor}, acc); err != nil {
 				return err
 			}
 		}
