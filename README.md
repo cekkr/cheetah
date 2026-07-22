@@ -315,6 +315,134 @@ SUCCESS,key=1_deleted
     `CLUSTER_GOSSIP json=<payload>`). Overrides persist next to `cluster_topology.json`, so restarts
     keep the new mapping.
 
+## Graph Command Language
+
+cheetah-db stores a labeled **property graph** next to the KV/pair data and drives it with the same
+newline-delimited protocol. The surface splits cleanly into **setting** information (nodes, edges,
+properties) and **calling** it back (point reads, adjacency, degree, and pattern queries). Graph
+records are just opaque byte keys to the trie: they live under four reserved control-byte namespaces —
+`\x01gn:` (nodes), `\x02ge:` (edges), `\x03go:` (out-adjacency), `\x04gi:` (in-adjacency) — plus a
+`graph/idx/` property index, so node/edge writes never trigger a full graph scan and adjacency reads
+are always prefix scans.
+
+### Data model
+
+- **Node** — `{ id, labels[], props{}, created_at, updated_at }`. `id` is any non-empty string; the
+  server only trims it (it does **not** sanitize or add suffixes — any such convention lives in the
+  client). `labels` is stored as a deduplicated, sorted set; `props` is a free-form JSON object.
+- **Edge** — `{ id, from, to, type, directed, weight, props{}, created_at, updated_at }`. An edge is
+  uniquely identified by the tuple `(from, to, type, directed)`; setting the same tuple again
+  **upserts** it. `weight` defaults to `1.0` and `directed` defaults to `1` (true).
+- **Properties** cross the wire as JSON — inline for simple values (`props={"since":2020}`) or
+  base64-encoded JSON (`props=<base64>`) when the blob would contain spaces/newlines. Values may be
+  strings, numbers, or booleans; `edge.props.*` values are additionally mirrored into a secondary
+  index for fast `WHERE` filtering.
+- **Record payloads** — every command that returns records answers `...,payload=<base64>`, where the
+  base64 decodes to the JSON record (or a JSON array of records). This keeps each response on one line
+  for line-oriented clients.
+
+### Setting information
+
+| Command | Purpose |
+| --- | --- |
+| `GRAPH_NODE_SET id=<id> [labels=a,b] [props=<json\|base64>]` | Upsert a node (preserves `created_at`; keeps existing labels/props when omitted). |
+| `GRAPH_EDGE_SET from=<id> to=<id> [type=<t>] [weight=<f>] [directed=0\|1] [props=<json\|base64>] [autocreate=0\|1]` | Upsert one edge plus its adjacency/index entries. Missing endpoint nodes are auto-created unless `autocreate=0`. |
+| `GRAPH_EDGE_SET_BATCH items=<base64 json[]> [continue_on_error=0\|1] [type=…] [directed=…] [weight=…] [props=…]` | Bulk upsert in one round-trip; top-level `type/directed/weight/props` act as per-item defaults. |
+| `GRAPH_NODE_DEL id=<id> [cascade=1]` | Delete a node; `cascade=1` also removes its incident edges. |
+| `GRAPH_EDGE_DEL from=<id> to=<id> [type=<t>] [directed=0\|1]` | Delete the edge addressed by the tuple. |
+
+```text
+[cheetah_data/graphlang]> GRAPH_NODE_SET id=alice labels=person,user props={"city":"berlin","age":30}
+SUCCESS,node_set,id=alice
+[cheetah_data/graphlang]> GRAPH_EDGE_SET from=alice to=bob type=follows weight=0.9 props={"since":2020} directed=1
+SUCCESS,edge_set,id=MXxhbGljZXxmb2xsb3dzfGJvYg
+[cheetah_data/graphlang]> GRAPH_EDGE_SET_BATCH items=<base64 of [{"from":"alice","to":"carol","type":"follows","weight":0.4}, …]> continue_on_error=1
+SUCCESS,requested=2,applied=2,created=2,updated=0,failed=0
+```
+
+`GRAPH_EDGE_SET` returns the opaque edge `id`; the batch form reports
+`requested/applied/created/updated/failed`, adding a base64 `payload=` array of `{index,error}`
+objects when some rows fail under `continue_on_error=1`. Edge upserts also stub out any `from`/`to`
+node that does not exist yet (disable with `autocreate=0`).
+
+### Calling information
+
+| Command | Returns |
+| --- | --- |
+| `GRAPH_NODE_GET id=<id>` | `payload=` the node record (or `ERROR,node_not_found`). |
+| `GRAPH_EDGE_GET from=<id> to=<id> [type=<t>] [directed=0\|1]` | `payload=` the edge record (or `ERROR,edge_not_found`). |
+| `GRAPH_NEIGHBORS id=<id> [direction=out\|in\|both] [type=<t\|*>] [limit=<n>] [cursor=<tok>]` | `count`, `next_cursor`, and `payload=` an array of edge records. |
+| `GRAPH_DEGREE id=<id> [direction=out\|in\|both] [type=<t\|*>] [weighted=0\|1]` | `degree` (plus `weighted_degree` when `weighted=1`). |
+| `GRAPH_NEIGHBOR_TYPES id=<id> [direction=out\|in\|both] [limit=<n>] [cursor=<tok>] [weighted=0\|1]` | `payload=` a compact relation histogram `[{type,count,weighted}]`. |
+
+```text
+[cheetah_data/graphlang]> GRAPH_NODE_GET id=alice
+SUCCESS,id=alice,payload=<base64>
+# payload decodes to: {"id":"alice","labels":["person","user"],"props":{"age":30,"city":"berlin"},"created_at":…,"updated_at":…}
+
+[cheetah_data/graphlang]> GRAPH_NEIGHBORS id=alice direction=out type=* limit=8
+SUCCESS,count=2,next_cursor=*,payload=<base64>
+# payload decodes to: [{"from":"alice","to":"carol","type":"follows","weight":0.4,…}, {"from":"alice","to":"bob","type":"follows","weight":0.9,"props":{"since":2020},…}]
+
+[cheetah_data/graphlang]> GRAPH_DEGREE id=alice direction=out type=* weighted=1
+SUCCESS,id=alice,direction=out,type=*,degree=2,weighted_degree=1.300000
+
+[cheetah_data/graphlang]> GRAPH_NEIGHBOR_TYPES id=alice direction=out limit=16 weighted=1
+SUCCESS,count=1,next_cursor=*,payload=<base64>
+# payload decodes to: [{"type":"follows","count":2,"weighted":1.3}]
+```
+
+Defaults: `direction=out`, `type=*` (all types), `limit=128` (max 2048). `next_cursor=*` means the
+scan is exhausted (and, as an input cursor, `*` means "start from the beginning"); pass a returned
+token back as `cursor=<tok>` to page. `direction=both` merges both sides and does not accept a cursor.
+`GRAPH_NEIGHBOR_TYPES` is the fast path for feature extraction — it aggregates a per-relation histogram
+without hydrating edge payloads.
+
+### Pattern queries — `GRAPH_QUERY`
+
+```text
+GRAPH_QUERY MATCH (<left>)-[:<type|*>]->(<right>)
+  [WHERE <predicate> [AND <predicate> ...]]
+  [HOPS <max> | <min>..<max>]      # default 1..1
+  [BRANCH_LIMIT <n>]               # fan-out cap per hop (default 128)
+  [COST_LIMIT <float>]             # early-stop on accumulated traversal cost (cost per hop = 1/weight)
+  [RETURN edges | nodes | paths | count]   # default edges
+  [LIMIT <n>]                      # default 128
+  [CURSOR <token>]
+```
+
+- **Node patterns** are `*` (wildcard) or `id='value'`, optionally narrowed with `label='value'`
+  (e.g. `(id='alice',label='person')`). The **left node must be ID-anchored** — wildcard-left queries
+  are rejected so execution stays index-backed.
+- **Predicates** read `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, `edge.weight`, and
+  `edge.props.<key>` with operators `= != >= <= > <`. An `edge.props.<key> = <literal>` equality is
+  served straight from the `graph/idx/` secondary index.
+- **RETURN modes**: `edges` (full edge records), `nodes` (sorted unique node ids), `paths` (compact
+  `{from,type,to,weight}` views), `count` (just `matches=<n>`, no payload). Since higher weight means
+  lower cost, `COST_LIMIT` prunes paths that traverse low-weight edges first.
+
+```text
+[cheetah_data/graphlang]> GRAPH_QUERY MATCH (id='alice')-[:follows]->(*) WHERE edge.weight >= 0.5 RETURN edges LIMIT 8
+SUCCESS,return=edges,matches=1,next_cursor=*,payload=<base64>
+# payload decodes to: [{"from":"alice","to":"bob","type":"follows","weight":0.9,"props":{"since":2020},…}]
+
+[cheetah_data/graphlang]> GRAPH_QUERY MATCH (id='alice')-[:*]->(*) RETURN nodes LIMIT 8
+SUCCESS,return=nodes,matches=3,next_cursor=*,payload=<base64>
+# payload decodes to: ["alice","bob","carol"]
+
+[cheetah_data/graphlang]> GRAPH_QUERY MATCH (id='alice')-[:*]->(id='carol') HOPS 1..2 BRANCH_LIMIT 32 COST_LIMIT 5 RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
+# payload decodes to: [{"from":"alice","type":"follows","to":"carol","weight":0.4},{"from":"bob","type":"likes","to":"carol","weight":0.7}]
+```
+
+Graph statistics can also stream through the reducer language: `PAIR_REDUCE degree|triangle|pagerank_seed <adj-hex-prefix>`
+runs directly over the `adj/out`/`adj/in` namespaces without hydrating edges. For the authoritative
+argument grammar of every command above, the source of truth is the `handleGraph*` dispatch in
+[`graph.go`](graph.go) (routed from `ExecuteCommand` in [`database.go`](database.go)) — this section
+documents that behavior, not a separate spec. A runnable, end-to-end example of the whole language
+(ingest → adjacency → query → predict over TCP) lives in
+[`demo/graph-nell/`](demo/graph-nell/README.md).
+
 ## Streaming Helpers
 
 - `PAIR_SCAN <prefix> [limit]` favors namespace exhaustiveness: `PAIR_SCAN ctx: 100` walks the first
