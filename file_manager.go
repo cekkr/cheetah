@@ -546,8 +546,10 @@ type ManagedFile struct {
 	opts    ManagedFileOptions
 	manager *FileManager
 
+	// file è protetto da handleMu: chi legge o scrive tiene il lock in
+	// lettura per tutta l'operazione, chi chiude lo prende in scrittura.
 	file     *os.File
-	handleMu sync.Mutex
+	handleMu sync.RWMutex
 
 	cacheMu    sync.RWMutex
 	sectors    map[uint64]*sectorEntry
@@ -623,39 +625,62 @@ func (mf *ManagedFile) ensureFileExists(preallocate int64) error {
 	return file.Close()
 }
 
-func (mf *ManagedFile) beginUse() {
-	mf.refCount.Add(1)
-	mf.touch()
-}
-
-func (mf *ManagedFile) endUse() {
-	mf.refCount.Add(-1)
-}
-
 func (mf *ManagedFile) touch() {
 	mf.lastUsed.Store(time.Now().UnixNano())
 }
 
-func (mf *ManagedFile) ensureHandle() error {
-	mf.handleMu.Lock()
-	defer mf.handleMu.Unlock()
+// acquireHandle restituisce il descrittore aperto insieme alla funzione di
+// rilascio. handleMu resta preso (in lettura sul percorso caldo) finché non si
+// chiama release: nessuna chiusura concorrente — idle close, cap sui
+// descrittori, FILE_CHECKPOINT close_handles — può quindi azzerare mf.file
+// mentre l'operazione è in corso, e la lettura del campo non è più una race.
+func (mf *ManagedFile) acquireHandle() (*os.File, func(), error) {
+	mf.handleMu.RLock()
 	if mf.file != nil {
-		return nil
+		file := mf.file
+		mf.refCount.Add(1)
+		mf.touch()
+		return file, func() {
+			mf.refCount.Add(-1)
+			mf.handleMu.RUnlock()
+		}, nil
 	}
-	file, err := os.OpenFile(mf.path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return err
+	mf.handleMu.RUnlock()
+
+	mf.handleMu.Lock()
+	if mf.file == nil {
+		file, err := os.OpenFile(mf.path, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			mf.handleMu.Unlock()
+			return nil, nil, err
+		}
+		mf.file = file
+		if mf.manager != nil {
+			mf.manager.handleOpened()
+		}
 	}
-	mf.file = file
-	if mf.manager != nil {
-		mf.manager.handleOpened()
+	file := mf.file
+	mf.refCount.Add(1)
+	mf.touch()
+	return file, func() {
+		mf.refCount.Add(-1)
+		mf.handleMu.Unlock()
+	}, nil
+}
+
+// syncHandle esegue fsync sotto handleMu, così l'fsync non può cadere su un
+// descrittore chiuso (ed eventualmente già riciclato) da un altro goroutine.
+func (mf *ManagedFile) syncHandle() {
+	mf.handleMu.RLock()
+	defer mf.handleMu.RUnlock()
+	if mf.file != nil {
+		_ = mf.file.Sync()
 	}
-	return nil
 }
 
 func (mf *ManagedFile) canCloseHandle() bool {
-	mf.handleMu.Lock()
-	defer mf.handleMu.Unlock()
+	mf.handleMu.RLock()
+	defer mf.handleMu.RUnlock()
 	return mf.file != nil && mf.refCount.Load() == 0
 }
 
@@ -747,25 +772,25 @@ func (mf *ManagedFile) ReadAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if err := mf.ensureHandle(); err != nil {
+	file, release, err := mf.acquireHandle()
+	if err != nil {
 		return 0, err
 	}
-	mf.beginUse()
-	defer mf.endUse()
+	defer release()
 
 	if !mf.cacheEnabled.Load() {
-		return mf.file.ReadAt(p, off)
+		return file.ReadAt(p, off)
 	}
-	return mf.readWithCache(p, off)
+	return mf.readWithCache(file, p, off)
 }
 
-func (mf *ManagedFile) readWithCache(p []byte, off int64) (int, error) {
+func (mf *ManagedFile) readWithCache(file *os.File, p []byte, off int64) (int, error) {
 	read := 0
 	for read < len(p) {
 		sectorIdx := (off + int64(read)) / mf.sectorSize
 		sectorOffset := (off + int64(read)) % mf.sectorSize
 		chunk := int(min64(mf.sectorSize-sectorOffset, int64(len(p)-read)))
-		buf, err := mf.getSector(sectorIdx)
+		buf, err := mf.getSector(file, sectorIdx)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return read, err
 		}
@@ -791,29 +816,29 @@ func (mf *ManagedFile) WriteAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if err := mf.ensureHandle(); err != nil {
+	file, release, err := mf.acquireHandle()
+	if err != nil {
 		return 0, err
 	}
-	mf.beginUse()
-	defer mf.endUse()
+	defer release()
 
 	if !mf.cacheEnabled.Load() {
-		n, err := mf.file.WriteAt(p, off)
+		n, err := file.WriteAt(p, off)
 		if err == nil {
 			mf.touch()
 		}
 		return n, err
 	}
-	return mf.writeWithCache(p, off)
+	return mf.writeWithCache(file, p, off)
 }
 
-func (mf *ManagedFile) writeWithCache(p []byte, off int64) (int, error) {
+func (mf *ManagedFile) writeWithCache(file *os.File, p []byte, off int64) (int, error) {
 	written := 0
 	for written < len(p) {
 		sectorIdx := (off + int64(written)) / mf.sectorSize
 		sectorOffset := (off + int64(written)) % mf.sectorSize
 		chunk := int(min64(mf.sectorSize-sectorOffset, int64(len(p)-written)))
-		buf, err := mf.ensureSector(sectorIdx)
+		buf, err := mf.ensureSector(file, sectorIdx)
 		if err != nil {
 			return written, err
 		}
@@ -824,8 +849,8 @@ func (mf *ManagedFile) writeWithCache(p []byte, off int64) (int, error) {
 	return written, nil
 }
 
-func (mf *ManagedFile) ensureSector(idx int64) ([]byte, error) {
-	buf, err := mf.getSector(idx)
+func (mf *ManagedFile) ensureSector(file *os.File, idx int64) ([]byte, error) {
+	buf, err := mf.getSector(file, idx)
 	if buf != nil || err != io.EOF {
 		return buf, err
 	}
@@ -841,7 +866,7 @@ func (mf *ManagedFile) ensureSector(idx int64) ([]byte, error) {
 	return entry.data, nil
 }
 
-func (mf *ManagedFile) getSector(idx int64) ([]byte, error) {
+func (mf *ManagedFile) getSector(file *os.File, idx int64) ([]byte, error) {
 	key := uint64(idx)
 	now := time.Now()
 	mf.cacheMu.RLock()
@@ -870,7 +895,7 @@ func (mf *ManagedFile) getSector(idx int64) ([]byte, error) {
 		mf.sectors = make(map[uint64]*sectorEntry)
 	}
 	data := make([]byte, mf.sectorSize)
-	n, err := mf.file.ReadAt(data, int64(idx)*mf.sectorSize)
+	n, err := file.ReadAt(data, int64(idx)*mf.sectorSize)
 	if err != nil && err != io.EOF {
 		mf.cacheMu.Unlock()
 		return nil, err
@@ -990,10 +1015,12 @@ func (mf *ManagedFile) flushSectorInternal(key uint64, force bool) {
 		time.Sleep(delay)
 	}
 
-	if err := mf.ensureHandle(); err != nil {
+	file, release, err := mf.acquireHandle()
+	if err != nil {
 		mf.clearPendingKey(key)
 		return
 	}
+	defer release()
 	mf.cacheMu.RLock()
 	entry, ok := mf.sectors[key]
 	dirty := ok && entry.dirty
@@ -1008,7 +1035,7 @@ func (mf *ManagedFile) flushSectorInternal(key uint64, force bool) {
 		mf.clearPendingKey(key)
 		return
 	}
-	_, err := mf.file.WriteAt(buf, int64(key)*mf.sectorSize)
+	_, err = file.WriteAt(buf, int64(key)*mf.sectorSize)
 	needsRetry := false
 	if err == nil {
 		mf.cacheMu.Lock()
@@ -1063,9 +1090,7 @@ func (mf *ManagedFile) clearPendingKey(key uint64) {
 
 func (mf *ManagedFile) Flush() {
 	if !mf.cacheEnabled.Load() {
-		if mf.file != nil {
-			_ = mf.file.Sync()
-		}
+		mf.syncHandle()
 		return
 	}
 	mf.cacheMu.RLock()
@@ -1079,9 +1104,7 @@ func (mf *ManagedFile) Flush() {
 	for _, key := range dirtyKeys {
 		mf.flushSectorImmediate(key)
 	}
-	if mf.file != nil {
-		_ = mf.file.Sync()
-	}
+	mf.syncHandle()
 }
 
 func (mf *ManagedFile) Close() {
@@ -1110,9 +1133,7 @@ func (mf *ManagedFile) SetCacheEnabled(enabled bool) {
 	}
 
 	if !mf.cacheEnabled.Load() {
-		if mf.file != nil {
-			_ = mf.file.Sync()
-		}
+		mf.syncHandle()
 		return
 	}
 	mf.Flush()

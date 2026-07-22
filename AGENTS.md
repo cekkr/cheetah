@@ -295,8 +295,12 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
   `promoteChildToJump`, `collectSingleBranchPath` — the jump-node collapse/split logic. High regression
   density; see [Jump-node invariants](#pitfall-jump-nodes).
 - **Scan / summary / reduce:** `PairScanWithOptions`, `PairSummaryWithOptions`, `handlePairReduce`,
-  `reduceWithPayload`, `parallelCollectPairEntries`, `walkPairTable`, cursor helpers
+  `reduceWithPayload`, `parallelCollectPairEntries`, `parallelSummarizePairEntries`, `walkPairTable`,
+  `walkPairSummary`, prefix resolution (`resolveScanPrefix`/`resolveSummaryPrefix`,
+  `readPrefixBranch`, `readBranchEntry`, `branchMatchesPartial`), cursor helpers
   (`comparePrefixToCursor`, `nextCursorForPrefix`), accumulators, and the async reduce handlers.
+  Both parallel walks size their task queue on the branch fan-out and drain inline (`select` +
+  `default`) when it is full — a blocking send there deadlocked `PAIR_SUMMARY` forever.
 - **Handler glue:** `handlePredict*`, `handleCluster*`, `handleForkAssign`, `systemStatsResponse`,
   `buildForkTransferPayload`/`applyForkTransferPayload`, `parseFileCheckpointArgs`.
 - **Depends on:** every other core file. **Tests:** [`benchmark_test.go`](benchmark_test.go)
@@ -394,7 +398,7 @@ Persists jump nodes (collapsed unique suffixes) in `pair_jumps/jumps.bin` + `ind
   `deleteJump`, `ensureJumpStoreLocked`, `loadJumpFromLegacyFileLocked` (migration),
   `idToIndex`/`decodeJumpAt`.
 - **Common mistakes:** the single-file store replaced a millions-of-inodes `.jump`-per-file scheme;
-  don't reintroduce per-node files. (`gofmt` currently flags this file.)
+  don't reintroduce per-node files.
 
 #### [`file_manager.go`](file_manager.go)
 
@@ -403,8 +407,16 @@ memory-pressure eviction, an fd cap, and a checkpoint controller.
 
 - **Key symbols:** `FileManager` (flush worker pool sized by `CHEETAH_FLUSH_WORKERS`/CPU, policy loop,
   fd limiter, `ForceCheckpoint`), `ManagedFile` (`ReadAt`/`WriteAt` over a `sectorEntry` cache,
-  `markDirty`, `queueFlush`, idle handle close/reopen), `cachePolicyConfig` +
-  `loadCachePolicyFromEnv` (the `CHEETAH_CACHE_*` knobs).
+  `markDirty`, `queueFlush`, idle handle close/reopen), `acquireHandle`/`syncHandle` (the only ways
+  to touch `ManagedFile.file`), `cachePolicyConfig` + `loadCachePolicyFromEnv` (the `CHEETAH_CACHE_*`
+  knobs).
+- **Handle contract:** `ManagedFile.file` is guarded by `handleMu` (a `sync.RWMutex`). Every read or
+  write pins it through `acquireHandle`, which opens the file if needed and keeps the lock held until
+  the returned release func runs; `closeHandle`/`forceCloseHandle` take the write lock, so a
+  concurrent idle close, fd-cap eviction, or `FILE_CHECKPOINT close_handles` can no longer swap the
+  descriptor mid-IO. Never read the field directly — pass the `*os.File` down (`readWithCache`,
+  `writeWithCache`, `getSector`, `ensureSector` all take it as a parameter) and fsync via
+  `syncHandle`. Lock order is `handleMu` → `cacheMu`/`pendingMu`, never the reverse.
 - **Common mistakes:** this is the only correct path to the backing files; bypassing it drops dirty
   data and defeats the fd cap that prevents "too many open files".
 
@@ -536,12 +548,28 @@ Unit tests for the graph subsystem: edge lifecycle + query, parser rules, batch 
 continue-on-error), multi-hop bound/cost, property secondary index, and the three graph reducers.
 Includes the `assertCommandPrefix` / `decodePairReducePayloads` helpers reused for reducer assertions.
 
+#### [`pair_scan_test.go`](pair_scan_test.go)
+
+Scan/summary contracts that are independent of the container format:
+`TestPairScanMidChunkPrefix` (prefixes that end inside a branch at stride 2 return the same sets as
+stride 1, for `PAIR_SCAN` and `PAIR_SUMMARY`), `TestPairScanPrefixParityAcrossStrides` (the same
+contract over ~300 prefixes of a deterministic random key set — it caught 141 wrong prefixes before
+the fix), and `TestPairSummaryDrainsSaturatedQueue` (the summary walk must finish with a task queue
+too small for the fan-out — the old blocking send hung there). Provides `mustInsertPair`, which
+writes a real payload because `PAIR_SUMMARY` reads value sizes, and `prefixFreeWords`.
+
+#### [`file_manager_test.go`](file_manager_test.go)
+
+`TestManagedFileConcurrentHandleLifecycle` — reads, writes, `Flush`, `ForceCheckpoint(CloseHandles)`
+and `forceCloseHandle` in parallel on one `ManagedFile`; run it with `-race` (it fails there without
+the `handleMu` protection of `ManagedFile.file`). Uses a cache-disabled file so it does not also trip
+the separate, still-open sector-payload race (see [Known Gaps](#known-gaps)).
+
 #### [`benchmark_test.go`](benchmark_test.go)
 
 `TestEditResizesValues` (correctness of size-changing edits) plus `TestCheetahDBBenchmark`, a
 throughput harness gated by `CHEETAHDB_BENCH=1` and tuned by `CHEETAHDB_BENCH_DURATION/_WORKERS/
-_VALUE_SIZE`. Writes logs a client would rotate under `var/eval_logs/` (untracked). (`gofmt` currently
-flags this file.)
+_VALUE_SIZE`. Writes logs a client would rotate under `var/eval_logs/` (untracked).
 
 ### Separate build targets (not part of the server binary)
 
@@ -602,6 +630,13 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Constraints:** cursor continuation is positional (`PAIR_SCAN <prefix> <limit> <cursor>`);
   `include_hidden=1` surfaces hidden terminals. **Gaps:** rolling-hash/Top-K digests are roadmap
   ([`NEXT_STEPS.md`](NEXT_STEPS.md)).
+- **Prefixes are byte-granular, node chunks are not.** A prefix does not have to land on a node
+  boundary: at stride 2 an odd-length prefix ends *inside* a branch, and a jump split can leave a
+  1-byte branch mid-key. `resolveScanPrefix`/`resolveSummaryPrefix` therefore return the unconsumed
+  bytes as a **partial**, which [`branchMatchesPartial`](database.go) applies as a filter on the seed
+  node's branches (1-byte branches must equal it, 2-byte branches must start with it), and
+  [`readPrefixBranch`](database.go) falls back to the short branch when the aligned one is empty.
+  Any new prefix walk must reuse those helpers instead of assuming `len(prefix) % stride == 0`.
 
 ### Adaptive pair-node indexing — Shipped
 
@@ -768,7 +803,10 @@ Test, vet, format:
 go test .                        # unit tests (fast; benchmark stays gated off)
 ```
 ```bash
-go vet ./... && gofmt -l .       # gofmt currently lists benchmark_test.go, jump_store.go, tables.go, types.go
+go test -race .                  # required for the ManagedFile handle-lifecycle test
+```
+```bash
+go vet ./... && gofmt -l .       # both silent on a clean tree
 ```
 
 Throughput benchmark (writes a client-rotated log; long-running):
@@ -855,6 +893,9 @@ seen in old docs are **client-side**; the server does not read them.
 | Legacy-directory guard + format marker pinned across reopen | [`TestPairFormatGuardRejectsLegacy`](pair_adaptive_test.go), [`TestPairFormatPinnedAcrossReopen`](pair_adaptive_test.go) |
 | Adaptive vs fixed storage/throughput comparison | [`TestAdaptivePairIndexBenchmark`](pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`) |
 | Known trie defects (documented, skipped) | [`TestPreexistingJumpTerminalDefects`](pair_adaptive_test.go) |
+| Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](pair_scan_test.go) |
+| `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](pair_scan_test.go) |
+| `ManagedFile` handle lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](file_manager_test.go) |
 | Throughput / concurrency under load | [`TestCheetahDBBenchmark`](benchmark_test.go) (gated by `CHEETAHDB_BENCH=1`) |
 | Graph edge lifecycle + query | [`TestGraphEdgeLifecycleAndQuery`](graph_test.go) |
 | `GRAPH_QUERY` parser rules | [`TestParseGraphQueryRules`](graph_test.go) |
@@ -866,8 +907,8 @@ seen in old docs are **client-side**; the server does not read them.
 | End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
 
 **Known test gaps:** no focused coverage for jump-node split/promote cycles, prediction-table
-train/inherit, cluster scheduling/gossip, the payload/managed-file caches, or cursor pagination edge
-cases. Add tests alongside changes in those areas. The graph subsystem now has both in-process unit
+train/inherit, cluster scheduling/gossip, the payload cache, the managed-file sector cache (only the
+handle lifecycle is covered), or cursor pagination edge cases. Add tests alongside changes in those areas. The graph subsystem now has both in-process unit
 coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over TCP
 ([`demo/graph-nell/main_test.go`](demo/graph-nell/main_test.go)).
 
@@ -933,16 +974,25 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
      `PAIR_GET` reports not-found (`lookupPairAt` tests `entryHasJump` before the entry's terminal).
   3. **Deleting one of two prefix-sharing keys drops its sibling** (`promoteChildToJump` /
      `collectSingleBranchPath` collapse a node still holding a live terminal).
-- **`PAIR_SUMMARY` deadlocks on any non-trivial trie.** [`walkPairSummary`](database.go) enqueues
-  child tasks with a **blocking** send (`tasks <- pairSummaryTask{…}`) into a channel sized
-  `workers*4` (~32), and has no inline-drain fallback. Once the queue fills, every worker blocks
-  sending and the call hangs forever at 0% CPU — reproduced on a 20k-key trie (both strides).
-  [`walkPairTable`](database.go) avoids this with its `enqueue` helper (`select` + `default` →
-  process inline); summary needs the same treatment.
+- **`PAIR_GET` loses keys at `pair_index_bytes = 2` after a jump split (4th trie defect).** Splitting
+  a jump re-inserts the old tail with [`insertSuffixWithContinuation`](database.go), which parks a
+  **1-byte** branch that still has a child — so the child node starts at an odd offset while
+  [`lookupPairAt`](database.go) keeps walking 2-byte chunks from the node start and reads an empty
+  branch. Repro: `PAIR_SET alpha/alpine/album` on a stride-2 database, then `PAIR_GET alpha` →
+  not-found (stride 1 is fine). `PAIR_SCAN`/`PAIR_SUMMARY` **do** find those keys: enumeration walks
+  populated branches whatever their width, and prefix resolution now falls back to the short branch
+  ([`readPrefixBranch`](database.go)). The real fix belongs in the insert/lookup/delete trio, which
+  must agree on where a node's chunks start.
 - **Cursor pagination is lossy and nondeterministic past the first page.** A full paginated
   `PAIR_SCAN` over 12k keys returned 11,727 / 11,727 / 11,726 / 11,705 across four runs on identical
-  data (parallel collection + limit/abort + cursor). Single-page scans are stable. There is currently
-  **no** reliable whole-trie traversal over the protocol — scan is lossy and summary hangs.
+  data (parallel collection + limit/abort + cursor). Single-page scans are stable, and
+  `PAIR_SUMMARY` now traverses the whole trie without hanging, so an unpaginated summary is the
+  reliable way to count.
+- **Sector payloads race under concurrent writers.** `writeWithCache` copies into `entry.data`
+  outside `cacheMu` while `flushSectorInternal` clones the same buffer under `cacheMu.RLock`; two
+  writers to one sector race the same way. `go test -race` flags it as soon as a `ManagedFile` with
+  the cache enabled is written concurrently. Distinct from the (fixed) `ManagedFile.file` race —
+  fixing it needs a per-`sectorEntry` lock, since `cacheMu` read locks do not exclude each other.
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](cluster_scheduler.go) `load`). Matches [`NEXT_STEPS.md`](NEXT_STEPS.md) #1.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the

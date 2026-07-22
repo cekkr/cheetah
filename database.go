@@ -883,9 +883,82 @@ func (db *Database) lookupPairAt(tableID uint32, key []byte, offset int) (uint64
 	return 0, errPairNotFound
 }
 
-func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (uint32, []byte, error) {
+// entryIsPopulated dice se un'entry porta davvero informazione: un ramo mai
+// scritto si rilegge come entry azzerata, non come errore.
+func entryIsPopulated(entry []byte) bool {
+	return len(entry) > 0 && (entryHasTerminal(entry) || entryHasChild(entry) || entryHasJump(entry))
+}
+
+// readBranchEntry legge un ramo risolvendo l'eventuale jump, con i tentativi
+// di ricarica previsti quando il jump store è in scrittura.
+func (db *Database) readBranchEntry(table *PairTable, index uint32, label string) ([]byte, *JumpNode, error) {
+	for retries := 0; retries < maxJumpReloadAttempts; retries++ {
+		entry, err := table.ReadEntry(index)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(entry) == 0 {
+			return nil, nil, errPairNotFound
+		}
+		if !entryHasJump(entry) {
+			return entry, nil, nil
+		}
+		node, err := db.loadJump(entryJumpID(entry))
+		if err != nil {
+			if shouldRetryJump(err) {
+				continue
+			}
+			return nil, nil, err
+		}
+		return entry, node, nil
+	}
+	return nil, nil, fmt.Errorf("jump reload limit exceeded (%s)", label)
+}
+
+// readPrefixBranch legge il ramo che prosegue il prefisso a partire da offset.
+// Prova prima il chunk allineato allo stride; se quel ramo è vuoto ripiega sul
+// ramo da 1 byte, perché lo split di un jump può materializzare un ramo corto
+// con continuazione anche in mezzo alla chiave (splitJumpIntoChild →
+// insertSuffixWithContinuation), lasciando il nodo figlio disallineato rispetto
+// ai chunk da 2 byte.
+func (db *Database) readPrefixBranch(table *PairTable, key []byte, offset int, label string) ([]byte, []byte, *JumpNode, error) {
+	chunk, index, _, err := db.nextChunk(key, offset)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	entry, node, err := db.readBranchEntry(table, index, label)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if entryIsPopulated(entry) || len(chunk) <= 1 {
+		return chunk, entry, node, nil
+	}
+	shortChunk := chunk[:1]
+	shortIndex, err := db.branchCodec.branchIndexFromChunk(shortChunk)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	shortEntry, shortNode, err := db.readBranchEntry(table, shortIndex, label)
+	if err != nil {
+		if errors.Is(err, errPairNotFound) {
+			return chunk, entry, node, nil
+		}
+		return nil, nil, nil, err
+	}
+	if entryIsPopulated(shortEntry) {
+		return shortChunk, shortEntry, shortNode, nil
+	}
+	return chunk, entry, node, nil
+}
+
+// resolveScanPrefix cammina il prefisso fino al nodo da cui far partire la
+// scansione. Restituisce l'id del nodo, il percorso già consumato e gli
+// eventuali byte residui: con stride 2 un prefisso di lunghezza dispari
+// termina a metà chunk, quindi l'ultimo byte non individua un ramo ma filtra
+// i rami del nodo raggiunto (vedi branchMatchesPartial).
+func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (uint32, []byte, []byte, error) {
 	if len(prefix) == 0 {
-		return 0, nil, nil
+		return 0, nil, nil, nil
 	}
 	targetLen := len(prefix)
 	pref := append([]byte{}, prefix...)
@@ -893,39 +966,16 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 	tableID := uint32(0)
 	offset := 0
 	for offset < len(pref) {
-		chunk, index, _, err := db.nextChunk(pref, offset)
-		if err != nil {
-			return 0, path, err
+		if len(pref)-offset < db.branchCodec.chunkBytes {
+			return tableID, path, append([]byte{}, pref[offset:]...), nil
 		}
 		table, err := db.getPairTable(tableID)
 		if err != nil {
-			return 0, path, err
+			return 0, path, nil, err
 		}
-		var entry []byte
-		var node *JumpNode
-		retries := 0
-		for {
-			if retries >= maxJumpReloadAttempts {
-				return 0, path, fmt.Errorf("jump reload limit exceeded (resolve scan prefix %x)", prefix)
-			}
-			entry, err = table.ReadEntry(index)
-			if err != nil {
-				return 0, path, err
-			}
-			if len(entry) == 0 {
-				return 0, path, errPairNotFound
-			}
-			if entryHasJump(entry) {
-				node, err = db.loadJump(entryJumpID(entry))
-				if err != nil {
-					if shouldRetryJump(err) {
-						retries++
-						continue
-					}
-					return 0, path, err
-				}
-			}
-			break
+		chunk, entry, node, err := db.readPrefixBranch(table, pref, offset, fmt.Sprintf("resolve scan prefix %x", prefix))
+		if err != nil {
+			return 0, path, nil, err
 		}
 		path = append(path, chunk...)
 		offset += len(chunk)
@@ -940,12 +990,12 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 			switch {
 			case remaining > len(jumpBytes):
 				if !bytes.Equal(jumpBytes, pref[offset:offset+len(jumpBytes)]) {
-					return 0, path, errPairNotFound
+					return 0, path, nil, errPairNotFound
 				}
 				offset += len(jumpBytes)
 			case remaining > 0:
 				if !bytes.Equal(jumpBytes[:remaining], pref[offset:offset+remaining]) {
-					return 0, path, errPairNotFound
+					return 0, path, nil, errPairNotFound
 				}
 				offset += remaining
 				if remaining < len(jumpBytes) {
@@ -961,7 +1011,7 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 				acc.add(append([]byte{}, path...), node.TerminalKey)
 			}
 			if node.NextTableID == 0 {
-				return 0, path, nil
+				return 0, path, nil, nil
 			}
 			tableID = node.NextTableID
 			continue
@@ -971,16 +1021,18 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 			continue
 		}
 		if offset < targetLen {
-			return 0, path, errPairNotFound
+			return 0, path, nil, errPairNotFound
 		}
-		return 0, path, nil
+		return 0, path, nil, nil
 	}
-	return tableID, path, nil
+	return tableID, path, nil, nil
 }
 
-func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumulator) (uint32, []byte, error) {
+// resolveSummaryPrefix è l'equivalente di resolveScanPrefix per PAIR_SUMMARY:
+// restituisce anche i byte residui quando il prefisso finisce a metà chunk.
+func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumulator) (uint32, []byte, []byte, error) {
 	if len(prefix) == 0 {
-		return 0, nil, nil
+		return 0, nil, nil, nil
 	}
 	targetLen := len(prefix)
 	pref := append([]byte{}, prefix...)
@@ -988,45 +1040,22 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 	tableID := uint32(0)
 	offset := 0
 	for offset < len(pref) {
-		chunk, index, _, err := db.nextChunk(pref, offset)
-		if err != nil {
-			return 0, path, err
+		if len(pref)-offset < db.branchCodec.chunkBytes {
+			return tableID, path, append([]byte{}, pref[offset:]...), nil
 		}
 		table, err := db.getPairTable(tableID)
 		if err != nil {
-			return 0, path, err
+			return 0, path, nil, err
 		}
-		var entry []byte
-		var node *JumpNode
-		retries := 0
-		for {
-			if retries >= maxJumpReloadAttempts {
-				return 0, path, fmt.Errorf("jump reload limit exceeded (resolve summary prefix %x)", prefix)
-			}
-			entry, err = table.ReadEntry(index)
-			if err != nil {
-				return 0, path, err
-			}
-			if len(entry) == 0 {
-				return 0, path, errPairNotFound
-			}
-			if entryHasJump(entry) {
-				node, err = db.loadJump(entryJumpID(entry))
-				if err != nil {
-					if shouldRetryJump(err) {
-						retries++
-						continue
-					}
-					return 0, path, err
-				}
-			}
-			break
+		chunk, entry, node, err := db.readPrefixBranch(table, pref, offset, fmt.Sprintf("resolve summary prefix %x", prefix))
+		if err != nil {
+			return 0, path, nil, err
 		}
 		path = append(path, chunk...)
 		offset += len(chunk)
 		if offset == targetLen && entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
 			if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), decodeAbsoluteKey(entry)); err != nil {
-				return 0, path, err
+				return 0, path, nil, err
 			}
 		}
 		if entryHasJump(entry) {
@@ -1037,12 +1066,12 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 			switch {
 			case remaining > len(jumpBytes):
 				if !bytes.Equal(jumpBytes, pref[offset:offset+len(jumpBytes)]) {
-					return 0, path, errPairNotFound
+					return 0, path, nil, errPairNotFound
 				}
 				offset += len(jumpBytes)
 			case remaining > 0:
 				if !bytes.Equal(jumpBytes[:remaining], pref[offset:offset+remaining]) {
-					return 0, path, errPairNotFound
+					return 0, path, nil, errPairNotFound
 				}
 				offset += remaining
 				if remaining < len(jumpBytes) {
@@ -1056,11 +1085,11 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 			}
 			if prefixWithinJump && node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
 				if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), node.TerminalKey); err != nil {
-					return 0, path, err
+					return 0, path, nil, err
 				}
 			}
 			if node.NextTableID == 0 {
-				return 0, path, nil
+				return 0, path, nil, nil
 			}
 			tableID = node.NextTableID
 			continue
@@ -1070,11 +1099,11 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 			continue
 		}
 		if offset < targetLen {
-			return 0, path, errPairNotFound
+			return 0, path, nil, errPairNotFound
 		}
-		return 0, path, nil
+		return 0, path, nil, nil
 	}
-	return tableID, path, nil
+	return tableID, path, nil, nil
 }
 
 func (db *Database) deletePairValue(value []byte) (bool, error) {
@@ -1735,8 +1764,9 @@ func (db *Database) PairScanWithOptions(prefix []byte, limit int, cursor []byte,
 	acc := newPairScanAccumulator(limit, cursor, includeHidden)
 	startTable := uint32(0)
 	expandedPrefix := append([]byte{}, prefix...)
+	var partialPrefix []byte
 	if len(prefix) > 0 {
-		tableID, path, err := db.resolveScanPrefix(prefix, acc)
+		tableID, path, partial, err := db.resolveScanPrefix(prefix, acc)
 		if err != nil {
 			if errors.Is(err, errPairNotFound) {
 				results, nextCursor := acc.finalize(acc.limit)
@@ -1746,7 +1776,8 @@ func (db *Database) PairScanWithOptions(prefix []byte, limit int, cursor []byte,
 		}
 		expandedPrefix = path
 		startTable = tableID
-		if acc.shouldStop() || startTable == 0 {
+		partialPrefix = partial
+		if acc.shouldStop() || (startTable == 0 && len(partialPrefix) == 0) {
 			results, nextCursor := acc.finalize(acc.limit)
 			return results, nextCursor, nil
 		}
@@ -1754,7 +1785,7 @@ func (db *Database) PairScanWithOptions(prefix []byte, limit int, cursor []byte,
 		expandedPrefix = nil
 	}
 	workerCount := db.recommendedWorkerCount(acc.limit, pairScanDefaultLimit)
-	if err := db.parallelCollectPairEntries(startTable, expandedPrefix, workerCount, acc); err != nil {
+	if err := db.parallelCollectPairEntries(startTable, expandedPrefix, partialPrefix, workerCount, acc); err != nil {
 		return nil, nil, err
 	}
 	results, nextCursor := acc.finalize(acc.limit)
@@ -1779,8 +1810,9 @@ func (db *Database) PairSummaryWithOptions(prefix []byte, depthLimit int, branch
 	acc := newPairSummaryAccumulator(prefix, depthLimit, branchLimit, includeHidden)
 	startTable := uint32(0)
 	expandedPrefix := append([]byte{}, prefix...)
+	var partialPrefix []byte
 	if len(prefix) > 0 {
-		tableID, path, err := db.resolveSummaryPrefix(prefix, acc)
+		tableID, path, partial, err := db.resolveSummaryPrefix(prefix, acc)
 		if err != nil {
 			if errors.Is(err, errPairNotFound) {
 				return acc.finalize(), nil
@@ -1789,14 +1821,15 @@ func (db *Database) PairSummaryWithOptions(prefix []byte, depthLimit int, branch
 		}
 		expandedPrefix = path
 		startTable = tableID
-		if startTable == 0 {
+		partialPrefix = partial
+		if startTable == 0 && len(partialPrefix) == 0 {
 			return acc.finalize(), nil
 		}
 	} else {
 		expandedPrefix = nil
 	}
 	workerCount := db.recommendedWorkerCount(branchLimit, pairScanDefaultLimit)
-	if err := db.parallelSummarizePairEntries(startTable, expandedPrefix, workerCount, acc); err != nil {
+	if err := db.parallelSummarizePairEntries(startTable, expandedPrefix, partialPrefix, workerCount, acc); err != nil {
 		return nil, err
 	}
 	return acc.finalize(), nil
@@ -1806,11 +1839,30 @@ type pairScanTask struct {
 	tableID uint32
 	prefix  []byte
 	cursor  []byte
+	// partial contiene i byte di prefisso non ancora consumati perché il
+	// prefisso finisce a metà chunk (possibile solo con stride 2). Filtra i
+	// rami del nodo iniziale; i task figli lo lasciano vuoto.
+	partial []byte
 }
 
 type pairSummaryTask struct {
 	tableID uint32
 	path    []byte
+	partial []byte
+}
+
+// branchMatchesPartial dice se un ramo va visitato quando restano byte di
+// prefisso da consumare a metà chunk. Con stride 2 un prefisso di lunghezza
+// dispari finisce fra i due byte di un ramo: i rami da 1 byte devono
+// coincidere con il resto, quelli da 2 byte devono iniziare con esso.
+func branchMatchesPartial(chunk []byte, partial []byte) bool {
+	if len(partial) == 0 {
+		return true
+	}
+	if len(chunk) < len(partial) {
+		return false
+	}
+	return bytes.HasPrefix(chunk, partial)
 }
 
 func comparePrefixToCursor(prefix []byte, cursor []byte) int {
@@ -2002,7 +2054,7 @@ func (a *pairScanAccumulator) finalize(limit int) ([]PairScanResult, []byte) {
 	return a.results, nextCursor
 }
 
-func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, workers int, acc *pairScanAccumulator) error {
+func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, partial []byte, workers int, acc *pairScanAccumulator) error {
 	// Avoid deadlocks when a very dense table fans out more tasks than workers*buffer
 	// by sizing the queue to hold at least the maximum branch fan-out.
 	queueSize := workers * 4
@@ -2026,7 +2078,7 @@ func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, wo
 	if len(acc.cursor) > 0 {
 		initialCursor = append([]byte{}, acc.cursor...)
 	}
-	tasks <- pairScanTask{tableID: tableID, prefix: append([]byte{}, prefix...), cursor: initialCursor}
+	tasks <- pairScanTask{tableID: tableID, prefix: append([]byte{}, prefix...), cursor: initialCursor, partial: append([]byte{}, partial...)}
 	go func() {
 		pending.Wait()
 		close(tasks)
@@ -2059,8 +2111,18 @@ func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, wo
 	return nil
 }
 
-func (db *Database) parallelSummarizePairEntries(tableID uint32, prefix []byte, workers int, acc *pairSummaryAccumulator) error {
-	tasks := make(chan pairSummaryTask, workers*4)
+func (db *Database) parallelSummarizePairEntries(tableID uint32, prefix []byte, partial []byte, workers int, acc *pairSummaryAccumulator) error {
+	// Stessa politica di dimensionamento della coda usata dallo scan: un nodo
+	// molto denso genera più task del buffer minimo.
+	queueSize := workers * 4
+	if db.branchCodec.branchCount > queueSize {
+		queueSize = db.branchCodec.branchCount
+	}
+	queueSize *= 2
+	if queueSize < 16 {
+		queueSize = 16
+	}
+	tasks := make(chan pairSummaryTask, queueSize)
 	var pending sync.WaitGroup
 	var workerWG sync.WaitGroup
 	var firstErr error
@@ -2068,7 +2130,7 @@ func (db *Database) parallelSummarizePairEntries(tableID uint32, prefix []byte, 
 	var abort atomic.Bool
 
 	pending.Add(1)
-	tasks <- pairSummaryTask{tableID: tableID, path: append([]byte{}, prefix...)}
+	tasks <- pairSummaryTask{tableID: tableID, path: append([]byte{}, prefix...), partial: append([]byte{}, partial...)}
 	go func() {
 		pending.Wait()
 		close(tasks)
@@ -2109,6 +2171,19 @@ func (db *Database) walkPairSummary(
 	abort *atomic.Bool,
 ) error {
 	defer pending.Done()
+	enqueue := func(t pairSummaryTask) error {
+		if abort != nil && abort.Load() {
+			return nil
+		}
+		pending.Add(1)
+		select {
+		case tasks <- t:
+			return nil
+		default:
+			// Coda satura: elabora in linea per evitare il deadlock.
+			return db.walkPairSummary(t, acc, pending, tasks, abort)
+		}
+	}
 	table, err := db.getPairTable(task.tableID)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2161,6 +2236,9 @@ func (db *Database) walkPairSummary(
 		if !ok {
 			continue
 		}
+		if !branchMatchesPartial(chunk, task.partial) {
+			continue
+		}
 		value := append(append([]byte{}, task.path...), chunk...)
 		if entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
 			key := decodeAbsoluteKey(entry)
@@ -2175,8 +2253,9 @@ func (db *Database) walkPairSummary(
 			if childID == 0 {
 				continue
 			}
-			pending.Add(1)
-			tasks <- pairSummaryTask{tableID: childID, path: value}
+			if err := enqueue(pairSummaryTask{tableID: childID, path: value}); err != nil {
+				return err
+			}
 		}
 		if entryHasJump(entry) {
 			extended := append(append([]byte{}, value...), node.Bytes...)
@@ -2186,8 +2265,9 @@ func (db *Database) walkPairSummary(
 				}
 			}
 			if node.NextTableID != 0 {
-				pending.Add(1)
-				tasks <- pairSummaryTask{tableID: node.NextTableID, path: extended}
+				if err := enqueue(pairSummaryTask{tableID: node.NextTableID, path: extended}); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -2285,6 +2365,9 @@ func (db *Database) walkPairTable(
 		}
 		chunk, ok := db.branchCodec.decode(branch)
 		if !ok {
+			continue
+		}
+		if !branchMatchesPartial(chunk, task.partial) {
 			continue
 		}
 		value := append(append([]byte{}, task.prefix...), chunk...)
