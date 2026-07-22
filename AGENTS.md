@@ -41,9 +41,11 @@ mismatch within task scope, and update stale docs in the same change.
    truth for behavior. Tests in [`src/graph_test.go`](src/graph_test.go) and
    [`src/benchmark_test.go`](src/benchmark_test.go) assert the pieces they cover.
 3. [`config.example.ini`](config.example.ini) — the authoritative shape of `config.ini` settings.
-4. [`README.md`](README.md) — operator/user guide. High-signal but partially stale: it documents
-   `RECYCLE` and a standalone TCP `CURSOR` command that the dispatcher does **not** implement. Verify
-   commands against [`ExecuteCommand`](src/database.go) before trusting them.
+4. [`README.md`](README.md) — operator/user guide. Its
+   [Command Reference](README.md#command-reference) now covers every command in the
+   `ExecuteCommand` switch plus the three front-end ones, with the meaning of each and the
+   distinctions between the look-alikes; still verify against
+   [`ExecuteCommand`](src/database.go) before trusting a syntax detail.
 5. [`CONCEPTS.md`](CONCEPTS.md) — original design intent and the context-relativism / reducer payload
    contracts. Written from the parent project's perspective; the `ctx:`/`ctxv:`/`cnt:`/`prob:` layouts
    it describes are *client conventions*, not enforced by this server (the server treats all prefixes
@@ -889,11 +891,14 @@ nodes are reused — keep automated runs to a few hundred edges.
 ### Pitfall: documented commands that don't exist
 
 - **Symptom:** scripting `RECYCLE <value_size>` or a standalone TCP `CURSOR <token>` returns
-  `ERROR,unknown_command`.
-- **Cause:** [`README.md`](README.md) lists both, but [`ExecuteCommand`](src/database.go) implements
-  neither. `CURSOR` exists only as a *clause inside* `GRAPH_QUERY`.
+  `ERROR,unknown_command`; `EDIT:<size> <key> <payload>` does too.
+- **Cause:** older revisions of [`README.md`](README.md) listed the first two, and its synopsis gave
+  `EDIT` an `INSERT`-style `:<size>` suffix. [`ExecuteCommand`](src/database.go) implements none of
+  them: `CURSOR` exists only as a *clause inside* `GRAPH_QUERY`, and `EDIT` is matched by exact
+  equality (only `INSERT` is matched by prefix), taking its size from the payload. All three are
+  corrected in the current README.
 - **Safe pattern:** the authoritative command list is the `ExecuteCommand` switch plus the front-end
-  `DATABASE`/`RESET_DB`. Continue a scan with `PAIR_SCAN <prefix> <limit> <cursor>`.
+  `DATABASE`/`RESET_DB`/`EXIT`. Continue a scan with `PAIR_SCAN <prefix> <limit> <cursor>`.
 
 <a id="pitfall-jump-nodes"></a>
 ### Pitfall: prefix overlaps in the trie (jump collapse/split)
@@ -1194,8 +1199,18 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](src/cluster_scheduler.go) `load`). First open item in
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
-- **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the
-  server does not implement (see [pitfall](#pitfall-doc-command-drift)).
+- **`PAIR_PURGE` is racy** — `purgePairEntries` ([`commands.go`](src/commands.go)) deletes entries from
+  parallel goroutines while `deletePairAt` mutates the trie unlocked. Fails ~6 runs in 8 on 8 keys
+  under one prefix, either with `remove pairs/<n>.table: no such file or directory` /
+  `jump reload limit exceeded`, or silently, reporting `purged=N` with entries still scannable.
+  Full repro in [`NEXT_STEPS.md`](NEXT_STEPS.md).
+- **`PREDICT_*` error responses omit the `ERROR,` prefix** — the handlers return `err.Error()` raw
+  (`inherit_sources_missing`), breaking the otherwise universal `SUCCESS`/`ERROR,` classification.
+- **Command-surface redundancy** — 51 dispatcher commands, of which the async trios, the `_BATCH`
+  forms, the four hydration levels of one adjacency/trie walk, and the five erasure verbs are the
+  same operation in different envelopes. Documented per command in
+  [`README.md`](README.md#telling-the-look-alikes-apart); the micro-command + alias plan is in
+  [`NEXT_STEPS.md`](NEXT_STEPS.md).
 - **Thin tests** for prediction, cluster, and the payload cache (see test gaps above).
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))

@@ -1,3 +1,7 @@
+# Defects (found by driving a live server while documenting the protocol, 2026-07-23):
+- **`PAIR_PURGE` is racy and can lose or strand entries.** `purgePairEntries` ([`src/commands.go`](src/commands.go)) fans deletions out over goroutines, but the trie mutation they reach — `deletePairValue` → `deletePairAt`, including node collapse, jump promotion and `deletePairTable`'s `os.Remove` — holds no lock. Two goroutines deleting sibling keys under a shared ancestor race. Observed on 8 keys under one prefix, **6 failures in 8 trials**: `ERROR,internal_error:pair delete <hex> failed: remove pairs/2.table: no such file or directory`, `ERROR,…: jump reload limit exceeded (delete table=3 offset=5)`, and — worst — `SUCCESS,purged=8` followed by a `PAIR_SCAN` that still returns entries. Repro: `INSERT` + `PAIR_SET` eight `ctx:<WORD>` keys, `PAIR_PURGE ctx: 4096`, then `PAIR_SCAN ctx: 64`. Fix by serializing the pair-entry removal (the parallelism only helps the payload delete, not the trie walk) and pin it with a `-race` regression test beside [`src/pair_scan_test.go`](src/pair_scan_test.go).
+- **`PREDICT_*` failures skip the `ERROR,` prefix.** `handlePredictTrain`/`handlePredictInherit` and friends return `err.Error()` verbatim, so a failed inherit answers a bare `inherit_sources_missing` instead of `ERROR,inherit_sources_missing`. Every other family prefixes its failures, so a client that classifies on the prefix mis-reads these as neither success nor error. Wrap them at the dispatcher boundary — and note the change is client-visible, so it belongs with the alias work below rather than as a silent fix.
+
 # To do:
 - **Hippocampus, consolidation step.** `GRAPH_RECALL` reads; nothing writes back. Record which nodes co-activate across repeated recalls and, past a threshold, persist the pair as a derived edge (`recalled_with`, low confidence, `props.derived=1`) so an association discovered twice becomes cheap the third time. Needs a decay/forgetting rule too, or the graph fills with its own echoes.
 - **Async recall for wide fan-outs.** `GRAPH_RECALL` is synchronous and budget-bounded: on a hub-heavy graph a deep recall returns `truncated=1` instead of the full picture. Add `GRAPH_RECALL_ASYNC/_STATUS/_FETCH` on the `reduce_jobs.go` model so a wide sweep can run past a single round-trip.
@@ -10,6 +14,93 @@
 - Add optional reducer digests (entropy / CDF / rolling hashes) and trie-level rolling-hash mirrors for fast Top-K / similarity scans.
 - Wire the `demo/graph-nell` end-to-end execution test (`CHEETAH_NELL_E2E=1`) into CI, and optionally add a large-slice variant that runs a bounded pass over the real NELL dataset when it is present.
 - Focused tests for prediction train/inherit, cluster scheduling/gossip, and the payload cache — the thinnest areas left after the trie work.
+
+# Command surface: collapse the repeats into micro-commands, keep the names as aliases
+
+The protocol grew one feature at a time, and it shows: 51 dispatcher commands, of which a large
+minority are **the same operation in a different envelope**. The cost is not code size, it is
+meaning — `PAIR_SUMMARY`, `GRAPH_DEGREE` and `GRAPH_QUERY … RETURN count` all mean "count without
+hydrating", and nothing in their names says so, so a caller picks by memory instead of by intent.
+[`README.md`](README.md#telling-the-look-alikes-apart) now documents each command's meaning and the
+look-alike distinctions; this entry is the plan to make the surface itself say them.
+
+## What actually repeats
+
+| Repeated shape | Commands | What differs |
+| --- | --- | --- |
+| **async envelope** | `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH` | nothing but the job manager they poll — two independent implementations of submit/poll/fetch ([`reduce_jobs.go`](src/reduce_jobs.go), [`predict_jobs.go`](src/predict_jobs.go)) with slightly different response fields |
+| **batch envelope** | `GRAPH_EDGE_SET` vs `_SET_BATCH`, `PREDICT_INHERIT` vs `_BATCH` | one item inline vs `items=<base64 json[]>`; the per-item work is identical |
+| **one walk, four hydration levels** | `PAIR_SCAN` / `PAIR_SUMMARY` / `PAIR_REDUCE`, and `GRAPH_NEIGHBORS` / `GRAPH_DEGREE` / `GRAPH_NEIGHBOR_TYPES` / `GRAPH_QUERY … RETURN count` | how much of each visited entry is read and what is emitted: names, a count, an aggregate, full payloads |
+| **one erasure, six spellings** | `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL cascade=`, `GRAPH_EDGE_DEL`, `RESET_DB` | only the selector (one key, one name, a prefix, a record + its indexes, a directory) — the verb is the same verb |
+| **point read / point write** | `PAIR_GET`/`PAIR_SET`(`_HIDDEN`), `GRAPH_NODE_GET`/`_SET`, `GRAPH_EDGE_GET`/`_SET`, `PREDICT_SET` | which namespace the key lives in, and whether one flag bit is set |
+| **placement read** | `CLUSTER_STATUS` vs `FORK_ASSIGN` | whole map vs one prefix — a selector, not a command |
+
+Three argument dialects sit on top of that (positional for KV/`PAIR_*`, `key=value` for
+`GRAPH_*`/`PREDICT_*`/`CLUSTER_*`, a clause language for `GRAPH_QUERY`), so two commands doing the
+same thing often cannot even be written the same way.
+
+## The decomposition
+
+Factor every command into three orthogonal parts and give each part its own token:
+
+```text
+<verb>  <target>            <view / modifiers>
+GET     pairs|graph|values  ─
+SET     …                   hidden=1 · items=<base64 json[]>
+DEL     …                   cascade=1 · recursive=1
+SCAN    …                   view=names|count|stats|types|payload:<reducer> · limit/cursor/depth
+JOB     submit|status|fetch  ─  (one envelope over any bounded SCAN/SET)
+```
+
+- **`SCAN` with a `view=`** absorbs `PAIR_SCAN`/`PAIR_SUMMARY`/`PAIR_REDUCE` and
+  `GRAPH_NEIGHBORS`/`GRAPH_DEGREE`/`GRAPH_NEIGHBOR_TYPES`. They already share the walk in code —
+  `PairScanWithOptions`, `walkPairSummary` and `reduceWithPayload` differ in their accumulator, which
+  is exactly what `view=` would select. `view=payload:<reducer>` reuses the existing reducer registry
+  ([`reducers.go`](src/reducers.go)), so the extension point stays where it is.
+- **`JOB`** replaces both async trios: `JOB submit <any bounded command>` → `job=<id>`, then
+  `JOB status <id>` / `JOB fetch <id>`. One job manager, one progress contract, and any future
+  long command (`GRAPH_RECALL_ASYNC`, first item in this file) gets an async form for free instead
+  of a third copy of the same three commands.
+- **`items=`** as a modifier rather than a `_BATCH` command name; the single-item form stays as the
+  degenerate case.
+- **`DEL` with a selector** covers all five erasures, with the scope explicit in the arguments
+  (`DEL values key=<n>` vs `DEL pairs prefix=<p> payloads=1` vs `DEL graph node=<id> cascade=1`)
+  instead of implied by the verb's name. This is where meaning is lost most often today.
+- **Leave `GRAPH_QUERY` alone.** Its clause language is a genuinely different surface, not an
+  envelope; folding it into `SCAN` would trade one clear grammar for a pile of flags. `GRAPH_RECALL`
+  and `GRAPH_SIMILAR` likewise: they are distinct operations, not views.
+
+## Recomposition as aliases — the compatibility half
+
+Nothing above is worth breaking a client for. Every current name stays, re-expressed as an **alias**:
+a legacy command name plus an argument rewriter plus a response formatter, registered at startup in
+one table the way `registerDefaultReducers` registers reducers. `ExecuteCommand` resolves the alias,
+runs the micro-command, and renders the legacy response.
+
+Two constraints make the formatter non-optional:
+
+- **Response field names are a wire contract.** `purged=`, `matches=`, `degree=`, `count=`,
+  `next_cursor=`, `job=` are parsed by external clients (the Python adapter in
+  `/Users/riccardo/Sources/GitHub/lmdb` reads them positionally in places). An alias must reproduce
+  its legacy response byte-for-byte; only the internals change.
+- **One command, one line.** The single-line rule applies to micro-commands and aliases alike;
+  list-shaped output still travels as `payload=<base64>`.
+
+Aliases also become the place where the three argument dialects are absorbed: micro-commands accept
+`key=value` only, and the positional forms survive exclusively inside the alias rewriters
+(`PAIR_SCAN <prefix> <limit> <cursor>` → `SCAN pairs prefix=… limit=… cursor=…`).
+
+## Suggested order
+
+1. **`JOB`** — smallest, two existing implementations to unify, and it unblocks `GRAPH_RECALL_ASYNC`.
+2. **`DEL`** — highest meaning-per-line-changed; the five erasures are the most commonly confused set.
+3. **`SCAN` + `view=`** — the largest win and the largest regression surface (it touches the scan,
+   summary and reducer walks); do it only with the pair-trie test suite green on both strides.
+4. **`GET`/`SET`** — mostly cosmetic once the above land; may be deferred indefinitely.
+
+Verification for each step is the same: the alias must produce, for every legacy command in
+[`README.md`](README.md#command-reference), a response identical to the current one. That is a
+golden-response test worth writing before the first refactor, not after.
 
 # Done (implemented + verified by tests — do not re-add):
 - Associative recall ("hippocampus"): `GRAPH_RECALL` spreads activation from several seed terms at once and returns every node above a requested precision with the seeds that reached it, the conceptual distance, the evidence path (weight + confidence + modality per edge) and a novelty score, so a model can pick what to explore instead of guessing the next query. Activation from different seeds combines in noisy-OR, which makes a node reached by two seeds outrank both single-seed neighbours — `min_sources=2` isolates exactly those convergences. Seeds resolve three ways: exact id, lexical overlap through the new `\x05gt:` term index (maintained on node upsert/delete, rebuildable with `GRAPH_TERM_INDEX action=rebuild`, switchable off with `CHEETAH_GRAPH_TERM_INDEX=0`), and declared synonym edges (`synonym`/`alias`/`same_as`/`aka`/`abbreviation`/`acronym`), which cost a hop but no conceptual distance. `GRAPH_SIMILAR` adds distributional similarity — same neighbours, or same words in the id. Everything is bounded by `branch_limit`/`budget` and degrades with `truncated=1` rather than stalling — `src/graph_recall.go`, `src/graph_recall_test.go`.

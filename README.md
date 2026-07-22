@@ -129,119 +129,503 @@ logical databases or send the same command over TCP.
 
 ## Command Reference
 
-```
-INSERT:<size> <payload>         # create payload, returns abs key
-READ <abs_key>                  # fetch payload by key
-EDIT:<size> <abs_key> <payload> # overwrite payload in-place
-PAIR_SET <hex_prefix> <payload> # map trie prefix to payload key
-PAIR_SET_HIDDEN <hex_prefix> <payload>
-                                # map a hidden trie prefix to payload key
-PAIR_SCAN <prefix> [limit] [cursor] [include_hidden=1]
-                                # stream ordered namespace slices (cursors supported)
-PAIR_REDUCE <mode> <prefix> [limit] [cursor] [include_hidden=1]
-                                # stream reducer payloads (counts/probabilities/degree/triangle/pagerank_seed/etc.)
-PAIR_REDUCE_ASYNC <mode> <prefix> [limit] [cursor]
-                                # enqueue reducer job and return a job identifier
-PAIR_REDUCE_STATUS <job_id>     # report reducer job progress/state
-PAIR_REDUCE_FETCH <job_id>      # fetch reducer results once completed (PENDING while running)
-PAIR_SUMMARY <prefix> [depth] [branch_limit] [include_hidden=1]
-                                # aggregate namespace statistics (payload totals, branch fan-out)
-GRAPH_NODE_SET id=<node> [labels=a,b] [props=<base64 json>]
-                                # upsert a graph node record
-GRAPH_NODE_GET id=<node>
-GRAPH_NODE_DEL id=<node> [cascade=1]
-GRAPH_EDGE_SET from=<node> to=<node> [type=<edge>] [weight=<float>] [directed=0|1]
-               [confidence=<0..1|word>] [modality=<word>] [ambiguity=<group>]
-                                # upsert a typed edge + adjacency indexes
-GRAPH_AMBIGUITY_SET from=<node> group=<id> options=<node>[=<share>][,…] [type=<edge>]
-                                # enumerate mutually exclusive alternatives as one group
-GRAPH_AMBIGUITY_GET from=<node> group=<id> [direction=out|in] [limit=<n>]
-                                # read a group back, strongest alternative first
-GRAPH_AMBIGUITY_RESOLVE from=<node> group=<id> winner=<node> [drop=0|1]
-                                # collapse a group: winner certain, others ruled out
-GRAPH_EDGE_SET_BATCH items=<base64 json> [continue_on_error=0|1] [type=<edge>] [directed=0|1]
-                                # bulk graph edge upsert in one command
-GRAPH_EDGE_GET from=<node> to=<node> [type=<edge>] [directed=0|1]
-GRAPH_EDGE_DEL from=<node> to=<node> [type=<edge>] [directed=0|1]
-GRAPH_NEIGHBORS id=<node> [direction=out|in|both] [type=<edge>] [limit=<n>] [cursor=<token>]
-                                # stream adjacency pages backed by trie prefixes
-GRAPH_DEGREE id=<node> [direction=out|in|both] [type=<edge|*>] [weighted=0|1]
-                                # fast degree/weighted-degree stats
-GRAPH_NEIGHBOR_TYPES id=<node> [direction=out|in|both] [limit=<n>] [cursor=<token>] [weighted=0|1]
-                                # compact relation histogram for fast graph feature extraction
-GRAPH_QUERY MATCH (...) ...     # graph pattern query (see syntax below)
-GRAPH_RECALL seeds=<term>[,<term>…] [precision=<0..1|word>] [hops=<n>] [limit=<n>]
-             [min_sources=<n>] [direction=out|in|both] [type=<t>[,…]] [decay=<0..1>]
-             [expand=exact|lexical|synonyms|all] [branch_limit=<n>] [budget=<n>]
-                                # associative recall: everything several terms co-activate, ranked
-GRAPH_SIMILAR id=<node> [by=context|lexical|all] [limit=<n>] [precision=<0..1|word>]
-                                # nodes that occur in the same contexts, or share the same words
-GRAPH_TERM_INDEX [action=stats|rebuild|drop] [limit=<n>] [cursor=<token>]
-                                # maintain the lexical index that resolves free-text seeds
-RESET_DB [name]                 # delete/recreate the current (or named) database on disk
-DELETE <abs_key>                # tombstone entry
-FILE_CHECKPOINT [IDLE=<dur>] [DROP_CACHE] [CLOSE_HANDLES]
-                                # force-flush dirty sectors / release idle handles mid-run
-SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
-LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (optionally capped)
+Every command is **one line in, one line out**. A response opens with `SUCCESS` or `ERROR,<reason>`
+and continues as comma-separated `key=value` fields; anything list- or record-shaped travels inside a
+single `payload=<base64>` field (JSON once decoded), never as extra lines. The CLI and the TCP
+listener speak the same vocabulary — only `DATABASE`, `RESET_DB` and `EXIT` are handled by the
+front-ends, because they change *which* database the connection is talking to.
+
+Three argument dialects coexist, which is why a command's family is easier to guess than its syntax:
+
+| Dialect | Used by | Example |
+| --- | --- | --- |
+| **positional** | the KV and `PAIR_*` families, `LOG_FLUSH`, `FORK_ASSIGN`, job polling | `PAIR_SCAN ctx: 64 x000104` |
+| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*` | `GRAPH_DEGREE id=alice direction=both` |
+| **clause language** | `GRAPH_QUERY` only | `MATCH (id='alice')-[:follows]->(*) HOPS 1..2 RETURN paths` |
+
+`FILE_CHECKPOINT` adds a fourth, smaller convention: bare uppercase flags (`DROP_CACHE`,
+`CLOSE_HANDLES`, `IDLE=<dur>`). Wherever a command takes a **byte prefix** (`PAIR_*`, `FORK_ASSIGN`)
+the text is used raw — write `x<HEX>` for binary, and `*` for "the whole trie / no prefix".
+
+The authoritative inventory is the `ExecuteCommand` switch in [`src/database.go`](src/database.go)
+plus the two front-ends; this section documents that switch. The overlaps between the families below
+are real and deliberate for now — [`NEXT_STEPS.md`](NEXT_STEPS.md) records the plan to factor them
+into composable micro-commands with the current names kept as aliases.
+
+### The layer a command belongs to
+
+Most confusion between two commands disappears once you know which layer each one addresses. There
+are two storage layers; everything else is a view over them:
+
+```text
+value layer   INSERT / READ / EDIT / DELETE      bytes, addressed by a numeric key
+name  layer   PAIR_SET / PAIR_GET / PAIR_DEL …   byte prefixes in a trie → numeric keys
+  ├─ views over one walk  PAIR_SCAN (names) · PAIR_SUMMARY (statistics) · PAIR_REDUCE (payloads)
+  ├─ graph records        GRAPH_* — nodes/edges/adjacency under reserved \x01..\x05 prefixes
+  └─ recall               GRAPH_RECALL / GRAPH_SIMILAR / GRAPH_TERM_INDEX
+side tables   PREDICT_*                          prediction_<name>.table files, not the trie
+control       DATABASE / RESET_DB · CLUSTER_* / FORK_ASSIGN · SYSTEM_STATS / LOG_FLUSH / FILE_CHECKPOINT
 ```
 
-- Prefix strings (`ctx:`, `ctxv:`, `prob:2`, etc.) are treated as raw bytes; encode binary prefixes
-  as `x<HEX>`.
-- `PAIR_SCAN` replies include `items=<hex_prefix>:<abs_key>` pairs plus `next_cursor=<token>` when
-  additional pages remain. Reissue `PAIR_SCAN <prefix> <limit> <token>` (over both CLI and TCP) to
-  continue from that cursor. Add `include_hidden=1` to return hidden terminals.
-- `PAIR_REDUCE` includes inline base64 payloads so reducers can hydrate counters/probabilities
-  without extra `READ` calls. Each response also includes `next_cursor` when more items exist.
-- `PAIR_REDUCE_ASYNC` is ideal for long-running reducers: it queues the request, returns a `job`
-  token immediately, and lets clients poll `PAIR_REDUCE_STATUS`/`PAIR_REDUCE_FETCH` to monitor
-  progress or stream the final payloads once the job completes.
-- `PAIR_REDUCE_FETCH` replies with `PENDING,...,progress=<percent>,completed=<n>,total=<n>` while a
-  job is still running so adapters can emit keep-alive logs; once the reducer finishes the response
-  mirrors the synchronous `PAIR_REDUCE` payload (including `next_cursor` when more pages remain).
-- `PAIR_SUMMARY` walks the trie beneath a namespace prefix, counts terminal entries, sums payload
-  sizes (without hydrating the bytes), tracks min/max payloads and keys, and emits branch-level
-  fan-out counts up to the requested depth. Use the optional `branch_limit` to cap the number of
-  branch digests returned (default: 32) and `include_hidden=1` to count hidden terminals. This is the entry point for data-centric statistics—e.g.,
-  estimating hot prefixes before launching GPU reducers or precomputing rolling hashes described in
-  the tree-indexing section below.
-- Graph storage is indexed in four isolated namespaces (`node`, `edge`, `adj/out`, `adj/in`) so
-  node/edge writes do not force full graph scans. `GRAPH_NEIGHBORS` and `GRAPH_QUERY` always execute
-  as prefix scans over adjacency indexes.
-- `GRAPH_QUERY` supports bounded multi-hop traversal with pruning/cost controls:
+A value and a name are independent on purpose: `INSERT` returns a key, `PAIR_SET` binds a name to
+it, and either can be removed without the other. That is why there is no single "put" command, and
+why four different commands delete four different things.
 
-  ```text
-  MATCH (<left-node>)-[:<edge_type>]->(<right-node>)
-  [WHERE <predicate> [AND <predicate> ...]]
-  [HOPS <max>|<min>..<max>]
-  [BRANCH_LIMIT <n>]
-  [COST_LIMIT <float>]
-  [RETURN edges|nodes|paths|count]
-  [LIMIT <n>]
-  [CURSOR <token>]
-  ```
+### Session and database scope
 
-  Node expressions support `*` or `id='value'` (optionally `label='value'`). Predicates support
-  `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, `edge.weight`, and
-  `edge.props.<prop_key>`. The left node must be anchored by ID to keep execution index-backed.
-  `edge.props.<prop_key> = <literal>` predicates use a secondary index namespace
-  (`graph/idx/<prop>/<value>/...`) for fast filtering.
-- Reducer modes `degree`, `triangle`, and `pagerank_seed` operate directly on graph adjacency
-  namespaces (`adj/out` / `adj/in`) so graph statistics can stream without full edge hydration.
-- `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`,
-  plus `adaptive_pair_index=`, `pair_list_max_bytes=`, and `pair_list_max_fill_percent=`) to rebuild a specific database with different
-  trie-node geometry or payload-cache budget without editing `config.ini`. Trie-format overrides only
-  take effect when the database is created, so pair them with `RESET_DB`.
-- `SYSTEM_STATS` emits `logical_cores`, GOMAXPROCS, goroutine counts, CPU percentages, and
-  per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
-  out to `top`/`iostat`. The payload cache now reports `payload_cache_*` fields (entries/bytes,
-  hits/misses/evictions, hit % plus an advisory bypass threshold) in the same response so adapters
-  can auto-tune `CHEETAH_PAYLOAD_CACHE_*` or skip caching multi-megabyte payloads that would churn.
-- `LOG_FLUSH` returns the most recent log lines captured by the server (default ring buffer depth:
-  256 entries) and clears the buffer. Pass a numeric limit to trim the output without truncating the
-  stored log metadata. Like every other command it answers on a **single line**: the entries come back
-  as `payload=<base64>` decoding to a JSON array of strings (`SUCCESS,count=0` when the buffer is
-  empty), so a line-oriented client stays in sync.
+Handled in the front-ends ([`src/main.go`](src/main.go), [`src/server.go`](src/server.go)), not in
+the dispatcher, because they mutate per-connection state.
+
+| Command | What it means |
+| --- | --- |
+| `DATABASE <name> [key=value …]` | Point **this connection** at another logical database (`cheetah_data/<name>`), creating it on first use. Overrides are remembered for that name: `pair_bytes=`/`pair_index_bytes=`, `adaptive_pair_index=`, `pair_list_max_bytes=`, `pair_list_max_fill_percent=`, `payload_cache_entries=`, `payload_cache_mb=`, `payload_cache_bytes=`. The trie-geometry ones only bite when the directory is *created*. |
+| `RESET_DB [name] [key=value …]` | Close the database, delete `cheetah_data/<name>` on disk, reopen it empty. The only way to adopt a new trie geometry, since `pairs/format.dat` wins on every ordinary open. Omitting the name resets whichever database the connection currently holds. |
+| `EXIT` | CLI only: leave the interactive loop. A TCP client just closes the socket. |
+
+**In context** — you keep each experiment in its own database, and a benchmark run needs the wide
+stride, which only a rebuild can adopt:
+
+```text
+[cheetah_data/default]> DATABASE notes
+SUCCESS,database_changed_to_notes
+[cheetah_data/notes]> DATABASE bench pair_bytes=2 payload_cache_entries=0
+SUCCESS,database_changed_to_bench
+[cheetah_data/bench]> RESET_DB bench
+SUCCESS,database_reset_to_bench
+# the overrides were recorded on the name, so the rebuilt directory is the one that adopts them
+[cheetah_data/bench]> DATABASE notes
+SUCCESS,database_changed_to_notes
+```
+
+### Value layer — the bytes
+
+| Command | What it means |
+| --- | --- |
+| `INSERT:<size> <payload>` | Store `<payload>` in the value table for that byte length and return its **absolute key** (a `main_keys` offset). The declared `<size>` is validated against the payload — it decides which file the bytes land in, so a wrong number is an error, not a hint. |
+| `INSERT <payload>` | The same write with the size inferred from the payload. |
+| `READ <abs_key>` | Hydrate the bytes behind a key: one arithmetic `ReadAt` (or a payload-cache hit). Answers `SUCCESS,size=<n>,value=<bytes>`. |
+| `EDIT <abs_key> <payload>` | Overwrite the value under an existing key. A length change **relocates** it into the correctly sized value table and recycles the old slot, so the key stays valid. There is no `EDIT:<size>` form — the size always comes from the payload. |
+| `DELETE <abs_key>` | Tombstone the value, push its slot onto the recycle stack, invalidate its cache entry. Any pair name still pointing at that key is **not** removed. |
+
+**In context** — staging one context payload, correcting it, and retiring it. Note the key survives an
+edit that changes the length, and that a wrong declared size is refused rather than silently accepted:
+
+```text
+[cheetah_data/notes]> INSERT:18 ctx:BERLIN|CONTEXT
+SUCCESS,key=1
+[cheetah_data/notes]> READ 1
+SUCCESS,size=18,value=ctx:BERLIN|CONTEXT
+[cheetah_data/notes]> EDIT 1 ctx:BERLIN|CONTEXT|v2
+SUCCESS,key=1_updated
+[cheetah_data/notes]> READ 1
+SUCCESS,size=21,value=ctx:BERLIN|CONTEXT|v2
+# 18 → 21 bytes: the payload moved to another value table, the key did not change
+[cheetah_data/notes]> INSERT:16 ctx:NAXOS|CONTEXT
+ERROR,value_size_mismatch (expected 16, got 17)
+[cheetah_data/notes]> DELETE 1
+SUCCESS,key=1_deleted
+[cheetah_data/notes]> READ 1
+ERROR,key_not_found (deleted)
+```
+
+### Name layer — the pair trie
+
+| Command | What it means |
+| --- | --- |
+| `PAIR_SET <prefix> <abs_key>` | Bind a byte prefix to a value key. Upserts; the prefix may be any byte string (`x<HEX>` for binary), and a prefix of another prefix is legal — a trie node is terminal and a parent at the same time. |
+| `PAIR_SET_HIDDEN <prefix> <abs_key>` | The same binding with the hidden flag set: `PAIR_SCAN`/`PAIR_SUMMARY`/`PAIR_REDUCE` skip it unless they pass `include_hidden=1`. A **visibility bit on one entry**, not a separate namespace. |
+| `PAIR_GET <prefix>` | Resolve exactly one name to its key. A point lookup, never a scan — a prefix with no terminal of its own answers `ERROR`, even when keys exist beneath it. |
+| `PAIR_DEL <prefix>` | Unbind one name. The value it pointed at survives; pair `DELETE` with it to reclaim the bytes. |
+| `PAIR_PURGE <prefix\|*> [batch]` | Unbind **and** delete the payloads of every name under a prefix, looping inside the server until the namespace is empty (`batch` sizes each page, default 4096). This is the bulk form of `PAIR_DEL` + `DELETE`, moved server-side so a namespace wipe is seconds instead of thousands of round trips. `*` empties the whole trie. **Currently unreliable** — it deletes entries concurrently without serializing trie mutation, so it can fail mid-way or leave entries behind (see [`NEXT_STEPS.md`](NEXT_STEPS.md)). Verify with a follow-up `PAIR_SCAN`, or use `RESET_DB` when the whole database is disposable. |
+
+**In context** — a name is bound, resolved, and hidden from ordinary sweeps. `PAIR_GET` is a point
+lookup, so the parent prefix answers `not_found` even though keys live beneath it:
+
+```text
+[cheetah_data/notes]> PAIR_SET ctx:BERLIN 1
+SUCCESS,pair_set
+[cheetah_data/notes]> PAIR_GET ctx:BERLIN
+SUCCESS,key=1
+[cheetah_data/notes]> PAIR_GET ctx:
+ERROR,not_found
+[cheetah_data/notes]> PAIR_SET_HIDDEN ctx:_wip 4
+SUCCESS,pair_set_hidden
+[cheetah_data/notes]> PAIR_SCAN ctx: 8
+SUCCESS,count=1,items=6374783a4245524c494e:1
+[cheetah_data/notes]> PAIR_SCAN ctx: 8 * include_hidden=1
+SUCCESS,count=2,items=6374783a4245524c494e:1;6374783a5f776970:4
+# `*` in the cursor position means "from the beginning"; the hidden entry only shows on request
+[cheetah_data/notes]> PAIR_DEL ctx:_wip
+SUCCESS,pair_deleted
+```
+
+### Reading a namespace — one walk, three payload contracts
+
+The first three descend the same subtree and differ only in what they are willing to pay for; the
+last three are the async envelope around `PAIR_REDUCE`.
+
+| Command | What it means |
+| --- | --- |
+| `PAIR_SCAN <prefix> [limit] [cursor] [include_hidden=1]` | **The names.** An ordered page of `<hex_prefix>:<abs_key>` items plus `next_cursor` when more remain. Pages are complete, strictly increasing and resumable: exactly `limit` items until the last one. |
+| `PAIR_SUMMARY <prefix> [depth] [branch_limit] [include_hidden=1]` | **The shape, without hydrating a byte.** Terminal count, total/min/max payload bytes, min/max key, max depth, and per-branch fan-out counts down to `depth` (capped at `branch_limit`, default 32). The "how much is under here, and where is it dense?" probe you run *before* committing to a scan. |
+| `PAIR_REDUCE <mode> <prefix> [limit] [cursor] [include_hidden=1]` | **The bytes, already processed.** The same page as `PAIR_SCAN`, with each payload hydrated and pushed through a registered reducer, returned inline as base64 — so a client never issues one `READ` per row. Modes: `counts`/`count`/`probabilities`/`probs`/`backoffs`/`continuations`/`continuation` (payload pass-through) and `degree`/`triangle`/`pagerank_seed` (graph adjacency statistics). New modes are registered in [`src/reducers.go`](src/reducers.go), not added to the dispatcher. |
+| `PAIR_REDUCE_ASYNC <mode> <prefix> [limit] [cursor]` | The identical request, detached: returns a `job=<id>` immediately instead of blocking on a long sweep. Jobs are in-memory and do not survive a restart. |
+| `PAIR_REDUCE_STATUS <job_id>` | How far that job has got — state, progress percent, completed/total. No results. |
+| `PAIR_REDUCE_FETCH <job_id>` | `PENDING,…,progress=…` while it runs, then **exactly** the synchronous `PAIR_REDUCE` response, `next_cursor` included. |
+
+**In context** — five city contexts are staged under `ctx:`. The same namespace is then read three
+ways, and once asynchronously:
+
+```text
+[cheetah_data/notes]> PAIR_SCAN ctx: 3
+SUCCESS,count=3,next_cursor=x6374783a4d554e494348,items=6374783a4245524c494e:1;6374783a4c4953424f4e:5;6374783a4d554e494348:7
+[cheetah_data/notes]> PAIR_SCAN ctx: 3 x6374783a4d554e494348
+SUCCESS,count=2,items=6374783a5041524953:4;6374783a504f52544f:6
+# no next_cursor on the second page: the namespace is exhausted
+
+[cheetah_data/notes]> PAIR_SUMMARY ctx: 1 8
+SUCCESS,command=PAIR_SUMMARY,count=5,total_payload_bytes=91,min_payload_bytes=17,max_payload_bytes=21,min_key=1,max_key=7,max_depth=6,self_terminal=0,branch_count=4,branches=50:2;42:1;4c:1;4d:1
+# 5 names, 91 bytes of payload, and no byte of it was read; branch 50 ("P") holds 2 of them
+
+[cheetah_data/notes]> PAIR_REDUCE counts ctx: 2
+SUCCESS,reducer=counts,count=2,next_cursor=x6374783a4c4953424f4e,items=6374783a4245524c494e:1:Y3R4OkJFUkxJTnxDT05URVhUfHYy;6374783a4c4953424f4e:5:Y3R4OkxJU0JPTnxDT05URVhU
+# same items as PAIR_SCAN plus a third field per row: the payload, base64, no READ needed
+
+[cheetah_data/notes]> PAIR_REDUCE_ASYNC counts ctx: 4096
+SUCCESS,reducer=counts,job=reduce_1,state=queued
+[cheetah_data/notes]> PAIR_REDUCE_STATUS reduce_1
+SUCCESS,job=reduce_1,state=running,progress=0.00
+[cheetah_data/notes]> PAIR_REDUCE_FETCH reduce_1
+SUCCESS,reducer=counts,count=5,items=6374783a4245524c494e:1:Y3R4OkJFUkxJTnxDT05URVhUfHYy;…
+```
+
+### Graph — writing what is the case
+
+Full grammar in [Graph Command Language](#graph-command-language).
+
+| Command | What it means |
+| --- | --- |
+| `GRAPH_NODE_SET id=<id> [labels=…] [props=…]` | Upsert an **entity**. `labels` are the kinds it belongs to (filterable, valueless); `props` are descriptive attributes you will not query on their own. Omitting either keeps the stored one; `created_at` survives. |
+| `GRAPH_NODE_DEL id=<id> [cascade=1]` | Forget the entity. Without `cascade=1` its incident edges are left dangling — pass it whenever you mean "and everything that was said about it". |
+| `GRAPH_EDGE_SET from= to= [type=] [weight=] [directed=] [confidence=] [modality=] [ambiguity=] [props=] [autocreate=0]` | Upsert a **relation**, identified by the tuple `(from, to, type, directed)`. `weight` is traversal strength (cost `1/weight`); `confidence`/`modality` are how sure the claim is; `ambiguity` names the group of mutually exclusive readings it belongs to. Missing endpoint nodes are stubbed out unless `autocreate=0`. |
+| `GRAPH_EDGE_SET_BATCH items=<base64 json[]> [continue_on_error=1] [type=] [directed=] [weight=] [props=]` | The same upsert for many edges in one round-trip, with the top-level tokens acting as per-item defaults. Reports `requested/applied/created/updated/failed`. |
+| `GRAPH_EDGE_DEL from= to= [type=] [directed=]` | **Forget** the relation. Different from writing `confidence=ruled_out`, which keeps it on record as excluded and still answerable. |
+| `GRAPH_AMBIGUITY_SET from= group= options=<id>[=<share>][,…] [type=] [normalize=0]` | Write a whole set of **mutually exclusive readings** at once and normalize their shares to sum to 1. The engine has no `OR`, so a disjunction is stored as a group rather than expressed as a query. |
+| `GRAPH_AMBIGUITY_RESOLVE from= group= winner= [drop=1]` | Collapse the set: the winner becomes `certain`, the others `ruled_out` (or are deleted with `drop=1`), and the group dissolves. |
+
+**In context** — *"Marco's cat Luna is a siamese and may be sterile; they both live in Berlin."* One
+hedged edge, one batch for the rest, and an alternative set for what is genuinely unknown:
+
+```text
+[cheetah_data/notes]> GRAPH_NODE_SET id=cat:luna labels=animal,cat props={"name":"Luna","sex":"female"}
+SUCCESS,node_set,id=cat:luna
+[cheetah_data/notes]> GRAPH_EDGE_SET from=person:marco to=cat:luna type=owns weight=1.0
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298b3duc3xjYXQ6bHVuYQ
+[cheetah_data/notes]> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition confidence=possible
+SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
+# no such node as condition:sterile yet — the edge stubs it out (autocreate=0 would refuse instead)
+
+[cheetah_data/notes]> GRAPH_EDGE_SET_BATCH items=<base64 of [{"from":"cat:luna","to":"city:berlin","type":"lives_in","weight":1.0}, …4 rows]> continue_on_error=1
+SUCCESS,requested=4,applied=4,created=4,updated=0,failed=0
+[cheetah_data/notes]> GRAPH_EDGE_SET_BATCH items=<base64 of [{"to":"city:berlin","type":"lives_in"}]> continue_on_error=1
+SUCCESS,requested=1,applied=0,created=0,updated=0,failed=1,payload=<base64>
+# payload decodes to: [{"index":0,"error":"graph_edge_set_requires_from_and_to"}]
+
+# "he moved to Lisbon — or was it Berlin? I think Berlin."
+[cheetah_data/notes]> GRAPH_AMBIGUITY_SET from=person:marco type=lives_in group=where_marco options=city:berlin=0.7,city:lisbon
+SUCCESS,ambiguity_set,group=where_marco,options=2,confidence_sum=1.0000
+# the undeclared alternative takes the remaining 0.3 — one command, both readings on record
+
+[cheetah_data/notes]> GRAPH_EDGE_DEL from=cat:luna to=condition:sterile type=has_condition
+SUCCESS,edge_deleted,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
+[cheetah_data/notes]> GRAPH_NODE_DEL id=cat:temp cascade=1
+SUCCESS,node_deleted,id=cat:temp
+```
+
+### Graph — calling it back
+
+Four of these read the *same* adjacency index — `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`,
+`GRAPH_NEIGHBOR_TYPES` and `GRAPH_QUERY` — and differ only in how much of it they hydrate.
+
+| Command | What it means |
+| --- | --- |
+| `GRAPH_NODE_GET id=<id>` | One node record. `ERROR,node_not_found` is an answer — "nothing recorded" — not a failure. |
+| `GRAPH_EDGE_GET from= to= [type=] [directed=]` | One edge record, addressed by its identifying tuple. |
+| `GRAPH_NEIGHBORS id= [direction=out\|in\|both] [type=] [limit=] [cursor=]` | **A page of edge records** around a node. The plain adjacency read, cursor-resumable. |
+| `GRAPH_DEGREE id= [direction=] [type=] [weighted=1]` | **How many** (and how heavy), as a number. No records are read — the cheapest "how much do I know about X?". |
+| `GRAPH_NEIGHBOR_TYPES id= [direction=] [limit=] [cursor=] [weighted=1]` | **Which relations, and how many of each** — a compact `[{type,count,weighted}]` histogram without hydrating a single edge. The fast probe before deciding what to hydrate. |
+| `GRAPH_AMBIGUITY_GET from= group= [direction=] [limit=]` | One alternative group read back, strongest reading first, with `confidence_sum` and `top`. |
+| `GRAPH_QUERY MATCH … [WHERE …] [HOPS …] [BRANCH_LIMIT …] [COST_LIMIT …] [RETURN …] [LIMIT …] [CURSOR …]` | The same walk with **predicates, several hops and explicit bounds**, and a choice of what comes back: `edges`, `nodes`, `paths` or just `count`. The left node must be ID-anchored so execution stays index-backed. |
+
+**In context** — *"What do you know about Luna?"*, asked cheaply first and hydrated only where it
+pays. Each of these reads the same `adj/out` index:
+
+```text
+[cheetah_data/notes]> GRAPH_DEGREE id=cat:luna direction=both type=* weighted=1
+SUCCESS,id=cat:luna,direction=both,type=*,degree=4,weighted_degree=4.000000
+# one number, zero records read: "there are four things on file"
+
+[cheetah_data/notes]> GRAPH_NEIGHBOR_TYPES id=cat:luna direction=out limit=16 weighted=1
+SUCCESS,count=3,next_cursor=*,payload=<base64>
+# payload decodes to: [{"type":"has_breed","count":1,"weighted":1},{"type":"has_condition","count":1,"weighted":1},{"type":"lives_in","count":1,"weighted":1}]
+# now you know a has_condition edge exists — before paying to read it
+
+[cheetah_data/notes]> GRAPH_QUERY MATCH (id='cat:luna')-[:*]->(*) RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=3,next_cursor=*,payload=<base64>
+# payload decodes to: [{"from":"cat:luna","type":"has_breed","to":"breed:siamese","weight":1},
+#                      {"from":"cat:luna","type":"has_condition","to":"condition:sterile","weight":1},
+#                      {"from":"cat:luna","type":"lives_in","to":"city:berlin","weight":1}]
+
+[cheetah_data/notes]> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.modality >= 'probable' RETURN count
+SUCCESS,return=count,matches=0,next_cursor=*
+# the sterility is only `possible`, so nothing here is assertable — matches=0 means "not worth
+# stating", never "false"
+
+[cheetah_data/notes]> GRAPH_QUERY MATCH (id='city:berlin')<-[:lives_in]-(*) RETURN nodes LIMIT 8
+SUCCESS,return=nodes,matches=4,next_cursor=*,payload=<base64>
+# payload decodes to: ["cat:luna","cat:mia","city:berlin","person:marco"]
+# reverse question, anchor still on the left; `nodes` includes the anchor itself
+
+[cheetah_data/notes]> GRAPH_QUERY MATCH (*)-[:owns]->(id='cat:luna') RETURN edges LIMIT 8
+ERROR,graph_query_parse_failed:left_node_must_be_anchored_by_id
+# flip the arrow instead, or read GRAPH_NEIGHBORS id=cat:luna direction=in type=owns
+```
+
+### Graph — associative recall
+
+| Command | What it means |
+| --- | --- |
+| `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [limit=] [branch_limit=] [budget=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. |
+| `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=] [precision=]` | **"What else behaves like this?"** — nodes with the same neighbours (distributional) or the same words in their id (lexical). No edge between them is required. |
+| `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=] [cursor=]` | Maintenance of the derived `\x05gt:` lexical index that free-text seeds resolve through. It is never authoritative: exact ids and synonym edges keep working without it, and `rebuild` is resumable through `next_cursor`. |
+
+**In context** — the conversation has been touching Luna and Marco, and nobody has asked a question
+yet. Recall answers what a query cannot be written for:
+
+```text
+[cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=4
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=28,count=4,bridges=4,truncated=0,precision=0.100,payload=<base64>
+# payload decodes to {"seeds":[{"term":"cat:luna","matches":[{"id":"cat:luna","score":1,"match":"exact"},
+#                                                            {"id":"cat:mia","score":0.33,"match":"lexical"}]}, …],
+#  "associations":[
+#   {"id":"city:berlin","score":0.72325,"novelty":0.361625,"distance":1,"source_count":2,"bridge":true,
+#    "sources":[{"seed":"cat:luna","activation":0.55,"hops":1},{"seed":"person:marco","activation":0.385,"hops":1}],
+#    "via":[{"from":"cat:luna","type":"lives_in","to":"city:berlin","weight":1,"confidence":1,"modality":"certain"}]},
+#   {"id":"color:aquamarine","score":0.686125,…,"source_count":2,"bridge":true,…},
+#   {"id":"city:lisbon","score":0.240776,…,"via":[{…,"confidence":0.3,"modality":"unlikely"}]}]}
+# note the last one: Lisbon scores low precisely because that edge is only `unlikely` — belief is
+# part of the ranking, not a separate filter. `resolved=3` is 2 seeds, one of which also matched
+# cat:mia lexically.
+
+[cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2 limit=4
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=34,count=4,bridges=4,truncated=0,precision=0.050,payload=<base64>
+# the "what do these two have to do with each other?" view: only nodes both seeds reach
+
+[cheetah_data/notes]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1 limit=4
+SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,count=3,bridges=0,truncated=0,precision=0.100,payload=<base64>
+# "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"}]}]
+# a bare word, not an id — resolved through the term index, and it says so
+
+[cheetah_data/notes]> GRAPH_SIMILAR id=cat:luna limit=3
+SUCCESS,command=GRAPH_SIMILAR,id=cat:luna,count=3,truncated=0,payload=<base64>
+# payload decodes to: [{"id":"cat:mia","score":0.777778,"context":0.666667,"lexical":0.333333,
+#                       "shared_count":2,"shared":["breed:siamese","city:berlin"]}, …]
+# luna and mia are never linked to each other; they are similar because of where they both point
+
+[cheetah_data/notes]> GRAPH_TERM_INDEX action=stats
+SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=21
+[cheetah_data/notes]> GRAPH_TERM_INDEX action=rebuild limit=4096
+SUCCESS,command=GRAPH_TERM_INDEX,action=rebuild,nodes=9,terms=21,next_cursor=*
+# next_cursor=* means the whole graph fitted in one slice; otherwise pass the token back
+```
+
+### Prediction tables
+
+A separate store (`prediction_<name>.table`), addressed by prefix, with `table=<name>` selecting
+which one (omitted = the unnamed default, which is why responses read `table=`). Prefixes **and**
+every value in `value=`, `target=`, `sources=`, `negatives=` follow the same decoding rule as pair
+keys: plaintext, or `x<hex>` for binary — a bare hex string is taken literally, so `negatives=646f67`
+adds a value spelled `646f67` rather than `dog`. Context matrices and window specs cross the wire as
+base64-encoded JSON. Values come back **hex-encoded** in `items=<hex>:<prob>`.
+
+One wart to code around: several failure paths in this family return the bare reason
+(`inherit_sources_missing`) with **no `ERROR,` prefix**, unlike every other command.
+
+| Command | What it means |
+| --- | --- |
+| `PREDICT_SET key= value= prob= [weights=] [table=]` | Declare a candidate value for a prefix with its probability and optional context weights. The write path. |
+| `PREDICT_QUERY key= [keys=] [ctx=] [windows=] [key_windows=] [merge=avg\|sum\|max] [table=]` | Evaluate one or many prefixes and merge their probability windows under the current backend. The read path. |
+| `PREDICT_TRAIN key= target= [ctx=] [lr=] [negatives=<value>[,…]] [table=]` | Move the stored weights toward a target through the forward/backward loop, optionally down-weighting the listed negatives. **Persistent learning.** |
+| `PREDICT_CTX key= ctx= [mode=bias\|scale] [strength=] [table=]` | Apply a context adjustment **immediately, without training** — a nudge to this query, not a lesson. |
+| `PREDICT_INHERIT key= target= sources=<value>[,…] [merge=] [table=]` | Seed a new value by merging existing ones — how a composite token starts life with its parts' context weights. Every source must already exist under `key`, or the command answers `inherit_sources_missing`. |
+| `PREDICT_INHERIT_BATCH items=<base64 json> [key=] [merge=] [table=]` | The same merge for many targets in one call. |
+| `PREDICT_INHERIT_ASYNC items=<base64 json> [key=] [merge=] [table=]` | The same batch, detached: returns `job=<id>`. |
+| `PREDICT_INHERIT_STATUS <job_id>` | Progress of that job — merged/skipped/failed counters. |
+| `PREDICT_INHERIT_FETCH <job_id>` | `PENDING` while it runs, then the batch results. |
+| `PREDICT_BACKEND [mode=cpu\|gpu] [table=]` | Read or switch which merger a table uses. The "gpu" path is `webgpu-simulated` — CPU fan-out, not a real WebGPU binding. |
+| `PREDICT_BENCH samples= window= [table=]` | Compare the two mergers on this host, so the choice above is measured rather than assumed. |
+
+**In context** — three candidate continuations for the prefix `ctx:the`, then one round of learning
+and one composite token seeded from its parts:
+
+```text
+[cheetah_data/notes]> PREDICT_SET key=ctx:the value=cat prob=0.6
+SUCCESS,table=,prediction_values=1
+[cheetah_data/notes]> PREDICT_SET key=ctx:the value=kitten prob=0.25
+SUCCESS,table=,prediction_values=2
+[cheetah_data/notes]> PREDICT_SET key=ctx:the value=dog prob=0.15
+SUCCESS,table=,prediction_values=3
+[cheetah_data/notes]> PREDICT_QUERY key=ctx:the
+SUCCESS,count=3,backend=cpu,table=,items=636174:0.4269;6b697474656e:0.3009;646f67:0.2722
+# items are <hex value>:<merged probability> — 636174 is "cat"
+
+[cheetah_data/notes]> PREDICT_TRAIN key=ctx:the target=cat lr=0.05 negatives=dog
+SUCCESS,table=,prediction_values=3,lr=0.0500
+[cheetah_data/notes]> PREDICT_QUERY key=ctx:the
+SUCCESS,count=3,backend=cpu,table=,items=636174:0.4344;6b697474656e:0.3007;646f67:0.2649
+# cat up, dog down, and the change persisted — contrast PREDICT_CTX, which biases nothing on disk
+
+[cheetah_data/notes]> PREDICT_INHERIT key=ctx:the target=feline sources=cat,kitten merge=avg
+SUCCESS,table=,prediction_values=4,merged_sources=2
+[cheetah_data/notes]> PREDICT_QUERY key=ctx:the
+SUCCESS,count=4,backend=cpu,table=,items=636174:0.3191;66656c696e65:0.2655;6b697474656e:0.2209;646f67:0.1946
+# "feline" was never trained: it arrived with the averaged context weights of cat and kitten
+
+[cheetah_data/notes]> PREDICT_INHERIT key=ctx:the target=x sources=nosuchvalue
+inherit_sources_missing
+# ← no `ERROR,` prefix; a client keying on the prefix must treat "no SUCCESS" as failure
+
+[cheetah_data/notes]> PREDICT_BACKEND mode=gpu
+SUCCESS,table=,backend=webgpu-simulated
+[cheetah_data/notes]> PREDICT_BENCH samples=64 window=8
+SUCCESS,table=,samples=64,window=8,bench=webgpu-simulated=12.75µs|cpu=1.167µs
+# at this size the simulated backend is 10x slower — which is the point of having the command
+```
+
+### Cluster placement
+
+Placement metadata only: the server does not route your commands for you.
+
+| Command | What it means |
+| --- | --- |
+| `CLUSTER_UPDATE replication=<n> <nodeID>=host:port/weight …` (or `json=<base64>`) | Register the topology — who exists, where, and how many replicas a fork wants. Persisted to `cluster_topology.json`. |
+| `CLUSTER_STATUS` | The whole picture: node list, replication factor, last update, assignment count. |
+| `FORK_ASSIGN <prefix\|*>` | **One** placement: which `fork_id` a prefix hashes to and which nodes own it. The read that `CLUSTER_MOVE` overrides. |
+| `CLUSTER_MOVE prefix=<bytes>\|fork=<id> node=<nodeID>` | Force a fork onto a node, build its transfer payload and gossip it to peers. Note the override lives in memory: it is **not** persisted across a restart (see [`NEXT_STEPS.md`](NEXT_STEPS.md)). |
+| `CLUSTER_GOSSIP json=<base64>` | The inbound peer channel — heartbeats and `fork_move` messages. Machine-to-machine; do not drive it by hand, and only enable clustering among trusted nodes (the protocol is unauthenticated). |
+
+**In context** — two nodes are registered, the `ctx:` shard is looked up, then pinned:
+
+```text
+[cheetah_data/notes]> CLUSTER_STATUS
+SUCCESS,cluster_nodes=0,replication=1,updated=0001-01-01T00:00:00Z,nodes=,assignments=0
+# the zero time means no topology has ever been registered
+
+[cheetah_data/notes]> CLUSTER_UPDATE replication=2 nodeA=10.0.0.1:4455/2 nodeB=10.0.0.2:4455/1
+SUCCESS,cluster_nodes=2,replication=2
+[cheetah_data/notes]> CLUSTER_STATUS
+SUCCESS,cluster_nodes=2,replication=2,updated=2026-07-22T22:01:21Z,nodes=nodeA@10.0.0.1:4455(cap=2)|nodeB@10.0.0.2:4455(cap=1),assignments=0
+
+[cheetah_data/notes]> FORK_ASSIGN ctx:
+SUCCESS,fork_id=45471590a920dbcc,nodes=nodeA|nodeB
+# the prefix hashes to one fork; replication=2 puts it on both nodes
+
+[cheetah_data/notes]> CLUSTER_MOVE prefix=ctx: node=nodeB
+SUCCESS,fork_id=45471590a920dbcc,node=nodeB
+[cheetah_data/notes]> FORK_ASSIGN ctx:
+SUCCESS,fork_id=45471590a920dbcc,nodes=nodeB
+# the override holds — until the process restarts, when the ring answers nodeA|nodeB again
+```
+
+### Server operations
+
+| Command | What it means |
+| --- | --- |
+| `SYSTEM_STATS` | Live gauges: logical cores, GOMAXPROCS, goroutines, CPU percentages, per-second disk I/O deltas, payload-cache entries/bytes/hits/misses/evictions and an advisory bypass threshold. A cheap heartbeat between ingest and reduce loops. |
+| `LOG_FLUSH [limit]` | Recent history: dump **and clear** the in-memory log ring (default depth 256). Entries come back as `payload=<base64>` decoding to a JSON array of strings — the response is still one line. |
+| `FILE_CHECKPOINT [IDLE=<dur>] [DROP_CACHE] [CLOSE_HANDLES]` | Force the managed-file layer to act now: flush dirty sectors, optionally drop cached sectors and release idle file handles mid-run. The manual form of what shutdown does. |
+
+**In context** — between an ingest stage and a reduce stage, check the machine, settle the files, and
+read what the server logged:
+
+```text
+[cheetah_data/notes]> SYSTEM_STATS
+SUCCESS,command=SYSTEM_STATS,timestamp=2026-07-22T22:01:21Z,logical_cores=8,gomaxprocs=8,goroutines=70,mem_alloc_bytes=2467088,mem_sys_bytes=13977864,process_cpu_pct=0.82,process_cpu_supported=1,system_cpu_pct=NA,system_cpu_supported=0,io_supported=0,recommended_workers=1:1;32:8;256:8;4096:8,payload_cache_enabled=1,payload_cache_entries=65,…
+# `NA` + `_supported=0` is how a platform-unavailable metric reports (system CPU and /proc IO on
+# macOS); `recommended_workers` is queue-depth → worker-count advice you can size a client on
+
+[cheetah_data/notes]> FILE_CHECKPOINT
+SUCCESS,file_checkpoint_flushed=0
+# nothing was dirty
+[cheetah_data/notes]> FILE_CHECKPOINT IDLE=0s CLOSE_HANDLES
+SUCCESS,file_checkpoint_flushed=135
+# IDLE=0s means "every handle counts as idle", so all 135 were released
+
+[cheetah_data/notes]> LOG_FLUSH 3
+SUCCESS,count=3,payload=<base64>
+# payload decodes to: ["2026/07/23 00:01:20.234948 [INFO] Loaded database: scratch",
+#                      "2026/07/23 00:01:20.239303 [INFO] Reset database: scratch",
+#                      "2026/07/23 00:01:20.239869 [INFO] Loaded database: scratch"]
+# the ring is now empty: LOG_FLUSH returns and clears in one step
+
+[cheetah_data/notes]> NOPE arg
+ERROR,unknown_command
+```
+
+### Telling the look-alikes apart
+
+The command set grew feature by feature, so several names describe the same walk at a different
+price. The distinctions that actually matter:
+
+- **`DELETE` vs `PAIR_DEL` vs `PAIR_PURGE` vs `RESET_DB`** — four erasures at four scopes: one
+  value, one name, a whole namespace (names *and* values), the whole database (including its pinned
+  trie geometry). Deleting a value never removes the names pointing at it, and vice versa.
+- **`PAIR_GET` vs `READ`** — resolution vs hydration. `PAIR_GET` turns a name into a key;
+  `READ` turns a key into bytes. Two calls, deliberately: a name can be re-pointed without touching
+  the payload.
+- **`PAIR_SCAN` vs `PAIR_SUMMARY` vs `PAIR_REDUCE`** — one walk, three contracts: names,
+  statistics-without-hydration, hydrated-and-reduced payloads. Choosing wrongly costs an order of
+  magnitude, not correctness.
+- **`PAIR_SET` vs `PAIR_SET_HIDDEN`** — one flag bit on one entry, not a second namespace. Every
+  reader can opt back in with `include_hidden=1`.
+- **synchronous vs `_ASYNC` + `_STATUS`/`_FETCH`** — identical work, different envelope. Two
+  families implement that envelope separately (`PAIR_REDUCE_*`, `PREDICT_INHERIT_*`) with slightly
+  different response fields.
+- **`GRAPH_NEIGHBORS` vs `GRAPH_DEGREE` vs `GRAPH_NEIGHBOR_TYPES` vs `GRAPH_QUERY … RETURN`** — one
+  adjacency scan at four hydration levels: edge records, a count, a per-type histogram, and records
+  filtered by predicates over several hops. `GRAPH_QUERY … RETURN count` and `GRAPH_DEGREE` answer
+  the same question for a single unfiltered hop.
+- **`GRAPH_QUERY` vs `GRAPH_RECALL`** — a question you can already phrase (anchored, exact, bounded)
+  vs one you cannot (seeded, ranked, evidence-carrying).
+- **`GRAPH_RECALL` vs `GRAPH_SIMILAR`** — what is *around* these terms vs what *behaves like* this
+  node.
+- **`GRAPH_EDGE_DEL` vs `confidence=ruled_out`** — forgetting vs recording an exclusion. Only the
+  second keeps *"weren't you saying light blue?"* answerable.
+- **`GRAPH_EDGE_SET` vs `GRAPH_EDGE_SET_BATCH` vs `GRAPH_AMBIGUITY_SET`** — one edge, many
+  independent edges, one set of edges that are *alternatives to each other*.
+- **`PREDICT_TRAIN` vs `PREDICT_CTX`** — a lesson that persists vs a bias applied to the next query.
+- **`CLUSTER_STATUS` vs `FORK_ASSIGN`** — the whole map vs the owners of one prefix.
+- **`SYSTEM_STATS` vs `LOG_FLUSH`** — live gauges vs recent history (and `LOG_FLUSH` is destructive:
+  it clears what it returns).
+- **`RESET_DB` vs `PAIR_PURGE *`** — recreate the directory, which is the only way to adopt new trie
+  overrides, vs empty the trie in place, which keeps the format pinned in `pairs/format.dat`.
+
+### Response and paging notes
+
+- `PAIR_SCAN` replies carry `items=<hex_prefix>:<abs_key>;…` plus `next_cursor=<token>` when more
+  pages remain; reissue `PAIR_SCAN <prefix> <limit> <token>` to continue. Cursor continuation is
+  **positional** — there is no `CURSOR` keyword outside `GRAPH_QUERY`.
+- `PAIR_REDUCE` returns the same items with an extra `:<base64>` field per row, so counters and
+  probabilities arrive already hydrated. `PAIR_REDUCE_FETCH` answers
+  `PENDING,…,progress=<percent>,completed=<n>,total=<n>` while the job runs — enough for a client to
+  emit keep-alive logs — and then mirrors the synchronous response exactly, `next_cursor` included.
+- Graph storage occupies four isolated namespaces (`node`, `edge`, `adj/out`, `adj/in`) plus the
+  `graph/idx/` property index, so node/edge writes never force a full graph scan and
+  `GRAPH_NEIGHBORS`/`GRAPH_QUERY` always execute as prefix scans over an adjacency index. The full
+  `GRAPH_QUERY` grammar — patterns, predicates, `HOPS`/`BRANCH_LIMIT`/`COST_LIMIT`, `RETURN` modes —
+  is in [Pattern queries](#pattern-queries--graph_query).
+- Every paging command uses the same convention: `next_cursor=*` (or absent) means the scan is
+  exhausted, and `*` as an *input* cursor or prefix means "start from the beginning / no prefix".
 
 ## Command Walkthroughs
 
@@ -273,7 +657,7 @@ SUCCESS,key=1_deleted
   [cheetah_data/default]> PAIR_SET ctx:BERLIN 42
   SUCCESS,pair_set
   [cheetah_data/default]> PAIR_GET ctx:BERLIN
-  SUCCESS,pair=ctx:BERLIN,key=42
+  SUCCESS,key=42
   ```
 
 - `PAIR_SCAN` walks the trie in lexical order. Limits and cursors keep the scan resumable:
@@ -323,17 +707,17 @@ SUCCESS,key=1_deleted
     `{ "key": "<hex>", "windows": [[...], ...] }` objects for per-prefix window overrides. Responses
     include the backend name (`cpu` or the simulated `webgpu-simulated` merger).
   - `PREDICT_TRAIN key=<prefix> target=<bytes> [ctx=<base64 json>] [lr=0.01] [table=name]
-    [negatives=<hex,...>]` adjusts stored weights via the forward/backward loop (optionally
+    [negatives=<value>,...]` adjusts stored weights via the forward/backward loop (optionally
     down-weighting bad predictions listed in `negatives=`). The table now persists normalized window
     hints from every training/adversarial context and blends them into queries automatically when no
     `windows=` payload is supplied. `PREDICT_CTX key=<prefix> ctx=<base64 json> [mode=bias|scale]
     [strength=1] [table=name]` applies an immediate context bias without retraining.
-  - `PREDICT_INHERIT key=<prefix> target=<bytes> sources=<hex,...> [merge=avg|sum|max] [table=name]`
+  - `PREDICT_INHERIT key=<prefix> target=<bytes> sources=<value>,... [merge=avg|sum|max] [table=name]`
     merges existing prediction values into a new target (for example, to seed composite/merged
     tokens with inherited context weights).
   - `PREDICT_INHERIT_BATCH items=<base64 json> [key=<prefix>] [merge=avg|sum|max] [table=name]`
     processes multiple inherit requests in one call. The JSON payload is an array of
-    `{ "key": "<hex>", "target": "<hex>", "sources": ["<hex>", ...], "merge": "avg" }` objects.
+    `{ "key": "…", "target": "…", "sources": ["…", ...], "merge": "avg" }` objects.
   - `PREDICT_INHERIT_ASYNC items=<base64 json> [key=<prefix>] [merge=avg|sum|max] [table=name]`
     queues a batch job and returns a `job` token for later polling.
   - `PREDICT_INHERIT_STATUS <job_id>` reports job progress (merged/skipped/failed counts).
@@ -342,8 +726,11 @@ SUCCESS,key=1_deleted
     `PREDICT_BENCH samples=<n> window=<len> [table=name]` compares CPU vs accelerated merges on the
     current host.
 
-  All prediction commands accept plaintext prefixes or the `x<hex>` form. Context matrices and window
-  specs must be base64-encoded JSON so CLI input stays newline-safe.
+  All prediction commands accept plaintext prefixes or the `x<hex>` form — and so does every
+  *value* they take (`value=`, `target=`, `sources=`, `negatives=`, and the same fields inside an
+  `items=` payload), so a bare hex string is stored literally rather than decoded. Context matrices
+  and window specs must be base64-encoded JSON so CLI input stays newline-safe. Values are returned
+  hex-encoded in `items=<hex>:<prob>`.
 
 - **Cluster coordination.** Multi-node deployments can now tell cheetah where each fork lives. Set
   `CHEETAH_NODE_ID=<id>` on every server, then use:
