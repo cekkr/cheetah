@@ -35,8 +35,9 @@ type Database struct {
 	pairTableCache     *pairTableCache
 	payloadCache       *payloadCache
 	mu                 sync.Mutex
-	pairDir            string // Path alla cartella /pairs
-	nextPairIDPath     string // Path al file che memorizza il contatore
+	pairDeleteMu       sync.Mutex // Serializza le cancellazioni sul trie dei pair, vedi deletePairValue
+	pairDir            string     // Path alla cartella /pairs
+	nextPairIDPath     string     // Path al file che memorizza il contatore
 	jumpDataPath       string
 	jumpIndexPath      string
 	jumpMu             sync.Mutex
@@ -1102,10 +1103,20 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 	return tableID, path, nil, nil
 }
 
+// deletePairValue è l'unico ingresso alla cancellazione sul trie, e prende
+// pairDeleteMu perché deletePairAt non è rientrante fra goroutine: collassa i
+// nodi svuotati, promuove i rami singoli a jump e rimuove i file tabella, tutte
+// mutazioni che due cancellazioni di chiavi con antenati in comune eseguono
+// sugli stessi nodi. PAIR_PURGE parallelizza le cancellazioni proprio così, e
+// senza questo lock perdeva chiavi o falliva rimuovendo due volte lo stesso
+// file. Il costo è nullo: nella purge il lavoro caro è la Delete del payload,
+// che resta fuori dal lock.
 func (db *Database) deletePairValue(value []byte) (bool, error) {
 	if len(value) == 0 {
 		return false, fmt.Errorf("pair value cannot be empty")
 	}
+	db.pairDeleteMu.Lock()
+	defer db.pairDeleteMu.Unlock()
 	deleted, _, err := db.deletePairAt(0, value, 0)
 	return deleted, err
 }

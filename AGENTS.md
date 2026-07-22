@@ -1199,11 +1199,13 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](src/cluster_scheduler.go) `load`). First open item in
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
-- **`PAIR_PURGE` is racy** — `purgePairEntries` ([`commands.go`](src/commands.go)) deletes entries from
-  parallel goroutines while `deletePairAt` mutates the trie unlocked. Fails ~6 runs in 8 on 8 keys
-  under one prefix, either with `remove pairs/<n>.table: no such file or directory` /
-  `jump reload limit exceeded`, or silently, reporting `purged=N` with entries still scannable.
-  Full repro in [`NEXT_STEPS.md`](NEXT_STEPS.md).
+- **Concurrent `PAIR_SET` on a shared ancestor is unguarded** — `insertPairAt`
+  ([`database.go`](src/database.go)) splits nodes, creates tables and promotes jumps with no lock, so
+  two connections inserting keys under the same prefix mutate the same nodes. This is the insert-side
+  twin of the `PAIR_PURGE` race fixed by `pairDeleteMu` (see [`NEXT_STEPS.md`](NEXT_STEPS.md) *Done*);
+  unlike that one it has not been observed in the wild, because nothing in the server fans a single
+  command out into parallel inserts. The fix is symmetric — serialize the trie mutation — but it
+  serializes every writer, so measure `pair_adaptive_bench_test.go` before taking it.
 - **`PREDICT_*` error responses omit the `ERROR,` prefix** — the handlers return `err.Error()` raw
   (`inherit_sources_missing`), breaking the otherwise universal `SUCCESS`/`ERROR,` classification.
 - **Command-surface redundancy** — 51 dispatcher commands, of which the async trios, the `_BATCH`

@@ -317,3 +317,50 @@ func TestPairScanCursorPagination(t *testing.T) {
 		})
 	}
 }
+
+// TestPairPurgeSharedAncestors pretende che PAIR_PURGE cancelli davvero tutte
+// le chiavi sotto il prefisso, e che lo scan successivo sia vuoto.
+//
+// purgePairEntries distribuisce le cancellazioni su più goroutine, ma la
+// mutazione del trie che raggiungono — deletePairAt, con collasso dei nodi,
+// promozione a jump e os.Remove del file tabella — non era serializzata. Con
+// otto chiavi sotto lo stesso prefisso, quindi con antenati in comune, due
+// worker si contendevano lo stesso nodo e la purge falliva in circa 6 tentativi
+// su 8: `remove pairs/2.table: no such file or directory` (entrambi rimuovono
+// il nodo appena svuotato), `jump reload limit exceeded`, oppure — il caso
+// peggiore — `purged=8` seguito da uno scan che restituiva ancora chiavi.
+func TestPairPurgeSharedAncestors(t *testing.T) {
+	words := []string{"PARIS", "LISBON", "PORTO", "MUNICH", "BERLIN", "MADRID", "ROME", "OSLO"}
+	const prefix = "ctx:"
+
+	for _, stride := range []int{1, 2} {
+		t.Run(fmt.Sprintf("stride%d", stride), func(t *testing.T) {
+			// La corsa è probabilistica: un solo giro la manca spesso.
+			for trial := 0; trial < 8; trial++ {
+				db := newAdaptiveTestDB(t, stride, true, 4096)
+				keys := make([]uint64, 0, len(words))
+				for _, w := range words {
+					keys = append(keys, mustInsertPair(t, db, prefix+w))
+				}
+
+				purged, err := db.PairPurge([]byte(prefix), 4096)
+				if err != nil {
+					t.Fatalf("trial %d: PairPurge: %v", trial, err)
+				}
+				if purged != len(words) {
+					t.Fatalf("trial %d: purged %d entries, want %d", trial, purged, len(words))
+				}
+				if left := scannedValues(t, db, prefix); len(left) != 0 {
+					t.Fatalf("trial %d: PAIR_SCAN after purge returned %v, want none", trial, left)
+				}
+				// La purge cancella anche i payload: nessuna chiave deve
+				// sopravvivere alla mappatura che la teneva raggiungibile.
+				for i, key := range keys {
+					if _, err := db.getPairValue([]byte(prefix + words[i])); err == nil {
+						t.Fatalf("trial %d: %q still resolves to key %d after purge", trial, prefix+words[i], key)
+					}
+				}
+			}
+		})
+	}
+}
