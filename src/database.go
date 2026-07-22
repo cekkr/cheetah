@@ -1677,6 +1677,12 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response, err = db.handleGraphNeighborTypes(args)
 	case command == "GRAPH_QUERY":
 		response, err = db.handleGraphQuery(args)
+	case command == "GRAPH_RECALL":
+		response, err = db.handleGraphRecall(args)
+	case command == "GRAPH_SIMILAR":
+		response, err = db.handleGraphSimilar(args)
+	case command == "GRAPH_TERM_INDEX":
+		response, err = db.handleGraphTermIndex(args)
 	case command == "GRAPH_AMBIGUITY_SET":
 		response, err = db.handleGraphAmbiguitySet(args)
 	case command == "GRAPH_AMBIGUITY_GET":

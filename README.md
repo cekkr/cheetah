@@ -18,6 +18,12 @@ other dense analytical slices must be served with predictable latency.
   allocate full tables, and **adaptive node indexing** keeps a sparse node as a compact
   binary-searched list instead of reserving its whole branch array — so the wide stride no longer
   costs ~707 KB per node.
+- **Associative recall.** `GRAPH_RECALL` takes several terms at once and spreads activation from all
+  of them, returning everything they co-activate above a requested precision — each hit with the
+  seeds that reached it, its distance, the edges that justify it, and a novelty score. Because the
+  seeds combine in noisy-OR, what two topics *share* outranks what either topic merely touches, which
+  is where correlations nobody asked for turn up. Free-text seeds resolve through a lexical index and
+  declared synonym edges; `GRAPH_SIMILAR` answers the sibling question, "what else behaves like this".
 - **Payload caching.** `src/database.go` keeps a bounded cache (defaults: 16k entries ≈64 MB) keyed by
   `<value_size, table_id, entry_id>` so hot payloads never hit disk. Tune it with
   `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
@@ -164,6 +170,14 @@ GRAPH_DEGREE id=<node> [direction=out|in|both] [type=<edge|*>] [weighted=0|1]
 GRAPH_NEIGHBOR_TYPES id=<node> [direction=out|in|both] [limit=<n>] [cursor=<token>] [weighted=0|1]
                                 # compact relation histogram for fast graph feature extraction
 GRAPH_QUERY MATCH (...) ...     # graph pattern query (see syntax below)
+GRAPH_RECALL seeds=<term>[,<term>…] [precision=<0..1|word>] [hops=<n>] [limit=<n>]
+             [min_sources=<n>] [direction=out|in|both] [type=<t>[,…]] [decay=<0..1>]
+             [expand=exact|lexical|synonyms|all] [branch_limit=<n>] [budget=<n>]
+                                # associative recall: everything several terms co-activate, ranked
+GRAPH_SIMILAR id=<node> [by=context|lexical|all] [limit=<n>] [precision=<0..1|word>]
+                                # nodes that occur in the same contexts, or share the same words
+GRAPH_TERM_INDEX [action=stats|rebuild|drop] [limit=<n>] [cursor=<token>]
+                                # maintain the lexical index that resolves free-text seeds
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry
 FILE_CHECKPOINT [IDLE=<dur>] [DROP_CACHE] [CLOSE_HANDLES]
@@ -409,6 +423,9 @@ node that does not exist yet (disable with `autocreate=0`).
 | `GRAPH_DEGREE id=<id> [direction=out\|in\|both] [type=<t\|*>] [weighted=0\|1]` | `degree` (plus `weighted_degree` when `weighted=1`). |
 | `GRAPH_NEIGHBOR_TYPES id=<id> [direction=out\|in\|both] [limit=<n>] [cursor=<tok>] [weighted=0\|1]` | `payload=` a compact relation histogram `[{type,count,weighted}]`. |
 | `GRAPH_AMBIGUITY_GET from=<id> group=<g> [direction=out\|in] [limit=<n>]` | `count`, `confidence_sum`, `top`, `top_modality`, and `payload=` the alternatives, strongest first. |
+| `GRAPH_RECALL seeds=<t>[,…] [precision=…] [hops=…] [min_sources=…] […]` | `resolved`, `visited`, `expanded`, `count`, `bridges`, `truncated`, and `payload=` the resolved seeds plus the ranked associations. See [associative recall](#associative-recall--graph_recall-graph_similar). |
+| `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=<n>]` | `count`, `truncated`, and `payload=` `[{id,score,context,lexical,shared_count,shared,labels}]`. |
+| `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=<n>] [cursor=<tok>]` | `entries`/`enabled` (stats), `nodes`+`terms`+`next_cursor` (rebuild), `removed` (drop). |
 
 ```text
 [cheetah_data/graphlang]> GRAPH_NODE_GET id=alice
@@ -478,6 +495,95 @@ SUCCESS,return=nodes,matches=3,next_cursor=*,payload=<base64>
 SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
 # payload decodes to: [{"from":"alice","type":"follows","to":"carol","weight":0.4},{"from":"bob","type":"likes","to":"carol","weight":0.7}]
 ```
+
+### Associative recall — `GRAPH_RECALL`, `GRAPH_SIMILAR`
+
+`GRAPH_QUERY` answers a question you already know how to ask. `GRAPH_RECALL` answers the one you
+don't: give it the terms a conversation is touching and it spreads activation from all of them at
+once, returning everything they co-activate — ranked, with the evidence for each item — so the model
+can choose what to open next.
+
+```text
+GRAPH_RECALL seeds=<term>[,<term>…]     # free text or node ids; base64:<list> when a term has spaces
+  [precision=<0..1|word>]   # cut-off, default 0.25; accepts scale words (`probable` = 0.75)
+  [hops=<n>]                # default 3, max 6
+  [min_sources=<n>]         # 2 = only what several seeds reach: the convergence view
+  [direction=out|in|both]   # default both — association is not directional
+  [type=<t>[,…]]            # restrict the relations that carry activation
+  [decay=<0..1>]            # activation kept per hop, default 0.55
+  [expand=exact|lexical|synonyms|all]   # how seeds resolve, default all
+  [synonym_types=<t>[,…]|-] # default synonym,alias,same_as,aka,abbreviation,acronym
+  [limit=<n>] [branch_limit=<n>] [budget=<n>] [include_seeds=0|1] [seed_limit=<n>]
+```
+
+Scoring, in one line each:
+
+- **Activation** leaves a seed at its resolution score (1.0 for an exact id) and is multiplied at each
+  edge by `decay × weight × confidence` — so a `possible` edge carries half of what a plain one does,
+  and `precision` is a belief threshold as much as a distance one. It gates seed resolution too: a
+  free-text seed must overlap a node's words by at least `precision` to resolve to it.
+- **Convergence** combines the seeds in noisy-OR (`1 − Π(1 − aᵢ)`): a node two seeds each reach at
+  0.55 scores **0.7975**, above either of their own direct neighbours. `bridge=true` marks it.
+- **`distance`** is conceptual depth: crossing a synonym edge costs a hop but no distance, because an
+  alias is not a different subject. The per-source `hops` still counts the real steps.
+- **`novelty` = score × distance/(distance+1) × sources/seeds** — high for a far node that several
+  seeds reach, ~0 for the obvious neighbour of one seed. Sort by it to read the surprises first.
+
+```text
+[cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=8
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,count=6,bridges=3,truncated=0,precision=0.100,payload=<base64>
+# payload decodes to {"seeds":[…],"associations":[
+#   {"id":"city:berlin","score":0.7975,"novelty":0.39875,"distance":1,"source_count":2,"bridge":true,
+#    "sources":[{"seed":"cat:luna","activation":0.55,"hops":1},{"seed":"person:marco","activation":0.55,"hops":1}],
+#    "via":[{"from":"cat:luna","type":"lives_in","to":"city:berlin","weight":1,"confidence":1,"modality":"certain"}]},
+#   {"id":"country:germany","score":0.513494,"novelty":0.342329,"distance":2,"source_count":2,"bridge":true,…},
+#   {"id":"breed:siamese","score":0.55,"novelty":0.1375,"distance":1,"source_count":1,…}, …]}
+
+[cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=13,hydrated=24,count=5,bridges=5,truncated=0,precision=0.050,payload=<base64>
+# only what more than one seed reaches — the "what do these two have to do with each other?" question
+```
+
+A seed does not have to be an id. Free text resolves through the lexical index (`berlin` →
+`city:berlin`, scored by word overlap) and then through declared synonym edges, and every match says
+which route it took:
+
+```text
+[cheetah_data/default]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1
+SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=2,visited=5,expanded=2,hydrated=5,count=3,…,payload=<base64>
+# "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"},
+#                                      {"id":"city:berlino","score":0.47025,"match":"synonym"}]}]
+```
+
+`GRAPH_SIMILAR` is the other half: not "what is connected to X" but "what else behaves like X",
+scored on shared neighbours (`context`) and shared id words (`lexical`), with the shared contexts
+listed as evidence.
+
+```text
+# cat:luna and cat:mia are both siamese and both live in Berlin; no edge joins them
+[cheetah_data/default]> GRAPH_SIMILAR id=cat:luna limit=8
+SUCCESS,command=GRAPH_SIMILAR,id=cat:luna,count=1,truncated=0,payload=<base64>
+# payload decodes to: [{"id":"cat:mia","score":1,"context":1,"lexical":0.333333,
+#                       "shared_count":2,"shared":["breed:siamese","city:berlin"]}]
+# context=1: identical neighbourhoods. lexical=0.333: `cat` out of {cat,luna,mia}
+```
+
+Free-text seeds need the lexical index, which is maintained automatically on node writes. Databases
+written before it existed (or with `CHEETAH_GRAPH_TERM_INDEX=0`) index nothing until a rebuild — it is
+resumable, so a large graph is walked in bounded slices:
+
+```text
+[cheetah_data/default]> GRAPH_TERM_INDEX action=stats
+SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=12
+[cheetah_data/default]> GRAPH_TERM_INDEX action=rebuild limit=4096
+SUCCESS,command=GRAPH_TERM_INDEX,action=rebuild,nodes=6,terms=12,next_cursor=*
+# next_cursor != * means there is more: pass it back as cursor=<token>
+```
+
+Both commands are bounded by `branch_limit` (neighbours read per node and direction) and `budget`
+(edges hydrated in total). Hitting either ends the walk and reports `truncated=1` — a partial answer
+that says so, never a stall. Exact ids and synonym edges keep working without the index; only
+free-text matching depends on it.
 
 Graph statistics can also stream through the reducer language: `PAIR_REDUCE degree|triangle|pagerank_seed <adj-hex-prefix>`
 runs directly over the `adj/out`/`adj/in` namespaces without hydrating edges. For the authoritative
@@ -899,6 +1005,9 @@ Where the query language stops, and what to do about it:
 | "Who is behind/above/downstream of X?" | `GRAPH_QUERY … HOPS 1..n RETURN paths` | bound with `BRANCH_LIMIT` + `COST_LIMIT`; `paths` is the compact form |
 | "Is X connected to Y at all?" | `GRAPH_QUERY MATCH (id='X')-[:*]->(id='Y') HOPS 1..n RETURN count` | `count` skips payload hydration entirely |
 | "How much do you know about X?" | `GRAPH_DEGREE id=X direction=both weighted=1` | one number, no edge reads |
+| "What comes to mind around X, Y, Z?" (no known relation) | `GRAPH_RECALL seeds=X,Y,Z` | the associative path: free-text seeds allowed, every hit carries its evidence |
+| "What do X and Y have to do with each other?" | `GRAPH_RECALL seeds=X,Y min_sources=2` | only what both reach; sort the result by `novelty` for the non-obvious ones |
+| "What else is like X?" | `GRAPH_SIMILAR id=X` | same neighbours or same words — no edge between them required |
 | "What do you remember overall?" | `PAIR_SUMMARY x01676e3a` / `PAIR_SCAN x01676e3a <limit>` | `x01676e3a` is the hex form of the reserved node namespace `\x01gn:` |
 
 Note on `RETURN nodes`: it returns the sorted unique ids of *all* endpoints of the matched edges,

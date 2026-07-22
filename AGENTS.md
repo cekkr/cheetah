@@ -184,10 +184,16 @@ because they mutate per-connection "current database" state.
 - **Reducers are registered, not hard-coded.** Add new `PAIR_REDUCE` modes in
   [`registerDefaultReducers`](src/reducers.go); the dispatcher resolves them by name. Do not extend the
   `ExecuteCommand` switch per reducer.
-- **Graph keys use reserved control-byte prefixes.** `\x01gn:`, `\x02ge:`, `\x03go:`, `\x04gi:`, and
-  `graph/idx/` ([`graph.go`](src/graph.go)) share the trie with user data. Never emit user keys under these
+- **Graph keys use reserved control-byte prefixes.** `\x01gn:`, `\x02ge:`, `\x03go:`, `\x04gi:`,
+  `\x05gt:` (the lexical term index, [`graph_recall.go`](src/graph_recall.go)) and `graph/idx/`
+  ([`graph.go`](src/graph.go)) share the trie with user data. Never emit user keys under these
   prefixes. `GRAPH_QUERY` MUST anchor its left node by ID to stay index-backed
   ([`executeGraphQuery*`](src/graph.go)).
+- **The term index is derived, never authoritative.** `\x05gt:<token>/<node>` entries are rebuilt from
+  the node records at any time (`GRAPH_TERM_INDEX action=rebuild`) and recall degrades to exact-id
+  seeds when they are missing. Node upsert/delete keep them in sync
+  ([`graphSyncNodeTerms`](src/graph_recall.go)/[`graphDropNodeTerms`](src/graph_recall.go)); a new node
+  write path must call them or its nodes become unreachable by free-text seed.
 - **Prediction tables persist as fixed-byte `CHPREDTB` files**, not JSON. JSON appears only on the
   CLI/TCP wire ([`prediction_table.go`](src/prediction_table.go)); legacy `.json` tables are auto-migrated
   on first open.
@@ -211,6 +217,7 @@ client ── TCP ──►  server.go (per-conn loop)                          
                  │                        └─ cache.go (payload LRU),  jump_store.go (suffix collapse)
                  ├─ reducers.go        PAIR_REDUCE counts/probs/continuations + graph degree/triangle/pagerank
                  ├─ graph.go           GRAPH_* nodes/edges/adjacency/query
+                 │    └─ graph_recall.go  GRAPH_RECALL/SIMILAR/TERM_INDEX (associative recall)
                  ├─ prediction_*.go    PREDICT_* tables + context matrices
                  └─ cluster_*.go       CLUSTER_*/FORK_ASSIGN topology, gossip
                          ▲
@@ -538,6 +545,33 @@ plus a property index.
   and flip the arrow (`(id='x')<-[:t]-(*)`), which means **every direction-dependent branch must
   mirror both endpoints** — see [direction mirroring](#pitfall-graph-direction).
 
+#### [`src/graph_recall.go`](src/graph_recall.go)
+
+Associative recall — the "hippocampus" path. Turns a handful of terms into the whole neighbourhood
+worth exploring, ranked, with the evidence for each item, so a model can pick instead of guessing the
+next query.
+
+- **Key symbols:** the reserved term-index namespace `graphTermIndexPrefix` (`\x05gt:`) with
+  `graphTermPairKey`/`graphTermScanPrefix`/`graphNodeIndexTokens`/`graphSyncNodeTerms`/
+  `graphDropNodeTerms`/`graphEnsureTermEntry`/`graphTermCandidates`/`graphRebuildTermIndex`; lexical
+  helpers `graphRecallTokens`/`graphRecallTokenSet`/`graphRecallJaccard`; scoring
+  `graphRecallAffinity` (weight × confidence), `graphRecallNoisyOr`, `graphRecallNovelty`; option
+  parsing `graphParseRecallOptions`/`graphParseRecallExpansion`/`graphRecallResolveSynonymTypes`/
+  `(*graphRecallOptions).applyTypeFilter`; seed resolution `graphResolveRecallSeeds`/
+  `graphResolveRecallTerm`/`graphSynonymsOf`; traversal `graphRecallLinks`, `graphRecallSpread`,
+  `(*graphRecallRun).touch`/`path`/`associations`; handlers `handleGraphRecall`, `handleGraphSimilar`
+  (with `graphSimilarMatches`), `handleGraphTermIndex`.
+- **Depends on:** [`graph.go`](src/graph.go) (adjacency scan, node/edge records, pair-payload helpers)
+  and [`graph_uncertainty.go`](src/graph_uncertainty.go) (`graphEffectiveConfidence`/`Modality`, and the
+  modality scale, which `precision=` reuses so `precision=probable` means 0.75).
+  **Tests:** [`graph_recall_test.go`](src/graph_recall_test.go).
+- **Common mistakes:** activation is combined across seeds with **noisy-OR**, so a node can pass
+  `precision` even when no single seed reaches it — the frontier is therefore pruned at
+  `precision / seeds` (floored at `graphRecallMinActivation`), never at `precision`; tightening that
+  cut silently drops convergences. `distance` is **conceptual depth** (synonym hops cost a hop but no
+  depth), which is not the `hops` reported per source. Traversal never hydrates node records — labels
+  are read only for the items that survive the limit.
+
 #### [`src/graph_uncertainty.go`](src/graph_uncertainty.go)
 
 First-class uncertainty and ambiguity on edges: the modality scale (words ↔ numbers) and the
@@ -615,6 +649,16 @@ Leveled logging with an in-memory ring buffer feeding `LOG_FLUSH`.
 Unit tests for the graph subsystem: edge lifecycle + query, parser rules, batch upsert (+
 continue-on-error), multi-hop bound/cost, property secondary index, and the three graph reducers.
 Includes the `assertCommandPrefix` / `decodePairReducePayloads` helpers reused for reducer assertions.
+
+#### [`src/graph_recall_test.go`](src/graph_recall_test.go)
+
+Associative recall: multi-seed convergence and the `min_sources=2` view, novelty ordering (a distant
+two-seed node beats a one-seed node at the same distance), free-text seeds resolved lexically and
+through alias edges (and `expand=exact` turning both off), the precision gate against declared edge
+confidence (`precision=probable` = 0.75, like `edge.confidence`), `GRAPH_SIMILAR` on shared neighbours
+vs shared words, the term-index lifecycle (auto-maintained, label removal, node delete,
+`CHEETAH_GRAPH_TERM_INDEX=0` + rebuild + drop), and budget exhaustion answering `truncated=1` on one
+line. Provides `newRecallTestDB`, `seedRecallGraph`, `recallPayload`, `findAssociation`.
 
 #### [`src/pair_scan_test.go`](src/pair_scan_test.go)
 
@@ -771,6 +815,28 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Constraints:** left node ID-anchored; reserved `\x01..\x04` + `graph/idx/` prefixes; a reverse
   `<-[:t]-` pattern anchors on the left node and reads the `adj/in` index.
 
+### Associative recall ("hippocampus") — Shipped
+
+- **Behavior:** `GRAPH_RECALL seeds=a,b,…` spreads activation from every seed at once and returns each
+  reached node with its score, the seeds that reached it, the conceptual `distance`, a `novelty`
+  score and the `via` evidence path (per edge: weight, confidence, modality). Activation combines
+  across seeds in **noisy-OR**, so a node two seeds reach outranks either seed's own neighbours —
+  `min_sources=2` returns only those convergences, which is the "unexpected correlation" view.
+  Seeds resolve by exact id, by lexical overlap through the `\x05gt:` term index, and through declared
+  synonym edges. `GRAPH_SIMILAR id=<node>` answers "what else is like this" from shared neighbours
+  (distributional) and shared id words (lexical). `GRAPH_TERM_INDEX action=stats|rebuild|drop`
+  maintains the index.
+- **Owners:** [`graph_recall.go`](src/graph_recall.go); node-write hooks in
+  [`graph.go`](src/graph.go) (`handleGraphNodeSet`, `handleGraphNodeDel`, `graphEnsureNode`).
+  **Tests:** [`graph_recall_test.go`](src/graph_recall_test.go).
+- **Constraints:** every walk is bounded by `branch_limit` (per node/direction) and `budget`
+  (hydrated edges); exhausting either answers `truncated=1` rather than stalling. `hops` caps at 6.
+  Term-index maintenance on write is switchable with `CHEETAH_GRAPH_TERM_INDEX=0`; a database written
+  with it off (or created before this feature) needs `GRAPH_TERM_INDEX action=rebuild` before free-text
+  seeds resolve — exact ids and synonym edges work regardless.
+- **Gaps:** no consolidation (recall never writes back what it discovered), no async variant, and the
+  index weighs every token equally — all three are open items in [`NEXT_STEPS.md`](NEXT_STEPS.md).
+
 ### Edge uncertainty + ambiguity — Shipped
 
 - **Behavior:** an edge carries `confidence` (0–1), `modality` (a word on the ordered scale
@@ -900,6 +966,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `PAIR_REDUCE(_ASYNC/_STATUS/_FETCH)` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go) + [`reduce_jobs.go`](src/reduce_jobs.go) |
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
+| `GRAPH_RECALL`, `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go) |
 | `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`predict_jobs.go`](src/predict_jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
 | `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](src/database.go), [`resource_monitor.go`](src/resource_monitor.go), [`logger.go`](src/logger.go), [`file_manager.go`](src/file_manager.go) |
@@ -1009,6 +1076,9 @@ Environment variables read by the server (all verified in-tree):
   `CHEETAH_CACHE_IDLE_SECONDS`, `CHEETAH_CACHE_FORCE_SECONDS`, `CHEETAH_CACHE_SWEEP_SECONDS`,
   `CHEETAH_CACHE_STATS_SECONDS`, `CHEETAH_CACHE_PRESSURE_HIGH`, `CHEETAH_CACHE_PRESSURE_LOW`,
   `CHEETAH_CACHE_WRITE_WEIGHT`, `CHEETAH_CACHE_READ_WEIGHT`.
+- **Graph term index** ([`graph_recall.go`](src/graph_recall.go)): `CHEETAH_GRAPH_TERM_INDEX`
+  (default on; `0/false/no/off/disable(d)` turns off the automatic maintenance on node write —
+  `GRAPH_TERM_INDEX action=rebuild` indexes regardless, since it is an explicit request).
 - **Prediction:** `CHEETAH_PREDICT_DEEPEN`, `CHEETAH_PREDICT_FLUSH_MILLIS`,
   `CHEETAH_PREDICT_PURGE_THRESHOLD`, `CHEETAH_PREDICT_MERGER`.
 - **Cluster:** `CHEETAH_NODE_ID`, `CHEETAH_TRACK_STANDALONE_FORKS`.
@@ -1049,6 +1119,13 @@ seen in old docs are **client-side**; the server does not read them.
 | Confidence/modality round trip, default `certain`, persistence across partial upserts | [`TestGraphConfidence*`](src/graph_uncertainty_test.go) |
 | Modality predicates compare by rank; ambiguity groups set/get/resolve/drop and share distribution | [`TestGraphModalityPredicateOrdering`/`TestGraphAmbiguity*`](src/graph_uncertainty_test.go) |
 | Batch edge upsert carries confidence (number or word) and group tags | [`TestGraphEdgeBatchCarriesUncertainty`](src/graph_uncertainty_test.go) |
+| Multi-seed convergence outranks single-seed neighbours; `min_sources=2` keeps only bridges | [`TestGraphRecallConvergenceAcrossSeeds`](src/graph_recall_test.go) |
+| Novelty prefers a distant multi-seed node over a near single-seed one | [`TestGraphRecallNoveltyPrefersDistantConvergence`](src/graph_recall_test.go) |
+| Free-text seeds resolve lexically + through alias edges; `expand=exact` disables both | [`TestGraphRecallResolvesLexicalTermsAndSynonyms`](src/graph_recall_test.go) |
+| Recall precision gates on declared edge confidence; `via` carries the modality | [`TestGraphRecallHonoursPrecisionAndConfidence`](src/graph_recall_test.go) |
+| Exhausted recall budget answers `truncated=1` on one line instead of stalling | [`TestGraphRecallBudgetDegradesInsteadOfStalling`](src/graph_recall_test.go) |
+| Distributional similarity: shared neighbours and shared id words | [`TestGraphSimilarSharesContextAndWords`](src/graph_recall_test.go) |
+| Term index maintained on write, dropped with the node, rebuildable, switchable | [`TestGraphTermIndexLifecycle`](src/graph_recall_test.go) |
 | `LOG_FLUSH` answers on one line and leaves the next response aligned | [`TestLogFlush*`](src/logger_test.go) |
 | Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](src/graph_test.go) |
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go) |
@@ -1096,6 +1173,8 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   sync and async.
 - Graph store with batch upsert and bounded multi-hop `GRAPH_QUERY` incl. edge-property secondary
   index.
+- Associative recall: multi-seed `GRAPH_RECALL` with noisy-OR convergence, `GRAPH_SIMILAR`, and the
+  `\x05gt:` lexical term index behind `GRAPH_TERM_INDEX`.
 - Prediction tables with context-matrix train/query/inherit and CPU merge path.
 - Managed-file layer, payload cache, resource monitor, `SYSTEM_STATS`/`LOG_FLUSH`/`FILE_CHECKPOINT`.
 - Cluster topology registration, fork assignment, gossip, and `CLUSTER_MOVE` payload transfer.
@@ -1121,9 +1200,11 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))
 
-1. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
-2. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
-3. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.
+1. Recall consolidation: persist repeatedly co-activated pairs as derived edges (plus a forgetting
+   rule), an async recall variant, and frequency-weighted / misspelling-tolerant term matching.
+2. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
+3. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
+4. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.
 
 ---
 

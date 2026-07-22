@@ -206,6 +206,13 @@ func (db *Database) handleGraphNodeSet(args string) (string, error) {
 	if err := db.graphPutNode(record); err != nil {
 		return "", err
 	}
+	var previous *GraphNodeRecord
+	if found {
+		previous = &existing
+	}
+	if err := db.graphSyncNodeTerms(previous, &record); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf("SUCCESS,node_set,id=%s", id), nil
 }
 
@@ -241,6 +248,12 @@ func (db *Database) handleGraphNodeDel(args string) (string, error) {
 			return "", err
 		}
 	}
+	// Le voci dell'indice lessicale si ricavano dal record, quindi vanno tolte
+	// prima che il record sparisca.
+	existing, found, err := db.graphGetNode(id)
+	if err != nil {
+		return "", err
+	}
 	nodeKey := graphNodePairKey(id)
 	deleted, err := db.graphDeletePairAndPayload(nodeKey)
 	if err != nil {
@@ -248,6 +261,11 @@ func (db *Database) handleGraphNodeDel(args string) (string, error) {
 	}
 	if !deleted {
 		return "ERROR,node_not_found", nil
+	}
+	if found {
+		if err := db.graphDropNodeTerms(&existing); err != nil {
+			return "", err
+		}
 	}
 	return fmt.Sprintf("SUCCESS,node_deleted,id=%s", id), nil
 }
@@ -2485,11 +2503,15 @@ func (db *Database) graphEnsureNode(id string) error {
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	return db.graphPutNode(GraphNodeRecord{
+	record := GraphNodeRecord{
 		ID:        id,
 		CreatedAt: now,
 		UpdatedAt: now,
-	})
+	}
+	if err := db.graphPutNode(record); err != nil {
+		return err
+	}
+	return db.graphSyncNodeTerms(nil, &record)
 }
 
 func (db *Database) graphGetPayloadByPairKey(pairKey []byte) ([]byte, bool, error) {

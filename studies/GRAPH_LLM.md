@@ -220,6 +220,7 @@ the ladder only as far as the question requires, and stop at the first rung that
 | 3 | `GRAPH_NEIGHBORS id=X type=R` | one adjacency page | a known relation, one hop, either direction |
 | 4 | `GRAPH_QUERY … WHERE …` | index-served filter | a condition on weight or props |
 | 5 | `GRAPH_QUERY … HOPS 1..n` | bounded traversal | chains: reporting lines, provenance, containment |
+| 6 | `GRAPH_RECALL seeds=X,Y,…` | multi-seed spread, budget-bounded | the question names no relation, or you want what you did *not* ask for |
 
 Rungs 1 and 2 exist so the model can decide *not* to pay for 3–5. A histogram is a few dozen tokens;
 hydrating a fan-out is hundreds.
@@ -230,6 +231,72 @@ Answer template that keeps a small model honest — three slots, each filled fro
 <claim>, because <edge type + endpoint>, recorded <weight/modality>. [Source: <src episode text>]
 Unknown: <what returned matches=0>.
 ```
+
+### 5.1 When you don't know what to ask
+
+Rungs 0–5 all need the question already shaped: an id, usually a relation. A conversation rarely
+arrives that way — it touches three or four things at once and the useful move is to see what they
+have in common. That is rung 6.
+
+```text
+# the graph: luna and marco both live in Berlin, and share nothing else
+GRAPH_EDGE_SET from=cat:luna to=breed:siamese type=has_breed
+GRAPH_EDGE_SET from=breed:siamese to=trait:vocal type=has_trait
+GRAPH_EDGE_SET from=cat:luna to=city:berlin type=lives_in
+GRAPH_EDGE_SET from=person:marco to=city:berlin type=lives_in
+GRAPH_EDGE_SET from=person:marco to=hobby:sailing type=likes
+GRAPH_EDGE_SET from=city:berlin to=country:germany type=located_in
+GRAPH_EDGE_SET from=city:berlin to=city:berlino type=alias
+
+[cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=8
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,count=6,bridges=3,truncated=0,precision=0.100,payload=<base64>
+# associations decode to, in order:
+#  city:berlin      score 0.7975   novelty 0.39875  distance 1  sources 2  ← both seeds, one hop
+#  city:berlino     score 0.771994 novelty 0.385997 distance 1  sources 2  ← an alias: a hop, no distance
+#  breed:siamese    score 0.55     novelty 0.1375   distance 1  sources 1
+#  hobby:sailing    score 0.55     novelty 0.1375   distance 1  sources 1
+#  country:germany  score 0.513494 novelty 0.342329 distance 2  sources 2  ← both seeds, two hops
+#  trait:vocal      score 0.3025   novelty 0.100833 distance 2  sources 1
+```
+
+Read the columns, not just the order:
+
+- **`score`** ranks by "how strongly is this lit up" — `city:berlin` beats every direct neighbour
+  because two seeds reach it and their activations combine (`1 − Π(1 − aᵢ)`), not because it is
+  closer.
+- **`novelty`** ranks by "how much of this did I not already know": `country:germany` (0.342329) over
+  `breed:siamese` (0.1375), even though `breed:siamese` scores higher. A direct neighbour of one seed
+  is the answer to a question you could have asked; a two-hop node both seeds reach is not. Note
+  `city:berlino` stays at distance 1: crossing an alias costs a hop but no distance, because an alias
+  is not a different subject.
+- **`via`** is the justification — the actual edges, each with its `weight`, `confidence` and
+  `modality`. Quote it. An association without its path is a hallucination waiting to happen.
+- **`sources`** says *which* seeds lit it and how far each one is. One source means "this belongs to
+  one of your topics"; two means "this is where your topics meet".
+
+Two habits worth keeping:
+
+```text
+# 1. the convergence question — "what do these have to do with each other?"
+[cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2
+SUCCESS,…,count=5,bridges=5,…
+# only nodes more than one seed reaches; everything single-topic disappears
+
+# 2. seeds do not have to be ids — free text resolves through the lexical index and alias edges
+[cheetah_data/default]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1
+SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=2,…
+# "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"},
+#                                      {"id":"city:berlino","score":0.47025,"match":"synonym"}]}]
+```
+
+The knob that matters is `precision`. It is a belief threshold as much as a distance one, because
+activation is multiplied by each edge's confidence on the way: an edge recorded as `possible` passes
+half of what a plain one passes, so raising `precision` drops hearsay before it drops distant facts.
+It takes the same words as `edge.confidence` — `precision=probable` is 0.75.
+
+Recall never says "nothing". It says `count=0`, or it says `truncated=1` when the budget ran out
+before the graph did — a partial answer that declares itself. Both are reportable; neither is a
+negative fact about the world.
 
 ---
 
@@ -732,6 +799,10 @@ You answer from the database only. Emit queries, read the rows, then answer.
    question is answered.
 3. Then the targeted read: GRAPH_NEIGHBORS (one hop; direction=in for reverse) or GRAPH_QUERY
    (WHERE predicates, HOPS 1..n, RETURN edges|nodes|paths|count).
+3b. When the question names no relation ("what about X and Y?", "anything I'm missing?"), use
+   GRAPH_RECALL seeds=<every entity the turn touched> instead of guessing a query, and add
+   min_sources=2 when the question is about what two topics share. State only associations whose
+   `via` path you can quote; treat the rest as leads to explore, not as facts.
 4. Report edge.modality in words: certain = flat statement, probable/possible = "you mentioned it
    might be", ruled_out = "you later corrected this". Filter with WHERE edge.modality >= 'probable'
    for anything you are going to state as fact.
@@ -773,6 +844,10 @@ Design honestly around these; none of them has a workaround inside the server to
   `GRAPH_AMBIGUITY_SET`/`_RESOLVE`; a plain `GRAPH_EDGE_SET` on a member can unbalance the group.
 - **No atomicity.** Each command commits on its own; a batch that half-fails leaves half-written state,
   and there is no rollback. Make writes idempotent (they are upserts) and re-run.
+- **Recall discovers, it does not consolidate.** `GRAPH_RECALL` never writes back what it found, so an
+  association re-derived every turn costs the same every turn; and its lexical matching weighs every
+  word equally, with no tolerance for misspellings — a seed that is a typo resolves to nothing.
+  Both are open items in `NEXT_STEPS.md`.
 - **No vector search.** The trie is prefix-ordered, not metric. Coarse-bucketing a quantized embedding
   into a key prefix does give a usable *candidate* scan — mechanically verified:
 
