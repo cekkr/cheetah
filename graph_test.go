@@ -282,6 +282,65 @@ func TestGraphQueryMultiHopBoundsAndCost(t *testing.T) {
 	}
 }
 
+func TestGraphQueryReverseSingleHopMatchesInAdjacency(t *testing.T) {
+	dir := t.TempDir()
+	cfg := defaultConfig()
+	cfg.DataDir = filepath.Join(dir, "data")
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	t.Cleanup(func() {
+		engine.Close()
+	})
+	db, err := engine.GetDatabase(cfg.DefaultDatabase)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=owner labels=person", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_EDGE_SET from=owner to=luna type=owns weight=1.0", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_EDGE_SET from=vet to=luna type=treats weight=1.0", "SUCCESS")
+
+	// Un `<-[:type]-` a un hop deve restituire esattamente le in-adiacenze del nodo ancora.
+	resp := assertCommandPrefix(t, db, "GRAPH_NEIGHBORS id=luna direction=in type=owns limit=8", "SUCCESS")
+	var neighbors []GraphEdgeRecord
+	decodePayloadField(t, resp, &neighbors)
+
+	resp = assertCommandPrefix(t, db, "GRAPH_QUERY MATCH (id='luna')<-[:owns]-(*) RETURN edges LIMIT 8", "SUCCESS")
+	var reverse []GraphEdgeRecord
+	decodePayloadField(t, resp, &reverse)
+	if len(reverse) != len(neighbors) || len(reverse) != 1 {
+		t.Fatalf("reverse single hop returned %d edges, in-adjacency returned %d (%s)", len(reverse), len(neighbors), resp)
+	}
+	if reverse[0].From != "owner" || reverse[0].To != "luna" {
+		t.Fatalf("unexpected reverse edge: %+v", reverse[0])
+	}
+
+	// Il pattern di destra filtra l'altro capo dell'arco, non l'ancora.
+	resp = assertCommandPrefix(t, db, "GRAPH_QUERY MATCH (id='luna')<-[:owns]-(id='owner') RETURN edges LIMIT 8", "SUCCESS")
+	reverse = nil
+	decodePayloadField(t, resp, &reverse)
+	if len(reverse) != 1 {
+		t.Fatalf("expected the anchored reverse pattern to match 1 edge, got %d (%s)", len(reverse), resp)
+	}
+
+	resp = assertCommandPrefix(t, db, "GRAPH_QUERY MATCH (id='luna')<-[:owns]-(id='vet') RETURN edges LIMIT 8", "SUCCESS")
+	reverse = nil
+	decodePayloadField(t, resp, &reverse)
+	if len(reverse) != 0 {
+		t.Fatalf("expected no match for a wrong reverse endpoint, got %d (%s)", len(reverse), resp)
+	}
+
+	// Un label sul pattern di sinistra si applica all'ancora anche in direzione `in`.
+	resp = assertCommandPrefix(t, db, "GRAPH_QUERY MATCH (id='luna',label='person')<-[:owns]-(*) RETURN edges LIMIT 8", "SUCCESS")
+	reverse = nil
+	decodePayloadField(t, resp, &reverse)
+	if len(reverse) != 0 {
+		t.Fatalf("expected the anchor label filter to reject the match, got %d (%s)", len(reverse), resp)
+	}
+}
+
 func TestGraphPropertySecondaryIndexAndPredicate(t *testing.T) {
 	dir := t.TempDir()
 	cfg := defaultConfig()

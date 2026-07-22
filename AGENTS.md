@@ -511,9 +511,11 @@ plus a property index.
   `executeGraphQuerySingleHop`, `executeGraphQueryMultiHop` (bounded HOPS + BRANCH_LIMIT + COST_LIMIT),
   and the secondary-index path `graphIndexedEdgeCandidates`/`graphScanIndexedEdgeIDs`.
 - **Tests:** [`graph_test.go`](graph_test.go) — lifecycle, parser rules, batch upsert, multi-hop
-  bounds/cost, property secondary index.
+  bounds/cost, reverse single hop, property secondary index.
 - **Common mistakes:** the left node of a `MATCH` must be ID-anchored; wildcard-left queries are
-  intentionally rejected to keep execution index-backed.
+  intentionally rejected to keep execution index-backed. Reverse queries keep that anchor on the left
+  and flip the arrow (`(id='x')<-[:t]-(*)`), which means **every direction-dependent branch must
+  mirror both endpoints** — see [direction mirroring](#pitfall-graph-direction).
 
 ### Cluster coordination
 
@@ -723,7 +725,8 @@ nodes are reused — keep automated runs to a few hundred edges.
   upsert, and a bounded multi-hop pattern query with `WHERE`/`HOPS`/`BRANCH_LIMIT`/`COST_LIMIT`/
   `RETURN`/`LIMIT`/`CURSOR`, including an `edge.props.*` secondary index.
 - **Owners:** [`graph.go`](graph.go). **Tests:** [`graph_test.go`](graph_test.go).
-- **Constraints:** left node ID-anchored; reserved `\x01..\x04` + `graph/idx/` prefixes.
+- **Constraints:** left node ID-anchored; reserved `\x01..\x04` + `graph/idx/` prefixes; a reverse
+  `<-[:t]-` pattern anchors on the left node and reads the `adj/in` index.
 
 ### Prediction tables + context matrices — Shipped (GPU path simulated)
 
@@ -792,6 +795,23 @@ nodes are reused — keep automated runs to a few hundred edges.
   `selectPairBranch`; exercise prefix-sharing insert+get+delete cycles on **both** strides when
   touching [`database.go`](database.go) trie mutation or [`jump_store.go`](jump_store.go).
   **Status:** working, with randomized cross-stride coverage; regression risk stays high.
+
+<a id="pitfall-graph-direction"></a>
+### Pitfall: `GRAPH_QUERY` direction mirroring
+
+- **Symptom:** `MATCH (id='luna')<-[:owns]-(*)` returned `matches=0` at one hop while
+  `GRAPH_NEIGHBORS id=luna direction=in type=owns` returned the edge — and the *same* query with
+  `HOPS 1..2` worked, because only the single-hop path was wrong.
+- **Cause:** on `direction=in` the scan prefix is the target's `adj/in` index, so every returned edge
+  has `To == plan.Left.ID` and `From ==` the far endpoint. `executeGraphQuerySingleHop` mirrored
+  `rightIDFilter` and the right-hand node id but still matched `plan.Left` against `edge.From`, which
+  an ID-anchored left pattern can never satisfy.
+- **Safe pattern:** the `MATCH` patterns are **positional** (left = anchor, right = far endpoint) while
+  predicates are **edge-oriented** (`from.id`/`to.id` are the record's own fields). Any branch that
+  reads an endpoint must derive both from `plan.Direction` in one place:
+  `leftNodeID, rightNodeID := edge.From, edge.To` then swap when `direction == "in"`. Pinned by
+  [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](graph_test.go), which asserts the reverse
+  single hop equals the `GRAPH_NEIGHBORS direction=in` result.
 
 <a id="pitfall-cli-tcp-parity"></a>
 ### Pitfall: CLI/TCP command divergence
@@ -962,6 +982,7 @@ seen in old docs are **client-side**; the server does not read them.
 | `GRAPH_QUERY` parser rules | [`TestParseGraphQueryRules`](graph_test.go) |
 | Batch edge upsert (+ continue-on-error) | [`TestGraphEdgeSetBatchAndDegree`](graph_test.go), [`TestGraphEdgeSetBatchContinueOnError`](graph_test.go) |
 | Multi-hop bounds + cost limits | [`TestGraphQueryMultiHopBoundsAndCost`](graph_test.go) |
+| Reverse (`<-[:t]-`) single hop matches `direction=in` adjacency | [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](graph_test.go) |
 | Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](graph_test.go) |
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](graph_test.go) |
 | Graph-NELL demo eval/loader math (AUC/AP/P@K, models, split, loader) | [`TestRankingMetrics`/`TestBuildModels`/`TestLoadNELLEdges`/…](demo/graph-nell/main_test.go) |

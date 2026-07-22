@@ -873,12 +873,13 @@ func (db *Database) executeGraphQuerySingleHop(plan *graphQueryPlan) ([]GraphEdg
 				return false
 			}
 		}
-		if !db.graphMatchNodePattern(edge.From, plan.Left, nodeCache) {
-			return false
-		}
-		rightNodeID := edge.To
+		// Il pattern è posizionale: su `in` l'ancora è il `to` dell'arco.
+		leftNodeID, rightNodeID := edge.From, edge.To
 		if plan.Direction == "in" {
-			rightNodeID = edge.From
+			leftNodeID, rightNodeID = edge.To, edge.From
+		}
+		if !db.graphMatchNodePattern(leftNodeID, plan.Left, nodeCache) {
+			return false
 		}
 		if !db.graphMatchNodePattern(rightNodeID, plan.Right, nodeCache) {
 			return false
