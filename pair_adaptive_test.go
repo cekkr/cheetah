@@ -25,8 +25,7 @@ func newAdaptiveTestDBAt(t *testing.T, dir string, stride int, adaptive bool, li
 }
 
 // openAdaptiveTestDB opens without registering a cleanup close, for tests that
-// close and reopen the same directory themselves (Database.Close is not
-// idempotent: a second call panics inside FileManager.Close).
+// close and reopen the same directory themselves.
 func openAdaptiveTestDB(t *testing.T, dir string, stride int, adaptive bool, listMaxBytes int) *Database {
 	t.Helper()
 	cfg := DatabaseConfig{
@@ -96,10 +95,9 @@ func TestAdaptivePairListLifecycle(t *testing.T) {
 				}
 			}
 
-			// Delete a key that shares no prefix with its neighbours. (Deleting one
-			// of a prefix-sharing pair hits a pre-existing trie defect that is
-			// independent of the container format — see
-			// TestPreexistingJumpTerminalDefects.)
+			// Delete a key that shares no prefix with its neighbours. (Deleting
+			// one of a prefix-sharing pair is covered by
+			// TestJumpTerminalOverlaps and TestPairSetGetDeleteRoundTrip.)
 			if ok, err := db.deletePairValue([]byte("mango")); err != nil || !ok {
 				t.Fatalf("delete mango: ok=%v err=%v", ok, err)
 			}
@@ -134,10 +132,9 @@ func TestAdaptiveMatchesFixed(t *testing.T) {
 			for i := 0; i < 300; i++ {
 				keys = append(keys, fmt.Sprintf("K%c%c", byte(i/256), byte(i%256)))
 			}
-			// Prefix-free variable-length keys: bodies use 'a'-'z' and are closed
-			// with a 0xFF terminator, so no key is a strict prefix of another
-			// (which the trie cannot currently store — see
-			// TestPreexistingJumpTerminalDefects).
+			// Variable-length keys: bodies use 'a'-'z' and are closed with a 0xFF
+			// terminator. (Strict-prefix keys are storable now and covered by
+			// TestJumpTerminalOverlaps; here the point is comparing containers.)
 			r := rand.New(rand.NewSource(42))
 			for i := 0; i < 200; i++ {
 				n := 3 + r.Intn(6)

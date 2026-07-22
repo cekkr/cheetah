@@ -55,6 +55,10 @@ type Database struct {
 	reduceJobs         *reduceJobManager
 	predictJobs        *predictInheritJobManager
 	reducers           *ReducerRegistry
+	// closeOnce rende Close idempotente: spegnimento per segnale, EXIT dalla
+	// CLI e Engine.Close possono arrivare tutti sullo stesso database.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type pairTableCache struct {
@@ -426,8 +430,20 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 func (db *Database) Path() string { return db.path }
 func (db *Database) Name() string { return db.name }
 
-// Close chiude tutte le tabelle aperte per questo database.
+// Close chiude tabelle, file manager, prediction store e messenger di questo
+// database. È idempotente: le chiamate successive alla prima non fanno nulla e
+// restituiscono lo stesso errore.
 func (db *Database) Close() error {
+	if db == nil {
+		return nil
+	}
+	db.closeOnce.Do(func() {
+		db.closeErr = db.shutdown()
+	})
+	return db.closeErr
+}
+
+func (db *Database) shutdown() error {
 	var firstErr error
 	db.mainKeys.Close()
 	db.valuesTables.Range(func(key, value interface{}) bool {

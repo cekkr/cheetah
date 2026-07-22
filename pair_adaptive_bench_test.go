@@ -151,10 +151,9 @@ func TestAdaptivePairIndexBenchmark(t *testing.T) {
 //
 // The key set is deliberately prefix-free: variable-length bodies are drawn from
 // 'a'-'z' and closed with a 0xFF terminator that never appears in a body, and the
-// fan-out block is fixed width. Storing a key that is a strict prefix of another
-// currently fails in the trie itself ("offset beyond key length") independently of
-// the container format — see TestPreexistingJumpTerminalDefects — so a benchmark
-// workload must avoid it to measure storage behaviour rather than that defect.
+// fan-out block is fixed width. Strict-prefix keys are storable now (see
+// TestJumpTerminalOverlaps), but keeping them out of the benchmark keeps the two
+// containers comparing the same node shapes across runs.
 func buildBenchKeys(n int) []string {
 	seen := make(map[string]struct{}, n)
 	keys := make([]string, 0, n)

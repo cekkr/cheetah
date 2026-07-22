@@ -148,6 +148,7 @@ type FileManager struct {
 	limitCh       chan struct{}
 	limitStop     chan struct{}
 	limitWG       sync.WaitGroup
+	closeOnce     sync.Once
 }
 
 func NewFileManager(limit int, monitor *ResourceMonitor) *FileManager {
@@ -376,10 +377,16 @@ func (fm *FileManager) flushWorker() {
 	}
 }
 
+// Close drena la coda di flush e ferma i loop di servizio. È idempotente: i
+// canali di stop si chiudono una volta sola.
 func (fm *FileManager) Close() {
 	if fm == nil {
 		return
 	}
+	fm.closeOnce.Do(fm.closeInternal)
+}
+
+func (fm *FileManager) closeInternal() {
 	fm.ForceCheckpoint(FileCheckpointOptions{
 		DisableCache: true,
 		CloseHandles: true,

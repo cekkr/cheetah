@@ -84,10 +84,15 @@ func (e *Engine) DefaultDatabaseName() string {
 	return "default"
 }
 
-// Close chiude tutti i database gestiti dall'engine.
+// Close chiude tutti i database gestiti dall'engine. Il registro viene
+// svuotato, così una seconda Close non ha nulla da fare e una GetDatabase
+// successiva riapre da zero invece di restituire un handle chiuso.
 func (e *Engine) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if len(e.databases) == 0 {
+		return
+	}
 	logInfof("Closing all databases...")
 	for name, db := range e.databases {
 		if err := db.Close(); err != nil {
@@ -95,5 +100,6 @@ func (e *Engine) Close() {
 		} else {
 			logInfof("Database %s closed.", name)
 		}
+		delete(e.databases, name)
 	}
 }

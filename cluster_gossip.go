@@ -143,6 +143,9 @@ func (cm *ClusterMessenger) startHeartbeatLocked() {
 func (cm *ClusterMessenger) stopHeartbeatLocked() {
 	if cm.stopCh != nil {
 		close(cm.stopCh)
+		// Azzerato subito: Stop può arrivare più volte (spegnimento, EXIT,
+		// Engine.Close) e richiudere il canale sarebbe un panic.
+		cm.stopCh = nil
 	}
 	cm.wg.Wait()
 }

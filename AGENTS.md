@@ -46,9 +46,8 @@ mismatch within task scope, and update stale docs in the same change.
    [`studies/TODO_HIGH_PERFORMANCES_STATISTICS_IMPLEMENTATIONS.md`](studies/TODO_HIGH_PERFORMANCES_STATISTICS_IMPLEMENTATIONS.md)
    — design essays / research backlog. Aspirational; many TODOs are already done or belong to the
    Python client.
-7. [`NEXT_STEPS.md`](NEXT_STEPS.md) — the roadmap. **Partially stale**: multi-hop `GRAPH_QUERY`, graph
-   reducers, and edge-property indexes listed there are already implemented and tested. Treat it as
-   intent, verify against code.
+7. [`NEXT_STEPS.md`](NEXT_STEPS.md) — the roadmap, with a "Done" section that records what shipped
+   and how it was verified. Treat the open items as intent and verify against code.
 
 `AI_REFERENCE.md` is referenced by [`README.md`](README.md) and older notes but **is not present in
 this repository**. Do not link it; do not assume it exists.
@@ -248,6 +247,12 @@ Multi-tenant database registry. Lazily constructs and caches [`Database`](databa
 
 - **Key symbols:** `Engine`, `GetDatabase` (lazy create + cache), `ResetDatabase` (close + `RemoveAll`
   + drop from map), `SetDatabaseOverrides`, `DefaultDatabaseName`, `Close`.
+- **Shutdown is idempotent end to end.** `Engine.Close` empties the registry, so a second call does
+  nothing and a later `GetDatabase` reopens instead of handing back a closed handle;
+  `Database.Close` is guarded by a `sync.Once` (it returns the first call's error), and so are
+  `FileManager.Close` and `ClusterMessenger.Stop`, whose stop channels used to be closed twice.
+  Signal shutdown, CLI `EXIT` and `Engine.Close` all land on the same handles, so keep any new
+  shutdown path safe to call twice.
 - **Common mistakes:** `ResetDatabase` deletes the directory on disk; callers must re-`GetDatabase`
   afterward (the front-ends do). It only resets one named database, never the whole data dir.
 
@@ -586,6 +591,12 @@ a real payload because `PAIR_SUMMARY` reads value sizes, and `overlappingWords`.
 and `forceCloseHandle` in parallel on one `ManagedFile`, in a cache-disabled (`direct`) and a
 cache-enabled (`cached`) variant. Run it with `-race`: `direct` fails without the `handleMu`
 protection of `ManagedFile.file`, `cached` without the per-`sectorEntry` `dataMu`.
+
+#### [`lifecycle_test.go`](lifecycle_test.go)
+
+Shutdown lifecycle: `TestDatabaseCloseIsIdempotent` (three consecutive `Close` calls) and
+`TestEngineCloseIsIdempotent` (double `Engine.Close`, then a `GetDatabase` that must reopen and still
+read its data). Both panicked with "close of closed channel" before the stop channels were guarded.
 
 #### [`benchmark_test.go`](benchmark_test.go)
 
@@ -945,6 +956,7 @@ seen in old docs are **client-side**; the server does not read them.
 | `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](pair_scan_test.go) |
 | Cursor pagination returns every key once, any page size | [`TestPairScanCursorPagination`](pair_scan_test.go) |
 | `ManagedFile` handle + sector-cache lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](file_manager_test.go) |
+| Repeated shutdown: `Database.Close` / `Engine.Close` are idempotent | [`TestDatabaseCloseIsIdempotent`](lifecycle_test.go), [`TestEngineCloseIsIdempotent`](lifecycle_test.go) |
 | Throughput / concurrency under load | [`TestCheetahDBBenchmark`](benchmark_test.go) (gated by `CHEETAHDB_BENCH=1`) |
 | Graph edge lifecycle + query | [`TestGraphEdgeLifecycleAndQuery`](graph_test.go) |
 | `GRAPH_QUERY` parser rules | [`TestParseGraphQueryRules`](graph_test.go) |
@@ -1013,21 +1025,18 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 ### Known gaps
 
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
-  ([`cluster_scheduler.go`](cluster_scheduler.go) `load`). Matches [`NEXT_STEPS.md`](NEXT_STEPS.md) #1.
+  ([`cluster_scheduler.go`](cluster_scheduler.go) `load`). First open item in
+  [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the
   server does not implement (see [pitfall](#pitfall-doc-command-drift)).
 - **Missing `AI_REFERENCE.md`** — referenced by README/notes but absent here.
-- **Thin tests** for trie mutation, prediction, cluster, and caches (see test gaps above).
-- **`Database.Close` is not idempotent** — a second call panics inside `FileManager.Close`.
+- **Thin tests** for prediction, cluster, and the payload cache (see test gaps above).
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))
 
 1. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
 2. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
 3. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.
-
-Items in `NEXT_STEPS.md` about multi-hop `GRAPH_QUERY`, graph reducers, and edge-property indexes are
-**already implemented and tested** — treat them as done when reading that file.
 
 ---
 
