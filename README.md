@@ -214,7 +214,9 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
   can auto-tune `CHEETAH_PAYLOAD_CACHE_*` or skip caching multi-megabyte payloads that would churn.
 - `LOG_FLUSH` returns the most recent log lines captured by the server (default ring buffer depth:
   256 entries) and clears the buffer. Pass a numeric limit to trim the output without truncating the
-  stored log metadata.
+  stored log metadata. Like every other command it answers on a **single line**: the entries come back
+  as `payload=<base64>` decoding to a JSON array of strings (`SUCCESS,count=0` when the buffer is
+  empty), so a line-oriented client stays in sync.
 
 ## Command Walkthroughs
 

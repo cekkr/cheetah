@@ -167,6 +167,11 @@ because they mutate per-connection "current database" state.
   owns sector caching, the shared flush queue, fd-limit eviction, and checkpoints. Do not open those
   `.table` files with raw `os` calls; you would bypass dirty-sector flushing and the fd cap. Shutdown
   and [`FILE_CHECKPOINT`](database.go) drain this layer.
+- **Every command answers on exactly one line.** The protocol is newline-delimited, so a multi-line
+  response shifts every later answer on that connection. `LOG_FLUSH` used to break this and now
+  returns its entries as a base64 JSON array in `payload=` (`formatLogFlushResponse` in
+  [`database.go`](database.go), pinned by [`logger_test.go`](logger_test.go)); any new command with
+  list-shaped output must do the same rather than emitting `\n`.
 - **Reducers are registered, not hard-coded.** Add new `PAIR_REDUCE` modes in
   [`registerDefaultReducers`](reducers.go); the dispatcher resolves them by name. Do not extend the
   `ExecuteCommand` switch per reducer.
@@ -566,7 +571,9 @@ Leveled logging with an in-memory ring buffer feeding `LOG_FLUSH`.
 - **Key symbols:** `LogLevel`, `parseLogLevel` (`CHEETAH_LOG_LEVEL`), `LogBuffer` (ring, `Flush`),
   `logErrorf`/`logInfof`/`logVerbosef`, package `logSink`.
 - **Common mistakes:** verbose (level 3) logging summarizes args/responses to avoid dumping payloads;
-  keep new log calls at the right level so hot paths stay quiet by default.
+  keep new log calls at the right level so hot paths stay quiet by default. The `LOG_FLUSH` response
+  itself is formatted in [`database.go`](database.go) (`formatLogFlushResponse`), **not** here, and
+  must stay on one line — entries travel as a base64 JSON array.
 
 ### Tests
 
@@ -987,6 +994,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Batch edge upsert (+ continue-on-error) | [`TestGraphEdgeSetBatchAndDegree`](graph_test.go), [`TestGraphEdgeSetBatchContinueOnError`](graph_test.go) |
 | Multi-hop bounds + cost limits | [`TestGraphQueryMultiHopBoundsAndCost`](graph_test.go) |
 | Reverse (`<-[:t]-`) single hop matches `direction=in` adjacency | [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](graph_test.go) |
+| `LOG_FLUSH` answers on one line and leaves the next response aligned | [`TestLogFlush*`](logger_test.go) |
 | Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](graph_test.go) |
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](graph_test.go) |
 | Graph-NELL demo eval/loader math (AUC/AP/P@K, models, split, loader) | [`TestRankingMetrics`/`TestBuildModels`/`TestLoadNELLEdges`/…](demo/graph-nell/main_test.go) |
@@ -1054,12 +1062,6 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the
   server does not implement (see [pitfall](#pitfall-doc-command-drift)).
-- **`LOG_FLUSH` breaks the one-line response contract** — `formatLogFlushResponse`
-  ([`logger.go`](logger.go)) appends one `\n`-separated line per entry after `SUCCESS,count=<n>`, so a
-  line-oriented TCP client reads the next command's answer off by `n` lines and stays desynchronized
-  for the rest of the connection. Verified: `LOG_FLUSH 3` then `GRAPH_DEGREE …` returns
-  `[1] … [INFO] Connection closed …` as the degree response. Either encode the entries on one line
-  (base64/escaped) or make the CLI the only front-end that expands them.
 - **Thin tests** for prediction, cluster, and the payload cache (see test gaps above).
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))

@@ -3031,16 +3031,23 @@ func formatPairSummaryResponse(res *PairSummaryResult) string {
 	return b.String()
 }
 
+// formatLogFlushResponse rispetta il contratto "una riga per comando": le voci
+// viaggiano in un payload base64 (array JSON di stringhe) come per i comandi GRAPH_*.
+// Un blocco multi-riga qui desincronizza ogni client TCP orientato alle righe: la
+// risposta del comando successivo verrebbe letta con n righe di sfasamento.
 func formatLogFlushResponse(entries []string) string {
 	if len(entries) == 0 {
 		return "SUCCESS,count=0"
 	}
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("SUCCESS,count=%d", len(entries)))
-	for idx, entry := range entries {
-		b.WriteString(fmt.Sprintf("\n[%d] %s", idx+1, entry))
+	encoded, err := json.Marshal(entries)
+	if err != nil {
+		return fmt.Sprintf("ERROR,log_flush_encode_failed:%v", err)
 	}
-	return b.String()
+	return fmt.Sprintf(
+		"SUCCESS,count=%d,payload=%s",
+		len(entries),
+		base64.StdEncoding.EncodeToString(encoded),
+	)
 }
 
 func parseFileCheckpointArgs(raw string) (FileCheckpointOptions, error) {
