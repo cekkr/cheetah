@@ -1,7 +1,7 @@
 # TODO: High-performance Statistics Implementations
 
 ## Scope
-- Evaluate the cheetah-db features listed in `AI_REFERENCE.md` with a focus on high-throughput statistical workloads **and** the data products that live inside each namespace (counts, rolling hashes, continuation totals, etc.).
+- Evaluate the cheetah-db features listed in `AGENTS.md` with a focus on high-throughput statistical workloads **and** the data products that live inside each namespace (counts, rolling hashes, continuation totals, etc.).
 - Mirror the README guidance around tree indexing so data-centric statistics (e.g., `char_tree_similarity.py` style substring filters) can be reused by other runtimes.
 - Describe how the Go implementation plus the Python `src/db_slm` adapters should evolve (new commands, optional arguments) so typical statistical queries become one-shot server calls instead of bespoke loops.
 - Capture TODOs that keep the statistical path fast (counts, probabilities, continuations, Top-K slices, context relativism) when reused beyond this repo.
@@ -26,7 +26,7 @@
 - TODO: export `RecommendedWorkers` as part of the `SYSTEM_STATS` payload so Python can request batched reducers sized to the current worker pool instead of hard-coding `DEFAULT_REDUCE_PAGE_SIZE`.
 
 ### 3. Statistical reducers for counts/probabilities/continuations
-- The reducer pipeline mirrors `cnt:`, `prob:`, and `cont:` namespaces and walks them via the same pair trie (`AI_REFERENCE.md`, `database.go:705-873`). Each entry carries a base64 payload housing the serialized statistics so consumers can reconstruct totals without extra lookups.
+- The reducer pipeline mirrors `cnt:`, `prob:`, and `cont:` namespaces and walks them via the same pair trie (`AGENTS.md`, `database.go:705-873`). Each entry carries a base64 payload housing the serialized statistics so consumers can reconstruct totals without extra lookups.
 - The Python adapter wraps these into `iter_counts`, `iter_probabilities`, and `iter_continuations` (`src/db_slm/adapters/cheetah.py:960-1105`), producing structured `Raw*Projection` objects. Any other program can follow the same namespace convention: `<kind>:<order_or_tag>:<context_hash>`.
 - TODO: add streaming/iterator APIs on the Go side that return decoded structs (e.g., JSON) when `CHEETAH_JSON_STATS=1` for languages that prefer not to embed the serializer used by Python.
 
