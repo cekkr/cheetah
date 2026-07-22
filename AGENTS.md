@@ -35,8 +35,7 @@ mismatch within task scope, and update stale docs in the same change.
    [`benchmark_test.go`](benchmark_test.go) assert the pieces they cover.
 3. [`config.example.ini`](config.example.ini) — the authoritative shape of `config.ini` settings.
 4. [`README.md`](README.md) — operator/user guide. High-signal but partially stale: it documents
-   `RECYCLE` and a standalone TCP `CURSOR` command that the dispatcher does **not** implement, and it
-   references a `cheetah-db/` subdir and an `AGENTS.md` file that **do not exist here**. Verify
+   `RECYCLE` and a standalone TCP `CURSOR` command that the dispatcher does **not** implement. Verify
    commands against [`ExecuteCommand`](database.go) before trusting them.
 5. [`CONCEPTS.md`](CONCEPTS.md) — original design intent and the context-relativism / reducer payload
    contracts. Written from the parent project's perspective; the `ctx:`/`ctxv:`/`cnt:`/`prob:` layouts
@@ -45,12 +44,16 @@ mismatch within task scope, and update stale docs in the same change.
 6. [`studies/author_notes.md`](studies/author_notes.md),
    [`studies/TODO_HIGH_PERFORMANCES_STATISTICS_IMPLEMENTATIONS.md`](studies/TODO_HIGH_PERFORMANCES_STATISTICS_IMPLEMENTATIONS.md)
    — design essays / research backlog. Aspirational; many TODOs are already done or belong to the
-   Python client.
+   Python client. [`studies/GRAPH_LLM.md`](studies/GRAPH_LLM.md) is the exception in that directory:
+   it documents the LLM↔Cheetah learn/recall loop (memory tiers, teach/recall paths, `PREDICT_*`
+   routing, adapter contract) from transcripts captured against this revision, so treat it as
+   verified guidance rather than intent.
 7. [`NEXT_STEPS.md`](NEXT_STEPS.md) — the roadmap, with a "Done" section that records what shipped
    and how it was verified. Treat the open items as intent and verify against code.
 
-`AGENTS.md` is referenced by [`README.md`](README.md) and older notes but **is not present in
-this repository**. Do not link it; do not assume it exists.
+This file was previously named `AI_REFERENCE.md` (renamed in `168f67e`). External notes and the
+parent monorepo may still refer to it under that name, or as `cheetah-db/AI_REFERENCE.md` — the
+handbook here is `AGENTS.md`, and [`README.md`](README.md) links it as such.
 
 ---
 
@@ -749,13 +752,14 @@ nodes are reused — keep automated runs to a few hundred edges.
 <a id="pitfall-vestigial-references"></a>
 ### Pitfall: vestigial parent-monorepo references
 
-- **Symptom / wrong assumption:** docs mention `cd cheetah-db`, `AGENTS.md`, `src/train.py`,
-  `src/helpers/char_tree_similarity.py`, `DBSLM_BACKEND`, or SQLite fallback — an agent assumes those
-  exist here and wastes time looking.
+- **Symptom / wrong assumption:** docs mention `cd cheetah-db`, `cheetah-db/AGENTS.md` (or its old
+  name `AI_REFERENCE.md`), `src/train.py`, `src/helpers/char_tree_similarity.py`, `DBSLM_BACKEND`, or
+  SQLite fallback — an agent assumes those paths exist here and wastes time looking.
 - **Cause:** this repo was extracted from a `cheetah-db/` subdirectory of a Python project; prose docs
-  ([`README.md`](README.md), [`CONCEPTS.md`](CONCEPTS.md), `studies/*`) still speak from that vantage.
+  ([`CONCEPTS.md`](CONCEPTS.md), `studies/*`) still speak from that vantage.
 - **Safe pattern:** treat all Python/SQLite/`DBSLM_*`/`cheetah-db/`-subpath references as an external
-  client. The server here is the whole product; there is no nested `cheetah-db/` and no `AGENTS.md`.
+  client. The server here is the whole product; there is no nested `cheetah-db/`, and a
+  `cheetah-db/AGENTS.md` path in those notes means *this* file at the repository root.
 
 <a id="pitfall-doc-command-drift"></a>
 ### Pitfall: documented commands that don't exist
@@ -1050,7 +1054,12 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the
   server does not implement (see [pitfall](#pitfall-doc-command-drift)).
-- **Missing `AGENTS.md`** — referenced by README/notes but absent here.
+- **`LOG_FLUSH` breaks the one-line response contract** — `formatLogFlushResponse`
+  ([`logger.go`](logger.go)) appends one `\n`-separated line per entry after `SUCCESS,count=<n>`, so a
+  line-oriented TCP client reads the next command's answer off by `n` lines and stays desynchronized
+  for the rest of the connection. Verified: `LOG_FLUSH 3` then `GRAPH_DEGREE …` returns
+  `[1] … [INFO] Connection closed …` as the degree response. Either encode the entries on one line
+  (base64/escaped) or make the CLI the only front-end that expands them.
 - **Thin tests** for prediction, cluster, and the payload cache (see test gaps above).
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))

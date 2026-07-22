@@ -414,7 +414,8 @@ without hydrating edge payloads.
 ### Pattern queries — `GRAPH_QUERY`
 
 ```text
-GRAPH_QUERY MATCH (<left>)-[:<type|*>]->(<right>)
+GRAPH_QUERY MATCH (<left>)-[:<type|*>]->(<right>)     # follow out-edges of <left>
+GRAPH_QUERY MATCH (<left>)<-[:<type|*>]-(<right>)     # follow in-edges of <left>
   [WHERE <predicate> [AND <predicate> ...]]
   [HOPS <max> | <min>..<max>]      # default 1..1
   [BRANCH_LIMIT <n>]               # fan-out cap per hop (default 128)
@@ -427,6 +428,11 @@ GRAPH_QUERY MATCH (<left>)-[:<type|*>]->(<right>)
 - **Node patterns** are `*` (wildcard) or `id='value'`, optionally narrowed with `label='value'`
   (e.g. `(id='alice',label='person')`). The **left node must be ID-anchored** — wildcard-left queries
   are rejected so execution stays index-backed.
+- **Both arrow directions are supported and both anchor on the left node.** `-[:t]->` walks the
+  `adj/out` index, `<-[:t]-` walks `adj/in`; in either case the left pattern constrains the anchor and
+  the right pattern constrains the far endpoint. Predicates stay edge-oriented regardless of arrow:
+  `from.id`/`to.id` always mean the edge's own `from`/`to` fields, so in a reverse query the anchor is
+  `to.id`.
 - **Predicates** read `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, `edge.weight`, and
   `edge.props.<key>` with operators `= != >= <= > <`. An `edge.props.<key> = <literal>` equality is
   served straight from the `graph/idx/` secondary index.
@@ -454,7 +460,488 @@ argument grammar of every command above, the source of truth is the `handleGraph
 [`graph.go`](graph.go) (routed from `ExecuteCommand` in [`database.go`](database.go)) — this section
 documents that behavior, not a separate spec. A runnable, end-to-end example of the whole language
 (ingest → adjacency → query → predict over TCP) lives in
-[`demo/graph-nell/`](demo/graph-nell/README.md).
+[`demo/graph-nell/`](demo/graph-nell/README.md). For worked examples of turning natural-language
+sentences into these commands (and back into answers), see
+[Sentences → Graph → Answers](#sentences--graph--answers-llm-recipes).
+
+## Sentences → Graph → Answers (LLM Recipes)
+
+The graph language is meant to be driven by a model, in two directions:
+
+- **Writing** — a *statement* becomes nodes and edges (`GRAPH_NODE_SET` / `GRAPH_EDGE_SET`).
+- **Reading** — a *question or wish* becomes an **intent** plus a query plan
+  (`GRAPH_NODE_GET` / `GRAPH_NEIGHBORS` / `GRAPH_NEIGHBOR_TYPES` / `GRAPH_QUERY`).
+
+Every transcript below was captured from a fresh database; long `payload=` blobs are abbreviated and
+shown decoded on the following comment line.
+
+### The mapping contract
+
+| Sentence part | Graph object | Rationale |
+| --- | --- | --- |
+| Entity — "my cat", "Acme" | node, id `type:slug` | ids are opaque bytes; a `type:` prefix keeps namespaces scannable |
+| Kind / class — "is a cat", "a person" | `labels=animal,cat` | labels filter (`label='person'`), they never carry values |
+| Attribute you will never query on its own — "named Luna", "female" | `props={...}` on the node | cheap to read back with the node, no extra hop |
+| Attribute you *will* query or join — "siamese", "cute", "gluten-free" | its own node + a typed edge | reachable from both ends: "which of my pets are sweet?" starts at `trait:sweet` |
+| Relation — "owns", "works at", "reports to" | edge `type=` (snake_case verb) | edge types are the traversal alphabet; keep them few and stable |
+| Hedge / intensity — "may be", "very", "I think" | `weight=` (0–1 confidence) **+** `props={"modality":...}` | keeps the edge *type* stable so one query shape finds certain and uncertain facts |
+| Disjunction — "either A or B, I forget" | one edge per alternative sharing `props.oneof`, weights summing to ~1 | see [uncertainty](#recording-uncertainty-alternatives-and-corrections); the engine has no `OR`, so alternatives are data |
+| Time / provenance — "since 2019", "she told me" | edge `props` (`since`, `source`) | indexed for `WHERE edge.props.<k> = <v>` equality |
+| Wish / question — "I would like…" | `intent:` node + `wants` / `about` edges | the question itself becomes a fact you can answer, revisit, and close |
+
+Rule of thumb: **if a later question could start from it, it is a node.** Everything else is a prop.
+
+### Writing a sentence
+
+> *"My cat is a female siamese, very cute and sweet. But she may be sterile."*
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=person:owner labels=person props={"role":"speaker"}
+SUCCESS,node_set,id=person:owner
+[cheetah_data/default]> GRAPH_NODE_SET id=cat:luna labels=animal,cat props={"name":"Luna","sex":"female"}
+SUCCESS,node_set,id=cat:luna
+[cheetah_data/default]> GRAPH_NODE_SET id=breed:siamese labels=breed
+SUCCESS,node_set,id=breed:siamese
+[cheetah_data/default]> GRAPH_NODE_SET id=trait:cute labels=trait
+SUCCESS,node_set,id=trait:cute
+[cheetah_data/default]> GRAPH_NODE_SET id=trait:sweet labels=trait
+SUCCESS,node_set,id=trait:sweet
+[cheetah_data/default]> GRAPH_NODE_SET id=condition:sterile labels=condition,fertility
+SUCCESS,node_set,id=condition:sterile
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:owner to=cat:luna type=owns weight=1.0
+SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8b3duc3xjYXQ6bHVuYQ
+[cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=breed:siamese type=has_breed weight=1.0 props={"source":"owner_statement"}
+SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfYnJlZWR8YnJlZWQ6c2lhbWVzZQ
+[cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=trait:cute type=has_trait weight=0.9 props={"intensity":"very"}
+SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfdHJhaXR8dHJhaXQ6Y3V0ZQ
+[cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=trait:sweet type=has_trait weight=0.9
+SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfdHJhaXR8dHJhaXQ6c3dlZXQ
+[cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition weight=0.4 props={"modality":"possible","verified":false}
+SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
+```
+
+Read it back — the node carries the descriptive facts, the relation histogram carries the shape:
+
+```text
+[cheetah_data/default]> GRAPH_NODE_GET id=cat:luna
+SUCCESS,id=cat:luna,payload=<base64>
+# decodes to: {"id":"cat:luna","labels":["animal","cat"],"props":{"name":"Luna","sex":"female"},"created_at":…,"updated_at":…}
+
+[cheetah_data/default]> GRAPH_NEIGHBOR_TYPES id=cat:luna direction=out limit=16 weighted=1
+SUCCESS,count=3,next_cursor=*,payload=<base64>
+# decodes to: [{"type":"has_trait","count":2,"weighted":1.8},{"type":"has_breed","count":1,"weighted":1},{"type":"has_condition","count":1,"weighted":0.4}]
+```
+
+Why it is modeled this way:
+
+- **"may be sterile" is not a new edge type.** It is `has_condition` with `weight=0.4` and
+  `props={"modality":"possible","verified":false}`. A hedge-specific type (`may_have_condition`) would
+  force every later query to know the whole family of names; confidence in the weight keeps one query
+  shape — and because traversal cost is `1/weight`, `COST_LIMIT` naturally prunes shaky facts first.
+- **Traits and breeds are nodes, not props**, so the reverse question ("which of my animals are
+  sweet?") is a prefix scan from `trait:sweet` instead of a full scan of every node's props.
+- **The speaker is a node too** (`person:owner`), so possessives ("my cat") resolve to an edge rather
+  than being lost.
+- **`GRAPH_NODE_SET` upserts**: re-asserting the same sentence later keeps `created_at`, and omitting
+  `labels=`/`props=` preserves the stored ones instead of blanking them.
+
+### Reading a sentence
+
+> *"I would like to have a litter for my cat."*
+
+**Step 1 — record the intent.** A wish is a fact about the speaker; storing it makes the answer
+revisitable and lets a later turn ask "what was I trying to do?".
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=intent:breed_litter labels=intent props={"goal":"litter","status":"open"}
+SUCCESS,node_set,id=intent:breed_litter
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:owner to=intent:breed_litter type=wants weight=0.8
+SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8d2FudHN8aW50ZW50OmJyZWVkX2xpdHRlcg
+[cheetah_data/default]> GRAPH_EDGE_SET from=intent:breed_litter to=cat:luna type=about weight=1.0
+SUCCESS,edge_set,id=MXxpbnRlbnQ6YnJlZWRfbGl0dGVyfGFib3V0fGNhdDpsdW5h
+```
+
+**Step 2 — resolve the anchor.** "my cat" → the `owns` edge out of `person:owner`, i.e. `cat:luna`.
+Every retrieval starts from an ID-anchored node.
+
+**Step 3 — ask what is known, cheaply first.** `GRAPH_NEIGHBOR_TYPES` (above) is a histogram, not a
+hydration: it tells the model *that* a `has_condition` edge exists before paying to read it.
+
+**Step 4 — test the blockers the intent implies.** "Litter" needs a fertile female, so query
+fertility, filtering out facts too weak to act on:
+
+```text
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.weight >= 0.3 RETURN edges LIMIT 8
+SUCCESS,return=edges,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"id":"MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl","from":"cat:luna","to":"condition:sterile","type":"has_condition","directed":true,"weight":0.4,"props":{"modality":"possible","verified":false},…}]
+
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.props.verified = false RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"cat:luna","type":"has_condition","to":"condition:sterile","weight":0.4}]
+
+[cheetah_data/default]> GRAPH_NEIGHBORS id=cat:luna direction=in type=owns limit=8
+SUCCESS,count=1,next_cursor=*,payload=<base64>
+# decodes to: [{"id":"MXxwZXJzb246b3duZXJ8b3duc3xjYXQ6bHVuYQ","from":"person:owner","to":"cat:luna","type":"owns",…}]
+```
+
+**Step 5 — answer from rows, then write back the conclusion.** Every clause of the reply is backed by
+a returned row: *Luna is a female siamese (node props + `has_breed`), so a litter is biologically on
+the table; the one blocker on record is a **possible, unverified** sterility (confidence 0.4), so the
+next step is a vet fertility check.* That conclusion belongs in the graph:
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=action:vet_fertility_check labels=action props={"priority":"high"}
+SUCCESS,node_set,id=action:vet_fertility_check
+[cheetah_data/default]> GRAPH_EDGE_SET from=intent:breed_litter to=condition:sterile type=blocked_by weight=0.4
+SUCCESS,edge_set,id=MXxpbnRlbnQ6YnJlZWRfbGl0dGVyfGJsb2NrZWRfYnl8Y29uZGl0aW9uOnN0ZXJpbGU
+[cheetah_data/default]> GRAPH_EDGE_SET from=intent:breed_litter to=action:vet_fertility_check type=requires weight=0.9
+SUCCESS,edge_set,id=MXxpbnRlbnQ6YnJlZWRfbGl0dGVyfHJlcXVpcmVzfGFjdGlvbjp2ZXRfZmVydGlsaXR5X2NoZWNr
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='intent:breed_litter')-[:*]->(*) RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=3,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"intent:breed_litter","type":"about","to":"cat:luna","weight":1},
+#              {"from":"intent:breed_litter","type":"blocked_by","to":"condition:sterile","weight":0.4},
+#              {"from":"intent:breed_litter","type":"requires","to":"action:vet_fertility_check","weight":0.9}]
+```
+
+The intent node is now a small plan: what it is about, what blocks it, what would unblock it. When the
+vet answers, flip `verified` on the `has_condition` edge (upsert) and set the intent's `status`.
+
+### Two more pairs
+
+> **Write:** *"Marco joined Acme's Berlin office in 2019 and reports to Elena; Elena reports to Dana."*
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=person:marco labels=person props={"name":"Marco"}
+SUCCESS,node_set,id=person:marco
+[cheetah_data/default]> GRAPH_NODE_SET id=person:elena labels=person props={"name":"Elena"}
+SUCCESS,node_set,id=person:elena
+[cheetah_data/default]> GRAPH_NODE_SET id=person:dana labels=person props={"name":"Dana","title":"cfo"}
+SUCCESS,node_set,id=person:dana
+[cheetah_data/default]> GRAPH_NODE_SET id=org:acme labels=org
+SUCCESS,node_set,id=org:acme
+[cheetah_data/default]> GRAPH_NODE_SET id=city:berlin labels=city,place
+SUCCESS,node_set,id=city:berlin
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=org:acme type=works_at weight=1.0 props={"since":2019,"office":"berlin"}
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298d29ya3NfYXR8b3JnOmFjbWU
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=person:elena type=reports_to weight=1.0
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298cmVwb3J0c190b3xwZXJzb246ZWxlbmE
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:elena to=person:dana type=reports_to weight=1.0
+SUCCESS,edge_set,id=MXxwZXJzb246ZWxlbmF8cmVwb3J0c190b3xwZXJzb246ZGFuYQ
+[cheetah_data/default]> GRAPH_EDGE_SET from=org:acme to=city:berlin type=located_in weight=1.0
+SUCCESS,edge_set,id=MXxvcmc6YWNtZXxsb2NhdGVkX2lufGNpdHk6YmVybGlu
+```
+
+> **Read:** *"Who ends up approving Marco's expense report?"* → intent = walk the reporting chain
+> upward, so the shape is multi-hop over one edge type:
+
+```text
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:reports_to]->(*) HOPS 1..3 RETURN paths LIMIT 16
+SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","type":"reports_to","to":"person:elena","weight":1},
+#              {"from":"person:elena","type":"reports_to","to":"person:dana","weight":1}]
+```
+
+> **Read:** *"Who works in the Berlin office?"* → the fact lives on the edge, so filter on edge props
+> (served by the `graph/idx/` secondary index), or turn the question around and scan in-edges:
+
+```text
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:works_at]->(*) WHERE edge.props.office = 'berlin' RETURN edges LIMIT 8
+SUCCESS,return=edges,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","to":"org:acme","type":"works_at","weight":1,"props":{"office":"berlin","since":2019},…}]
+
+[cheetah_data/default]> GRAPH_NEIGHBORS id=org:acme direction=in type=works_at limit=8
+SUCCESS,count=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","to":"org:acme","type":"works_at","weight":1,"props":{"office":"berlin","since":2019},…}]
+```
+
+> "How is Marco connected at all?" is the open-ended version — wildcard type, bounded fan-out:
+
+```text
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:*]->(*) HOPS 1..2 BRANCH_LIMIT 8 COST_LIMIT 5 RETURN paths LIMIT 16
+SUCCESS,return=paths,matches=4,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","type":"reports_to","to":"person:elena","weight":1},
+#              {"from":"person:marco","type":"works_at","to":"org:acme","weight":1},
+#              {"from":"org:acme","type":"located_in","to":"city:berlin","weight":1},
+#              {"from":"person:elena","type":"reports_to","to":"person:dana","weight":1}]
+```
+
+> **Write:** *"My friend Sara Q. moved to Lisbon in 2025 and is strictly gluten-free — she's celiac."*
+> Props containing spaces must be base64-encoded JSON (see the failure modes below):
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=person:sara labels=friend,person props=eyJuYW1lIjoiU2FyYSBRIiwibm90ZSI6Im1ldCBpbiAyMDE5In0=
+SUCCESS,node_set,id=person:sara
+[cheetah_data/default]> GRAPH_NODE_SET id=city:lisbon labels=city,place
+SUCCESS,node_set,id=city:lisbon
+[cheetah_data/default]> GRAPH_NODE_SET id=diet:gluten_free labels=constraint,diet
+SUCCESS,node_set,id=diet:gluten_free
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:sara to=city:lisbon type=lives_in weight=1.0 props={"since":2025}
+SUCCESS,edge_set,id=MXxwZXJzb246c2FyYXxsaXZlc19pbnxjaXR5Omxpc2Jvbg
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:sara to=diet:gluten_free type=follows_diet weight=1.0 props=eyJzdHJpY3QiOnRydWUsInJlYXNvbiI6ImNlbGlhYyBkaXNlYXNlIn0=
+SUCCESS,edge_set,id=MXxwZXJzb246c2FyYXxmb2xsb3dzX2RpZXR8ZGlldDpnbHV0ZW5fZnJlZQ
+```
+
+> **Read:** *"Where should we have dinner when I visit Sara?"* → intent = collect the constraints that
+> bind a plan (place + diet) in one wildcard hop, then check strictness and who else shares it:
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=intent:plan_dinner labels=intent props={"with":"person:sara","status":"open"}
+SUCCESS,node_set,id=intent:plan_dinner
+[cheetah_data/default]> GRAPH_EDGE_SET from=intent:plan_dinner to=person:sara type=about weight=1.0
+SUCCESS,edge_set,id=MXxpbnRlbnQ6cGxhbl9kaW5uZXJ8YWJvdXR8cGVyc29uOnNhcmE
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:sara')-[:*]->(*) RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:sara","type":"follows_diet","to":"diet:gluten_free","weight":1},
+#              {"from":"person:sara","type":"lives_in","to":"city:lisbon","weight":1}]
+
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:sara')-[:follows_diet]->(*) WHERE edge.props.strict = true RETURN edges LIMIT 4
+SUCCESS,return=edges,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:sara","to":"diet:gluten_free","type":"follows_diet","weight":1,"props":{"reason":"celiac disease","strict":true},…}]
+
+[cheetah_data/default]> GRAPH_NEIGHBORS id=diet:gluten_free direction=in type=follows_diet limit=8
+SUCCESS,count=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:sara","to":"diet:gluten_free","type":"follows_diet","weight":1,"props":{"reason":"celiac disease","strict":true},…}]
+```
+
+Answer: *Lisbon, and it must be strictly gluten-free (celiac) — not a preference.*
+
+### Recording uncertainty, alternatives and corrections
+
+The command surface looks absolute — an edge either exists or it does not — but three channels carry
+uncertainty, and a model should use all three deliberately:
+
+1. **`weight`** — how sure you are (0–1). It is also the traversal cost (`1/weight`), so shaky facts
+   are the first thing `COST_LIMIT` prunes and the last thing a ranked walk expands.
+2. **`props`** — *why* you are unsure: `modality`, `verified`, `source`, `as_of`, `ruled_out`.
+   Equality on these is served by the `graph/idx/` secondary index, so they are filters, not just
+   annotations.
+3. **Shape** — mutually exclusive readings become *several edges tied together*, not one fuzzy edge.
+
+Take a sentence with no single truth in it:
+
+> *"Marco likes either the color light blue or aquamarine, I don't remember."*
+
+Write **both** alternatives, each with half the confidence, tagged with a shared group id:
+
+```text
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:light_blue type=likes weight=0.5 props={"oneof":"marco_fav_color","modality":"uncertain","verified":false}
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6bGlnaHRfYmx1ZQ
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:aquamarine type=likes weight=0.5 props={"oneof":"marco_fav_color","modality":"uncertain","verified":false}
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6YXF1YW1hcmluZQ
+```
+
+The convention (a *client* contract — the engine assigns no meaning to it) is: **weights inside one
+`oneof` group sum to ~1.0**. That makes the three questions a model actually asks all answerable with
+the same query shape:
+
+```text
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":0.5},
+#              {"from":"person:marco","type":"likes","to":"color:light_blue","weight":0.5}]
+# → "one of these two, and I genuinely don't know which"
+
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.weight >= 0.8 RETURN count
+SUCCESS,return=count,matches=0,next_cursor=*
+# → "nothing I'd assert about Marco's colors" — absence of a confident row is itself the answer
+
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:*]->(*) WHERE edge.props.oneof = 'marco_fav_color' RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":0.5},
+#              {"from":"person:marco","type":"likes","to":"color:light_blue","weight":0.5}]
+# → the alternative set as a unit, index-served
+```
+
+**When the open question itself matters**, promote the group to a `hypothesis:` node so it can carry
+status and be *found* later — otherwise an unresolved doubt is only reachable if you already know
+which entity to ask about:
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=hypothesis:marco_fav_color labels=hypothesis props={"question":"favourite_color","status":"open"}
+SUCCESS,node_set,id=hypothesis:marco_fav_color
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:owner to=hypothesis:marco_fav_color type=unsure_about weight=1.0
+SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8dW5zdXJlX2Fib3V0fGh5cG90aGVzaXM6bWFyY29fZmF2X2NvbG9y
+[cheetah_data/default]> GRAPH_EDGE_SET from=hypothesis:marco_fav_color to=person:marco type=about weight=1.0
+SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOm1hcmNvX2Zhdl9jb2xvcnxhYm91dHxwZXJzb246bWFyY28
+[cheetah_data/default]> GRAPH_EDGE_SET from=hypothesis:marco_fav_color to=color:light_blue type=alternative weight=0.5
+SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOm1hcmNvX2Zhdl9jb2xvcnxhbHRlcm5hdGl2ZXxjb2xvcjpsaWdodF9ibHVl
+[cheetah_data/default]> GRAPH_EDGE_SET from=hypothesis:marco_fav_color to=color:aquamarine type=alternative weight=0.5
+SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOm1hcmNvX2Zhdl9jb2xvcnxhbHRlcm5hdGl2ZXxjb2xvcjphcXVhbWFyaW5l
+
+[cheetah_data/default]> GRAPH_NEIGHBORS id=person:owner direction=out type=unsure_about limit=8
+SUCCESS,count=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:owner","to":"hypothesis:marco_fav_color","type":"unsure_about","weight":1,…}]
+# → "what am I still unsure about?" is now a one-hop read, not a scan
+```
+
+**Correcting the record** is an upsert, because `(from, to, type, directed)` identifies an edge. When
+Marco confirms it was aquamarine, raise the winner and demote — do not silently erase — the loser:
+
+```text
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:aquamarine type=likes weight=1.0 props={"oneof":"marco_fav_color","modality":"asserted","verified":true}
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6YXF1YW1hcmluZQ
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:light_blue type=likes weight=0.05 props={"oneof":"marco_fav_color","ruled_out":true}
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6bGlnaHRfYmx1ZQ
+[cheetah_data/default]> GRAPH_NODE_SET id=hypothesis:marco_fav_color props={"question":"favourite_color","status":"resolved"}
+SUCCESS,node_set,id=hypothesis:marco_fav_color
+
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.weight >= 0.8 RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":1}]
+
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.props.ruled_out = true RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","type":"likes","to":"color:light_blue","weight":0.05}]
+```
+
+A demoted edge (`weight=0.05`, `ruled_out=true`) still answers *"weren't you saying light blue?"* and
+keeps the same confidence filter from ever surfacing it as fact. Use `GRAPH_EDGE_DEL` only when the
+alternative should be forgotten outright rather than remembered as wrong.
+
+The full vocabulary, all built from the same three channels:
+
+| The sentence says… | Encoding |
+| --- | --- |
+| plain assertion — "Marco works at Acme" | `weight=1.0`, `props={"verified":true}` |
+| hedge — "may be", "I think", "probably" | `weight` 0.3–0.5 + `props={"modality":"possible","verified":false}` |
+| disjunction — "either A or B" | one edge per alternative, shared `props.oneof`, weights summing to ~1 |
+| hearsay — "Elena told me Marco hates red" | keep the claim, mark the origin: `props={"source":"elena"}` and a weight below first-hand facts |
+| staleness — "as of 2024", "back then" | `props={"as_of":2024}`; re-assert with a higher weight when confirmed |
+| negation — "Marco doesn't like red" | an explicit `dislikes` edge (or `props={"negated":true}`) — never a missing edge, which is indistinguishable from ignorance |
+| retraction — "actually, not that" | upsert to a low weight with `props={"ruled_out":true}`, or `GRAPH_EDGE_DEL` to forget |
+
+```text
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:red type=dislikes weight=0.9 props={"source":"elena","as_of":2024}
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298ZGlzbGlrZXN8Y29sb3I6cmVk
+[cheetah_data/default]> GRAPH_NEIGHBOR_TYPES id=person:marco direction=out limit=8 weighted=1
+SUCCESS,count=2,next_cursor=*,payload=<base64>
+# decodes to: [{"type":"likes","count":2,"weighted":1.05},{"type":"dislikes","count":1,"weighted":0.9}]
+# → count 2 vs weighted 1.05 is the signature of a resolved alternative set: two rows, one belief
+```
+
+Where the query language stops, and what to do about it:
+
+- **`WHERE` is AND-only** — no `OR`, no `NOT`, no parentheses (see
+  [`parseGraphWhereClause`](graph.go), which splits on `AND`). Disjunction is therefore expressed as
+  **data, not syntax**: tag the alternatives with `props.oneof` and one equality predicate returns the
+  whole group. `!=` covers per-field negation (`WHERE edge.type != 'likes'`), and anything richer
+  belongs in the client, which can union the results of two queries.
+- **Exclusivity is not enforced.** Nothing stops both alternatives from sitting at `weight=1.0`; the
+  engine treats prefixes and props as opaque bytes by design. Keeping a group normalized is the
+  writer's job — re-assert the whole group whenever you touch one of its edges.
+- **An upsert resets what it does not mention.** `weight` defaults to `1.0` and `props` is replaced,
+  not merged, so re-asserting an edge just to add a prop silently promotes a `0.4` hedge to a
+  certainty. Always write the complete record: read it back first if you do not have every field.
+- **One weight per edge.** If you need confidence *and* strength ("loves" vs "likes"), keep confidence
+  in `weight` and put the other dimension in props (`props={"intensity":"strong"}`).
+- **No validity intervals.** `as_of`/`since` props plus a re-assert are the whole story; the engine
+  does no temporal reasoning.
+- **Absence never means false.** `ERROR,node_not_found` and an empty `matches=0` mean *nothing is
+  recorded* — a model must report that, not infer a negative.
+
+### Choosing the retrieval command
+
+| The sentence asks… | Use | Notes |
+| --- | --- | --- |
+| "What do you know about X?" | `GRAPH_NODE_GET` then `GRAPH_NEIGHBOR_TYPES` | histogram first, hydrate only the relation types that matter |
+| "What is X's R?" (one hop, known relation) | `GRAPH_NEIGHBORS id=X type=R` | plain adjacency page, cursor-resumable |
+| "Who R's X?" (reverse) | `GRAPH_NEIGHBORS id=X direction=in type=R`, or `MATCH (id='X')<-[:R]-(*)` | in-adjacency is its own index; keep X on the left and flip the arrow |
+| "Is that certain?" | `… WHERE edge.weight >= 0.8` | `matches=0` means "nothing I'd assert", not "false" |
+| "…but only the ones where <condition>" | `GRAPH_QUERY … WHERE …` | `edge.props.<k> = <literal>` is index-served; `edge.weight >= n` filters by confidence |
+| "Who is behind/above/downstream of X?" | `GRAPH_QUERY … HOPS 1..n RETURN paths` | bound with `BRANCH_LIMIT` + `COST_LIMIT`; `paths` is the compact form |
+| "Is X connected to Y at all?" | `GRAPH_QUERY MATCH (id='X')-[:*]->(id='Y') HOPS 1..n RETURN count` | `count` skips payload hydration entirely |
+| "How much do you know about X?" | `GRAPH_DEGREE id=X direction=both weighted=1` | one number, no edge reads |
+| "What do you remember overall?" | `PAIR_SUMMARY x01676e3a` / `PAIR_SCAN x01676e3a <limit>` | `x01676e3a` is the hex form of the reserved node namespace `\x01gn:` |
+
+Note on `RETURN nodes`: it returns the sorted unique ids of *all* endpoints of the matched edges,
+which includes the anchor node itself — drop it client-side if you only want the far side.
+
+Inventorying the stored nodes goes through the trie directly, since graph records are ordinary pair
+keys — `\x01gn:` followed by the base64url-encoded node id:
+
+```text
+[cheetah_data/default]> PAIR_SCAN x01676e3a 4
+SUCCESS,count=4,next_cursor=x01676e3a59326c306554707361584e69623234,items=01676e3a593239755a476c30615739754f6e4e305a584a70624755:6;01676e3a593246304f6d7831626d45:2;01676e3a59326c30655470695a584a73615734:44;01676e3a59326c306554707361584e69623234:60
+# item 2: hex 01676e3a593246304f6d7831626d45 → "\x01gn:" + "Y2F0Omx1bmE" → node id "cat:luna", payload key 2
+
+[cheetah_data/default]> PAIR_SUMMARY x01676e3a 1 8
+SUCCESS,command=PAIR_SUMMARY,count=17,total_payload_bytes=2542,min_payload_bytes=120,max_payload_bytes=182,min_key=1,max_key=71,max_depth=35,self_terminal=0,branch_count=6,branches=59:6;63:5;61:2;64:2;5a:1;62:1
+# count is the number of stored nodes; the *_payload_bytes totals shift by a few bytes between runs
+# because every node record embeds RFC3339Nano timestamps of varying length
+```
+
+### Failure modes an extractor must not hit
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=cat sitter labels=person
+SUCCESS,node_set,id=cat
+# arguments are whitespace-split key=value tokens: "sitter" was dropped and a node named "cat" was created
+
+[cheetah_data/default]> GRAPH_NODE_SET id=person:sara props={"name":"Sara Q"}
+ERROR,invalid_props:unexpected end of JSON input
+# the space inside the JSON ended the token; base64-encode props that contain spaces
+
+[cheetah_data/default]> GRAPH_QUERY MATCH (*)-[:owns]->(id='cat:luna') RETURN edges LIMIT 8
+ERROR,graph_query_parse_failed:left_node_must_be_anchored_by_id
+
+[cheetah_data/default]> GRAPH_NODE_GET id=cat:pepper
+ERROR,node_not_found
+```
+
+- **Ids, labels and edge types may not contain spaces.** They are parsed as whitespace-separated
+  `key=value` tokens, so `id=cat sitter` silently truncates to `cat` — slugify (`cat:sitter`,
+  `person:sara`) and keep the human form in `props` (base64) instead.
+- **Any `props=` value containing a space must be base64-encoded JSON.** Inline JSON is only safe when
+  it has no spaces at all (`{"since":2019,"office":"berlin"}` is fine).
+- **The left node of `MATCH` must be ID-anchored** — `MATCH (*)-[:owns]->(id='cat:luna')` is rejected.
+  Reverse questions ("who owns Luna?") keep the anchor on the left and flip the arrow instead:
+  `MATCH (id='cat:luna')<-[:owns]-(*)`, or read the in-adjacency directly with
+  `GRAPH_NEIGHBORS id=cat:luna direction=in type=owns`.
+- **`ERROR,node_not_found` is an answer, not a failure.** A model must say "I have nothing on
+  cat:pepper" rather than inventing an edge; never fabricate a node id to make a query succeed.
+- **Responses are one line.** Decode `payload=` from base64 into JSON before reasoning over it, and
+  page with `next_cursor` (`*` means exhausted) instead of raising `limit` without bound.
+
+### Drop-in prompt skeleton
+
+```text
+You turn user statements into cheetah-db graph commands, and user questions into graph queries.
+Emit only commands, one per line, no prose.
+
+WRITING a statement:
+  1. Node per entity: id = "<type>:<slug>", lowercase, no spaces (person:, cat:, org:, city:,
+     trait:, condition:, diet:, action:, intent:).
+  2. labels = the kinds it belongs to (comma-separated, no spaces).
+  3. props = descriptive attributes as compact JSON, no spaces; base64-encode the JSON if any
+     value contains a space.
+  4. Edge per relation: type = snake_case verb (owns, works_at, reports_to, has_trait,
+     has_condition, lives_in, follows_diet).
+  5. weight = your confidence 0..1 (asserted fact 1.0, hedged "may/might/I think" 0.3-0.5).
+     Put the hedge itself in props: {"modality":"possible","verified":false}.
+  6. "either A or B": write BOTH edges, each with props {"oneof":"<group>"} and weights that sum
+     to ~1. Never collapse a disjunction into one guess and never drop it for lack of certainty.
+  7. Negation is an explicit edge (dislikes, or props {"negated":true}) — a missing edge means
+     "unknown", not "false". Hearsay carries props {"source":"<who>"} and a lower weight.
+  8. Never invent a relation the sentence does not state. Re-assert known nodes freely: writes upsert.
+
+READING a question or a wish:
+  1. Create intent:<goal> and link it: <speaker> -[:wants]-> intent, intent -[:about]-> <subject>.
+  2. Resolve the anchor node id from the sentence (possessives resolve through the speaker's edges).
+  3. Cheapest sufficient probe first: GRAPH_NODE_GET / GRAPH_NEIGHBOR_TYPES / GRAPH_DEGREE.
+  4. Then the targeted read: GRAPH_NEIGHBORS (one hop, direction=in for reverse) or
+     GRAPH_QUERY (predicates, HOPS 1..n, RETURN edges|nodes|paths|count).
+  5. Answer only from returned rows; report weight/modality as uncertainty in the wording.
+  6. Write the conclusion back: intent -[:blocked_by]-> …, intent -[:requires]-> action:….
+```
+
+Intent *scoring* (ranking several candidate intents for one sentence) is a natural fit for the
+`PREDICT_*` tables described above: store each candidate under a `PREDICT_SET key=<intent-prefix>`
+and let `PREDICT_QUERY` merge the context windows instead of hard-coding a classifier.
+
+For the system around these recipes — episodic/semantic/procedural memory tiers, the teach and recall
+loops, a six-turn session where the assistant learns a fact mid-conversation, online intent routing
+with `PREDICT_TRAIN`, consolidation and forgetting, and the adapter contract — see
+[`studies/GRAPH_LLM.md`](studies/GRAPH_LLM.md).
 
 ## Streaming Helpers
 
