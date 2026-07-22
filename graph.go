@@ -41,15 +41,22 @@ type GraphNodeRecord struct {
 }
 
 type GraphEdgeRecord struct {
-	ID        string                 `json:"id"`
-	From      string                 `json:"from"`
-	To        string                 `json:"to"`
-	Type      string                 `json:"type,omitempty"`
-	Directed  bool                   `json:"directed"`
-	Weight    float64                `json:"weight"`
-	Props     map[string]interface{} `json:"props,omitempty"`
-	CreatedAt string                 `json:"created_at,omitempty"`
-	UpdatedAt string                 `json:"updated_at,omitempty"`
+	ID   string `json:"id"`
+	From string `json:"from"`
+	To   string `json:"to"`
+	Type string `json:"type,omitempty"`
+	// Directed/Weight descrivono la topologia; Confidence/Modality/Ambiguity
+	// descrivono quanto ci si crede (vedi graph_uncertainty.go). Confidence è un
+	// puntatore perché 0 è un valore legittimo (`ruled_out`) e va distinto da
+	// "non dichiarato", che vale `certain`.
+	Directed   bool                   `json:"directed"`
+	Weight     float64                `json:"weight"`
+	Confidence *float64               `json:"confidence,omitempty"`
+	Modality   string                 `json:"modality,omitempty"`
+	Ambiguity  string                 `json:"ambiguity,omitempty"`
+	Props      map[string]interface{} `json:"props,omitempty"`
+	CreatedAt  string                 `json:"created_at,omitempty"`
+	UpdatedAt  string                 `json:"updated_at,omitempty"`
 }
 
 type graphQueryReturnMode string
@@ -115,6 +122,13 @@ type graphEdgeSetRequest struct {
 	Weight          float64
 	Props           map[string]interface{}
 	AutoCreateNodes bool
+	// SetUncertainty/SetAmbiguity distinguono "non passato" (si conserva il valore
+	// memorizzato) da "passato esplicitamente" (si sovrascrive, anche azzerando).
+	Confidence     *float64
+	Modality       string
+	Ambiguity      string
+	SetUncertainty bool
+	SetAmbiguity   bool
 }
 
 type graphEdgeSetBatchItem struct {
@@ -123,8 +137,31 @@ type graphEdgeSetBatchItem struct {
 	Type       string                 `json:"type,omitempty"`
 	Directed   *bool                  `json:"directed,omitempty"`
 	Weight     *float64               `json:"weight,omitempty"`
+	Confidence *json.RawMessage       `json:"confidence,omitempty"`
+	Modality   string                 `json:"modality,omitempty"`
+	Ambiguity  string                 `json:"ambiguity,omitempty"`
 	Props      map[string]interface{} `json:"props,omitempty"`
 	AutoCreate *bool                  `json:"autocreate,omitempty"`
+}
+
+// graphBatchConfidenceToken riporta `"confidence"` a un token testuale: nel JSON
+// di batch può arrivare sia come numero (0.4) sia come parola ("possible").
+func graphBatchConfidenceToken(raw *json.RawMessage) (string, error) {
+	if raw == nil {
+		return "", nil
+	}
+	trimmed := strings.TrimSpace(string(*raw))
+	if trimmed == "" || trimmed == "null" {
+		return "", nil
+	}
+	if strings.HasPrefix(trimmed, "\"") {
+		var text string
+		if err := json.Unmarshal(*raw, &text); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(text), nil
+	}
+	return trimmed, nil
 }
 
 type graphBatchError struct {
@@ -268,6 +305,20 @@ func (db *Database) handleGraphEdgeSetBatch(args string) (string, error) {
 	if raw := strings.TrimSpace(params["ensure_nodes"]); raw != "" {
 		defaultReq.AutoCreateNodes = parseBoolFlag(raw)
 	}
+	if confidence, modality, setUncertainty, err := graphResolveUncertaintyArgs(params["confidence"], params["modality"]); err != nil {
+		return fmt.Sprintf("ERROR,invalid_confidence:%v", err), nil
+	} else if setUncertainty {
+		defaultReq.Confidence = confidence
+		defaultReq.Modality = modality
+		defaultReq.SetUncertainty = true
+	}
+	if ambiguity := strings.TrimSpace(params["ambiguity"]); ambiguity != "" {
+		defaultReq.SetAmbiguity = true
+		defaultReq.Ambiguity = ambiguity
+		if ambiguity == graphClearToken {
+			defaultReq.Ambiguity = ""
+		}
+	}
 
 	continueOnError := parseBoolFlag(params["continue_on_error"]) || parseBoolFlag(params["continueonerror"])
 
@@ -309,6 +360,36 @@ func (db *Database) handleGraphEdgeSetBatch(args string) (string, error) {
 		}
 		if item.AutoCreate != nil {
 			req.AutoCreateNodes = *item.AutoCreate
+		}
+		confidenceToken, tokenErr := graphBatchConfidenceToken(item.Confidence)
+		if tokenErr != nil {
+			batchErrs = append(batchErrs, graphBatchError{Index: idx, Error: fmt.Sprintf("invalid_confidence:%v", tokenErr)})
+			if !continueOnError {
+				payload, _ := graphEncodeJSON(batchErrs)
+				return fmt.Sprintf("ERROR,graph_edge_set_batch_failed,applied=%d,payload=%s", applied, payload), nil
+			}
+			continue
+		}
+		confidence, modality, setUncertainty, uncertaintyErr := graphResolveUncertaintyArgs(confidenceToken, item.Modality)
+		if uncertaintyErr != nil {
+			batchErrs = append(batchErrs, graphBatchError{Index: idx, Error: fmt.Sprintf("invalid_confidence:%v", uncertaintyErr)})
+			if !continueOnError {
+				payload, _ := graphEncodeJSON(batchErrs)
+				return fmt.Sprintf("ERROR,graph_edge_set_batch_failed,applied=%d,payload=%s", applied, payload), nil
+			}
+			continue
+		}
+		if setUncertainty {
+			req.Confidence = confidence
+			req.Modality = modality
+			req.SetUncertainty = true
+		}
+		if ambiguity := strings.TrimSpace(item.Ambiguity); ambiguity != "" {
+			req.SetAmbiguity = true
+			req.Ambiguity = ambiguity
+			if ambiguity == graphClearToken {
+				req.Ambiguity = ""
+			}
 		}
 		_, existed, err := db.graphUpsertEdge(req)
 		if err != nil {
@@ -377,6 +458,18 @@ func graphBuildEdgeSetRequestFromParams(params map[string]string) (graphEdgeSetR
 	if raw := strings.TrimSpace(params["ensure_nodes"]); raw != "" {
 		autoCreateNodes = parseBoolFlag(raw)
 	}
+	confidence, modality, setUncertainty, err := graphResolveUncertaintyArgs(params["confidence"], params["modality"])
+	if err != nil {
+		return graphEdgeSetRequest{}, fmt.Sprintf("ERROR,invalid_confidence:%v", err), nil
+	}
+	ambiguity := strings.TrimSpace(params["ambiguity"])
+	if ambiguity == "" {
+		ambiguity = strings.TrimSpace(params["oneof"])
+	}
+	setAmbiguity := ambiguity != ""
+	if ambiguity == graphClearToken {
+		ambiguity = ""
+	}
 	return graphEdgeSetRequest{
 		From:            fromID,
 		To:              toID,
@@ -385,6 +478,11 @@ func graphBuildEdgeSetRequestFromParams(params map[string]string) (graphEdgeSetR
 		Weight:          weight,
 		Props:           props,
 		AutoCreateNodes: autoCreateNodes,
+		Confidence:      confidence,
+		Modality:        modality,
+		Ambiguity:       ambiguity,
+		SetUncertainty:  setUncertainty,
+		SetAmbiguity:    setAmbiguity,
 	}, "", nil
 }
 
@@ -442,15 +540,18 @@ func (db *Database) graphUpsertEdge(request graphEdgeSetRequest) (string, bool, 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	edgeID := graphEdgeID(fromID, toID, edgeType, directed)
 	record := GraphEdgeRecord{
-		ID:        edgeID,
-		From:      fromID,
-		To:        toID,
-		Type:      edgeType,
-		Directed:  directed,
-		Weight:    weight,
-		Props:     request.Props,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         edgeID,
+		From:       fromID,
+		To:         toID,
+		Type:       edgeType,
+		Directed:   directed,
+		Weight:     weight,
+		Confidence: request.Confidence,
+		Modality:   request.Modality,
+		Ambiguity:  request.Ambiguity,
+		Props:      request.Props,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	existed := false
 	var existingRecord GraphEdgeRecord
@@ -463,6 +564,18 @@ func (db *Database) graphUpsertEdge(request graphEdgeSetRequest) (string, bool, 
 		if request.Props == nil {
 			record.Props = existing.Props
 		}
+		// Una credenza si conserva finché non la si ridichiara: a differenza di
+		// weight, omettere confidence/modality/ambiguity non le azzera.
+		if !request.SetUncertainty {
+			record.Confidence = existing.Confidence
+			record.Modality = existing.Modality
+		}
+		if !request.SetAmbiguity {
+			record.Ambiguity = existing.Ambiguity
+		}
+	}
+	if record.Confidence != nil && record.Modality == "" {
+		record.Modality = graphModalityForConfidence(*record.Confidence)
 	}
 	if err := db.graphPutEdge(record); err != nil {
 		return "", false, err
@@ -1343,6 +1456,30 @@ func parseGraphWhereClause(raw string) ([]graphQueryPredicate, error) {
 				}
 				pred.IsNumber = true
 				pred.NumberValue = value
+			case fieldExpr == "confidence":
+				// Accetta indifferentemente il numero o la parola della scala.
+				pred.Field = "confidence"
+				value, _, err := graphParseConfidenceToken(graphUnquote(literal))
+				if err != nil {
+					return nil, fmt.Errorf("invalid_confidence_predicate")
+				}
+				pred.IsNumber = true
+				pred.NumberValue = value
+			case fieldExpr == "modality":
+				// `=`/`!=` confrontano la parola, gli operatori d'ordine il suo rango.
+				pred.Field = "modality"
+				level, ok := graphModalityByName(graphUnquote(literal))
+				if !ok {
+					return nil, fmt.Errorf("unknown_modality:%s", literal)
+				}
+				pred.StringValue = level.Name
+				pred.NumberValue = float64(level.Rank)
+			case fieldExpr == "ambiguity" || fieldExpr == "oneof":
+				pred.Field = "ambiguity"
+				if op != "=" && op != "!=" {
+					return nil, fmt.Errorf("string_predicates_only_support_equal_or_not_equal")
+				}
+				pred.StringValue = graphUnquote(literal)
 			case strings.HasPrefix(fieldExpr, "props."):
 				pred.Field = "prop"
 				propPath := fieldExprRaw[len("props."):]
@@ -1972,6 +2109,20 @@ func (db *Database) graphEvaluatePredicate(edge *GraphEdgeRecord, pred graphQuer
 			return graphCompareString(edge.Type, pred.Op, pred.StringValue), nil
 		case "weight":
 			return graphCompareFloat(edge.Weight, pred.Op, pred.NumberValue), nil
+		case "confidence":
+			return graphCompareFloat(graphEffectiveConfidence(edge), pred.Op, pred.NumberValue), nil
+		case "modality":
+			modality := graphEffectiveModality(edge)
+			if pred.Op == "=" || pred.Op == "!=" {
+				return graphCompareString(modality, pred.Op, pred.StringValue), nil
+			}
+			rank, ok := graphModalityRank(modality)
+			if !ok {
+				return false, nil
+			}
+			return graphCompareFloat(float64(rank), pred.Op, pred.NumberValue), nil
+		case "ambiguity":
+			return graphCompareString(edge.Ambiguity, pred.Op, pred.StringValue), nil
 		case "prop":
 			propValue, ok := graphLookupPropertyValue(edge.Props, pred.PropPath)
 			if !ok {

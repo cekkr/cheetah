@@ -141,7 +141,14 @@ GRAPH_NODE_SET id=<node> [labels=a,b] [props=<base64 json>]
 GRAPH_NODE_GET id=<node>
 GRAPH_NODE_DEL id=<node> [cascade=1]
 GRAPH_EDGE_SET from=<node> to=<node> [type=<edge>] [weight=<float>] [directed=0|1]
+               [confidence=<0..1|word>] [modality=<word>] [ambiguity=<group>]
                                 # upsert a typed edge + adjacency indexes
+GRAPH_AMBIGUITY_SET from=<node> group=<id> options=<node>[=<share>][,…] [type=<edge>]
+                                # enumerate mutually exclusive alternatives as one group
+GRAPH_AMBIGUITY_GET from=<node> group=<id> [direction=out|in] [limit=<n>]
+                                # read a group back, strongest alternative first
+GRAPH_AMBIGUITY_RESOLVE from=<node> group=<id> winner=<node> [drop=0|1]
+                                # collapse a group: winner certain, others ruled out
 GRAPH_EDGE_SET_BATCH items=<base64 json> [continue_on_error=0|1] [type=<edge>] [directed=0|1]
                                 # bulk graph edge upsert in one command
 GRAPH_EDGE_GET from=<node> to=<node> [type=<edge>] [directed=0|1]
@@ -345,9 +352,15 @@ are always prefix scans.
 - **Node** — `{ id, labels[], props{}, created_at, updated_at }`. `id` is any non-empty string; the
   server only trims it (it does **not** sanitize or add suffixes — any such convention lives in the
   client). `labels` is stored as a deduplicated, sorted set; `props` is a free-form JSON object.
-- **Edge** — `{ id, from, to, type, directed, weight, props{}, created_at, updated_at }`. An edge is
-  uniquely identified by the tuple `(from, to, type, directed)`; setting the same tuple again
-  **upserts** it. `weight` defaults to `1.0` and `directed` defaults to `1` (true).
+- **Edge** — `{ id, from, to, type, directed, weight, confidence, modality, ambiguity, props{},
+  created_at, updated_at }`. An edge is uniquely identified by the tuple `(from, to, type, directed)`;
+  setting the same tuple again **upserts** it. `weight` defaults to `1.0` and `directed` defaults to
+  `1` (true).
+- **Belief fields** — `confidence` (0–1), `modality` (a word from an ordered scale) and `ambiguity`
+  (the group of mutually exclusive alternatives this edge belongs to) are optional and describe *how
+  sure* the edge is, as opposed to `weight`, which is traversal strength. They are omitted from the
+  record when never declared, and an edge that declares nothing counts as `certain`. See
+  [Uncertainty and ambiguity](#uncertainty-and-ambiguity).
 - **Properties** cross the wire as JSON — inline for simple values (`props={"since":2020}`) or
   base64-encoded JSON (`props=<base64>`) when the blob would contain spaces/newlines. Values may be
   strings, numbers, or booleans; `edge.props.*` values are additionally mirrored into a secondary
@@ -365,6 +378,8 @@ are always prefix scans.
 | `GRAPH_EDGE_SET_BATCH items=<base64 json[]> [continue_on_error=0\|1] [type=…] [directed=…] [weight=…] [props=…]` | Bulk upsert in one round-trip; top-level `type/directed/weight/props` act as per-item defaults. |
 | `GRAPH_NODE_DEL id=<id> [cascade=1]` | Delete a node; `cascade=1` also removes its incident edges. |
 | `GRAPH_EDGE_DEL from=<id> to=<id> [type=<t>] [directed=0\|1]` | Delete the edge addressed by the tuple. |
+| `GRAPH_AMBIGUITY_SET from=<id> group=<g> options=<id>[=<share>][,…] [type=<t>] [normalize=0\|1]` | Write a whole set of mutually exclusive alternatives, shares normalized to sum 1. |
+| `GRAPH_AMBIGUITY_RESOLVE from=<id> group=<g> winner=<id> [drop=0\|1]` | Collapse the set: winner becomes `certain`, the others `ruled_out` (or deleted). |
 
 ```text
 [cheetah_data/graphlang]> GRAPH_NODE_SET id=alice labels=person,user props={"city":"berlin","age":30}
@@ -389,6 +404,7 @@ node that does not exist yet (disable with `autocreate=0`).
 | `GRAPH_NEIGHBORS id=<id> [direction=out\|in\|both] [type=<t\|*>] [limit=<n>] [cursor=<tok>]` | `count`, `next_cursor`, and `payload=` an array of edge records. |
 | `GRAPH_DEGREE id=<id> [direction=out\|in\|both] [type=<t\|*>] [weighted=0\|1]` | `degree` (plus `weighted_degree` when `weighted=1`). |
 | `GRAPH_NEIGHBOR_TYPES id=<id> [direction=out\|in\|both] [limit=<n>] [cursor=<tok>] [weighted=0\|1]` | `payload=` a compact relation histogram `[{type,count,weighted}]`. |
+| `GRAPH_AMBIGUITY_GET from=<id> group=<g> [direction=out\|in] [limit=<n>]` | `count`, `confidence_sum`, `top`, `top_modality`, and `payload=` the alternatives, strongest first. |
 
 ```text
 [cheetah_data/graphlang]> GRAPH_NODE_GET id=alice
@@ -435,9 +451,12 @@ GRAPH_QUERY MATCH (<left>)<-[:<type|*>]-(<right>)     # follow in-edges of <left
   the right pattern constrains the far endpoint. Predicates stay edge-oriented regardless of arrow:
   `from.id`/`to.id` always mean the edge's own `from`/`to` fields, so in a reverse query the anchor is
   `to.id`.
-- **Predicates** read `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, `edge.weight`, and
-  `edge.props.<key>` with operators `= != >= <= > <`. An `edge.props.<key> = <literal>` equality is
-  served straight from the `graph/idx/` secondary index.
+- **Predicates** read `from.id`, `to.id`, `from.label`, `to.label`, `edge.type`, `edge.weight`,
+  `edge.confidence`, `edge.modality`, `edge.ambiguity`, and `edge.props.<key>` with operators
+  `= != >= <= > <`. An `edge.props.<key> = <literal>` equality is served straight from the
+  `graph/idx/` secondary index. `edge.confidence` accepts a number **or** a scale word
+  (`>= possible` is `>= 0.5`), and `edge.modality` compares the word itself for `=`/`!=` and its rank
+  on the scale for the ordering operators.
 - **RETURN modes**: `edges` (full edge records), `nodes` (sorted unique node ids), `paths` (compact
   `{from,type,to,weight}` views), `count` (just `matches=<n>`, no payload). Since higher weight means
   lower cost, `COST_LIMIT` prunes paths that traverse low-weight edges first.
@@ -486,8 +505,8 @@ shown decoded on the following comment line.
 | Attribute you will never query on its own — "named Luna", "female" | `props={...}` on the node | cheap to read back with the node, no extra hop |
 | Attribute you *will* query or join — "siamese", "cute", "gluten-free" | its own node + a typed edge | reachable from both ends: "which of my pets are sweet?" starts at `trait:sweet` |
 | Relation — "owns", "works at", "reports to" | edge `type=` (snake_case verb) | edge types are the traversal alphabet; keep them few and stable |
-| Hedge / intensity — "may be", "very", "I think" | `weight=` (0–1 confidence) **+** `props={"modality":...}` | keeps the edge *type* stable so one query shape finds certain and uncertain facts |
-| Disjunction — "either A or B, I forget" | one edge per alternative sharing `props.oneof`, weights summing to ~1 | see [uncertainty](#recording-uncertainty-alternatives-and-corrections); the engine has no `OR`, so alternatives are data |
+| Hedge — "may be", "I think", "probably" | `confidence=possible` (a number or a word) | keeps the edge *type* stable, so one query shape finds certain and uncertain facts |
+| Disjunction — "either A or B, I forget" | `GRAPH_AMBIGUITY_SET … group=<g> options=A,B` | see [uncertainty and ambiguity](#uncertainty-and-ambiguity); the engine has no `OR`, so alternatives are a group |
 | Time / provenance — "since 2019", "she told me" | edge `props` (`since`, `source`) | indexed for `WHERE edge.props.<k> = <v>` equality |
 | Wish / question — "I would like…" | `intent:` node + `wants` / `about` edges | the question itself becomes a fact you can answer, revisit, and close |
 
@@ -518,7 +537,7 @@ SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfYnJlZWR8YnJlZWQ6c2lhbWVzZQ
 SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfdHJhaXR8dHJhaXQ6Y3V0ZQ
 [cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=trait:sweet type=has_trait weight=0.9
 SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfdHJhaXR8dHJhaXQ6c3dlZXQ
-[cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition weight=0.4 props={"modality":"possible","verified":false}
+[cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition confidence=possible props={"src":"1"}
 SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
 ```
 
@@ -536,10 +555,10 @@ SUCCESS,count=3,next_cursor=*,payload=<base64>
 
 Why it is modeled this way:
 
-- **"may be sterile" is not a new edge type.** It is `has_condition` with `weight=0.4` and
-  `props={"modality":"possible","verified":false}`. A hedge-specific type (`may_have_condition`) would
-  force every later query to know the whole family of names; confidence in the weight keeps one query
-  shape — and because traversal cost is `1/weight`, `COST_LIMIT` naturally prunes shaky facts first.
+- **"may be sterile" is not a new edge type.** It is `has_condition` with `confidence=possible`. A
+  hedge-specific type (`may_have_condition`) would force every later query to know the whole family of
+  names; a declared confidence keeps one query shape and lets `WHERE edge.modality >= 'probable'`
+  separate what is assertable from what is not.
 - **Traits and breeds are nodes, not props**, so the reverse question ("which of my animals are
   sweet?") is a prefix scan from `trait:sweet` instead of a full scan of every node's props.
 - **The speaker is a node too** (`person:owner`), so possessives ("my cat") resolve to an edge rather
@@ -707,139 +726,162 @@ SUCCESS,count=1,next_cursor=*,payload=<base64>
 
 Answer: *Lisbon, and it must be strictly gluten-free (celiac) — not a preference.*
 
-### Recording uncertainty, alternatives and corrections
+### Uncertainty and ambiguity
 
-The command surface looks absolute — an edge either exists or it does not — but three channels carry
-uncertainty, and a model should use all three deliberately:
+Not everything you are told is certain, and not everything is unambiguous. The engine carries both
+first-class on an edge, in **numbers and in words**:
 
-1. **`weight`** — how sure you are (0–1). It is also the traversal cost (`1/weight`), so shaky facts
-   are the first thing `COST_LIMIT` prunes and the last thing a ranked walk expands.
-2. **`props`** — *why* you are unsure: `modality`, `verified`, `source`, `as_of`, `ruled_out`.
-   Equality on these is served by the `graph/idx/` secondary index, so they are filters, not just
-   annotations.
-3. **Shape** — mutually exclusive readings become *several edges tied together*, not one fuzzy edge.
+| Field | Written as | Meaning |
+| --- | --- | --- |
+| `confidence=` | a number `0..1` **or** a scale word | how sure the fact is |
+| `modality=` | a scale word | the same thing said in language |
+| `ambiguity=` | a group id | this edge is one of several mutually exclusive readings |
 
-Take a sentence with no single truth in it:
+`weight` stays what it was — traversal strength, and cost `1/weight` — so a belief no longer has to
+borrow it. `props` still carry provenance (`src`, `source`, `as_of`).
+
+The scale is ordered, and each word is an anchor on the 0–1 line:
+
+| Word | Confidence | Accepted aliases |
+| --- | --- | --- |
+| `ruled_out` | 0.00 | `impossible`, `excluded`, `false`, `no` |
+| `unlikely` | 0.25 | `improbable`, `doubtful`, `rare` |
+| `possible` | 0.50 | `maybe`, `perhaps`, `uncertain`, `unverified` |
+| `probable` | 0.75 | `likely`, `presumably`, `expected` |
+| `certain` | 1.00 | `sure`, `asserted`, `definite`, `confirmed`, `verified`, `yes`, `true` |
+
+Give either one and the server derives the other — a number is labelled with its nearest word, a word
+is stored with its anchor value:
+
+```text
+[cheetah_data/default]> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition weight=1.0 confidence=possible props={"src":"1"}
+SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
+[cheetah_data/default]> GRAPH_EDGE_GET from=cat:luna to=condition:sterile type=has_condition
+SUCCESS,id=…,payload=<base64>
+# decodes to: {"from":"cat:luna","to":"condition:sterile","type":"has_condition","weight":1,
+#              "confidence":0.5,"modality":"possible","props":{"src":"1"},…}
+
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=org:acme type=works_at confidence=0.8
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298d29ya3NfYXR8b3JnOmFjbWU
+# stored as: "confidence":0.8,"modality":"probable"   ← 0.8 is nearest to the 0.75 anchor
+
+[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=person:elena type=reports_to modality=likely
+SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298cmVwb3J0c190b3xwZXJzb246ZWxlbmE
+# stored as: "confidence":0.75,"modality":"probable"  ← the alias canonicalizes
+```
+
+Rules worth knowing:
+
+- **Undeclared means certain.** An edge with no `confidence`/`modality` stores neither and reads as
+  `certain` (1.0) in every predicate. Asserting without qualification is asserting.
+- **A belief survives a partial upsert.** Unlike `weight` — which defaults back to `1.0` when
+  omitted — `confidence`, `modality` and `ambiguity` are *preserved* when you do not mention them, so
+  re-asserting an edge to change a prop cannot silently promote a hedge. Pass `confidence=-` to clear
+  the belief on purpose.
+- **A deliberate mismatch is allowed.** Give both and both are stored as given
+  (`confidence=0.9 modality=possible`); give one and the other is derived.
+
+### Ambiguity: enumerating the readings
 
 > *"Marco likes either the color light blue or aquamarine, I don't remember."*
 
-Write **both** alternatives, each with half the confidence, tagged with a shared group id:
+One command writes the whole alternative set, tags each edge with the group, and normalizes the
+shares to sum to 1:
 
 ```text
-[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:light_blue type=likes weight=0.5 props={"oneof":"marco_fav_color","modality":"uncertain","verified":false}
-SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6bGlnaHRfYmx1ZQ
-[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:aquamarine type=likes weight=0.5 props={"oneof":"marco_fav_color","modality":"uncertain","verified":false}
-SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6YXF1YW1hcmluZQ
+[cheetah_data/default]> GRAPH_AMBIGUITY_SET from=person:marco type=likes group=fav_color options=color:light_blue,color:aquamarine
+SUCCESS,ambiguity_set,group=fav_color,options=2,confidence_sum=1.0000
+
+[cheetah_data/default]> GRAPH_AMBIGUITY_GET from=person:marco group=fav_color
+SUCCESS,group=fav_color,count=2,confidence_sum=1.0000,top=color:aquamarine,top_modality=possible,payload=<base64>
+# decodes to: [{"from":"person:marco","to":"color:aquamarine","type":"likes","confidence":0.5,"modality":"possible","ambiguity":"fav_color",…},
+#              {"from":"person:marco","to":"color:light_blue","type":"likes","confidence":0.5,"modality":"possible","ambiguity":"fav_color",…}]
 ```
 
-The convention (a *client* contract — the engine assigns no meaning to it) is: **weights inside one
-`oneof` group sum to ~1.0**. That makes the three questions a model actually asks all answerable with
-the same query shape:
+`options=` takes an optional share per alternative — a number or a scale word after `=`. Undeclared
+alternatives are filled in two readings, chosen by what you did declare:
 
 ```text
-[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) RETURN paths LIMIT 8
-SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":0.5},
-#              {"from":"person:marco","type":"likes","to":"color:light_blue","weight":0.5}]
-# → "one of these two, and I genuinely don't know which"
+# probability reading: declared shares are ≤ 1 and sum to ≤ 1, so the rest splits the leftover
+[cheetah_data/default]> GRAPH_AMBIGUITY_SET from=person:sara type=lives_in group=where_sara options=city:lisbon=0.7,city:porto
+SUCCESS,ambiguity_set,group=where_sara,options=2,confidence_sum=1.0000
+[cheetah_data/default]> GRAPH_AMBIGUITY_GET from=person:sara group=where_sara
+SUCCESS,group=where_sara,count=2,confidence_sum=1.0000,top=city:lisbon,top_modality=probable,payload=<base64>
+# decodes to: [{"to":"city:lisbon","confidence":0.7,"modality":"probable",…},
+#              {"to":"city:porto","confidence":0.3,"modality":"unlikely",…}]
 
-[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.weight >= 0.8 RETURN count
+# relative reading: a share above 1 (or a sum above 1) means "three to one"
+#   options=city:lisbon=3,city:porto=1   → 0.75 / 0.25
+```
+
+Pass `normalize=0` to store the shares untouched (each must then be within 0–1).
+
+Because the scale is ordered, the words are a filter — and so is the number, interchangeably:
+
+```text
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.modality >= 'probable' RETURN count
 SUCCESS,return=count,matches=0,next_cursor=*
-# → "nothing I'd assert about Marco's colors" — absence of a confident row is itself the answer
+# → nothing here is worth asserting yet
 
-[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:*]->(*) WHERE edge.props.oneof = 'marco_fav_color' RETURN paths LIMIT 8
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:*]->(*) WHERE edge.ambiguity = 'fav_color' RETURN paths LIMIT 8
 SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":0.5},
-#              {"from":"person:marco","type":"likes","to":"color:light_blue","weight":0.5}]
-# → the alternative set as a unit, index-served
+# decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":1},
+#              {"from":"person:marco","type":"likes","to":"color:light_blue","weight":1}]
 ```
 
-**When the open question itself matters**, promote the group to a `hypothesis:` node so it can carry
-status and be *found* later — otherwise an unresolved doubt is only reachable if you already know
-which entity to ask about:
+When the answer arrives, resolve the group in one command — the winner becomes `certain`, the others
+`ruled_out`, and the group dissolves:
 
 ```text
-[cheetah_data/default]> GRAPH_NODE_SET id=hypothesis:marco_fav_color labels=hypothesis props={"question":"favourite_color","status":"open"}
-SUCCESS,node_set,id=hypothesis:marco_fav_color
-[cheetah_data/default]> GRAPH_EDGE_SET from=person:owner to=hypothesis:marco_fav_color type=unsure_about weight=1.0
-SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8dW5zdXJlX2Fib3V0fGh5cG90aGVzaXM6bWFyY29fZmF2X2NvbG9y
-[cheetah_data/default]> GRAPH_EDGE_SET from=hypothesis:marco_fav_color to=person:marco type=about weight=1.0
-SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOm1hcmNvX2Zhdl9jb2xvcnxhYm91dHxwZXJzb246bWFyY28
-[cheetah_data/default]> GRAPH_EDGE_SET from=hypothesis:marco_fav_color to=color:light_blue type=alternative weight=0.5
-SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOm1hcmNvX2Zhdl9jb2xvcnxhbHRlcm5hdGl2ZXxjb2xvcjpsaWdodF9ibHVl
-[cheetah_data/default]> GRAPH_EDGE_SET from=hypothesis:marco_fav_color to=color:aquamarine type=alternative weight=0.5
-SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOm1hcmNvX2Zhdl9jb2xvcnxhbHRlcm5hdGl2ZXxjb2xvcjphcXVhbWFyaW5l
+[cheetah_data/default]> GRAPH_AMBIGUITY_RESOLVE from=person:marco group=fav_color winner=color:aquamarine
+SUCCESS,ambiguity_resolved,group=fav_color,winner=color:aquamarine,ruled_out=1,dropped=0
 
-[cheetah_data/default]> GRAPH_NEIGHBORS id=person:owner direction=out type=unsure_about limit=8
-SUCCESS,count=1,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"person:owner","to":"hypothesis:marco_fav_color","type":"unsure_about","weight":1,…}]
-# → "what am I still unsure about?" is now a one-hop read, not a scan
-```
-
-**Correcting the record** is an upsert, because `(from, to, type, directed)` identifies an edge. When
-Marco confirms it was aquamarine, raise the winner and demote — do not silently erase — the loser:
-
-```text
-[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:aquamarine type=likes weight=1.0 props={"oneof":"marco_fav_color","modality":"asserted","verified":true}
-SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6YXF1YW1hcmluZQ
-[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:light_blue type=likes weight=0.05 props={"oneof":"marco_fav_color","ruled_out":true}
-SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298bGlrZXN8Y29sb3I6bGlnaHRfYmx1ZQ
-[cheetah_data/default]> GRAPH_NODE_SET id=hypothesis:marco_fav_color props={"question":"favourite_color","status":"resolved"}
-SUCCESS,node_set,id=hypothesis:marco_fav_color
-
-[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.weight >= 0.8 RETURN paths LIMIT 8
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.modality >= 'probable' RETURN paths LIMIT 8
 SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
 # decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":1}]
 
-[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.props.ruled_out = true RETURN paths LIMIT 8
+[cheetah_data/default]> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.modality = 'ruled_out' RETURN paths LIMIT 8
 SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"person:marco","type":"likes","to":"color:light_blue","weight":0.05}]
+# decodes to: [{"from":"person:marco","type":"likes","to":"color:light_blue","weight":1}]
+
+[cheetah_data/default]> GRAPH_AMBIGUITY_GET from=person:marco group=fav_color
+ERROR,ambiguity_group_not_found,group=fav_color
 ```
 
-A demoted edge (`weight=0.05`, `ruled_out=true`) still answers *"weren't you saying light blue?"* and
-keeps the same confidence filter from ever surfacing it as fact. Use `GRAPH_EDGE_DEL` only when the
-alternative should be forgotten outright rather than remembered as wrong.
+The same query that returned nothing while the memory was ambiguous now returns exactly one answer,
+and the discarded reading is still on record as *excluded* rather than forgotten — so *"weren't you
+saying light blue?"* remains answerable. Use `drop=1` to delete the losers instead of ruling them
+out.
 
-The full vocabulary, all built from the same three channels:
+The rest of the vocabulary still lives in `props`, because it is provenance rather than belief:
 
 | The sentence says… | Encoding |
 | --- | --- |
-| plain assertion — "Marco works at Acme" | `weight=1.0`, `props={"verified":true}` |
-| hedge — "may be", "I think", "probably" | `weight` 0.3–0.5 + `props={"modality":"possible","verified":false}` |
-| disjunction — "either A or B" | one edge per alternative, shared `props.oneof`, weights summing to ~1 |
-| hearsay — "Elena told me Marco hates red" | keep the claim, mark the origin: `props={"source":"elena"}` and a weight below first-hand facts |
-| staleness — "as of 2024", "back then" | `props={"as_of":2024}`; re-assert with a higher weight when confirmed |
-| negation — "Marco doesn't like red" | an explicit `dislikes` edge (or `props={"negated":true}`) — never a missing edge, which is indistinguishable from ignorance |
-| retraction — "actually, not that" | upsert to a low weight with `props={"ruled_out":true}`, or `GRAPH_EDGE_DEL` to forget |
-
-```text
-[cheetah_data/default]> GRAPH_EDGE_SET from=person:marco to=color:red type=dislikes weight=0.9 props={"source":"elena","as_of":2024}
-SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298ZGlzbGlrZXN8Y29sb3I6cmVk
-[cheetah_data/default]> GRAPH_NEIGHBOR_TYPES id=person:marco direction=out limit=8 weighted=1
-SUCCESS,count=2,next_cursor=*,payload=<base64>
-# decodes to: [{"type":"likes","count":2,"weighted":1.05},{"type":"dislikes","count":1,"weighted":0.9}]
-# → count 2 vs weighted 1.05 is the signature of a resolved alternative set: two rows, one belief
-```
+| plain assertion — "Marco works at Acme" | nothing to declare; the edge is `certain` |
+| hedge — "may be", "I think", "probably" | `confidence=possible` / `confidence=probable` |
+| disjunction — "either A or B" | `GRAPH_AMBIGUITY_SET … group=<g> options=A,B` |
+| hearsay — "Elena told me Marco hates red" | `confidence=probable props={"source":"elena"}` |
+| staleness — "as of 2024", "back then" | `props={"as_of":2024}`, re-asserted with a new confidence when confirmed |
+| negation — "Marco doesn't like red" | an explicit `dislikes` edge — never a missing edge, which is indistinguishable from ignorance |
+| retraction — "actually, not that" | `confidence=ruled_out`, or `GRAPH_EDGE_DEL` to forget entirely |
 
 Where the query language stops, and what to do about it:
 
 - **`WHERE` is AND-only** — no `OR`, no `NOT`, no parentheses (see
-  [`parseGraphWhereClause`](graph.go), which splits on `AND`). Disjunction is therefore expressed as
-  **data, not syntax**: tag the alternatives with `props.oneof` and one equality predicate returns the
-  whole group. `!=` covers per-field negation (`WHERE edge.type != 'likes'`), and anything richer
-  belongs in the client, which can union the results of two queries.
-- **Exclusivity is not enforced.** Nothing stops both alternatives from sitting at `weight=1.0`; the
-  engine treats prefixes and props as opaque bytes by design. Keeping a group normalized is the
-  writer's job — re-assert the whole group whenever you touch one of its edges.
-- **An upsert resets what it does not mention.** `weight` defaults to `1.0` and `props` is replaced,
-  not merged, so re-asserting an edge just to add a prop silently promotes a `0.4` hedge to a
-  certainty. Always write the complete record: read it back first if you do not have every field.
-- **One weight per edge.** If you need confidence *and* strength ("loves" vs "likes"), keep confidence
-  in `weight` and put the other dimension in props (`props={"intensity":"strong"}`).
-- **No validity intervals.** `as_of`/`since` props plus a re-assert are the whole story; the engine
-  does no temporal reasoning.
-- **Absence never means false.** `ERROR,node_not_found` and an empty `matches=0` mean *nothing is
-  recorded* — a model must report that, not infer a negative.
+  [`parseGraphWhereClause`](graph.go), which splits on `AND`). This is why a disjunction is stored as
+  a *group* rather than expressed as a query: one `edge.ambiguity` equality returns the whole set.
+  `!=` covers per-field negation, and anything richer belongs in the client.
+- **Exclusivity is enforced at write time, not as an invariant.** `GRAPH_AMBIGUITY_SET` and
+  `GRAPH_AMBIGUITY_RESOLVE` keep a group normalized, but a later plain `GRAPH_EDGE_SET` on one member
+  can unbalance it — rewrite the group through `GRAPH_AMBIGUITY_SET` rather than editing members.
+- **Groups are anchored.** `GRAPH_AMBIGUITY_GET`/`_RESOLVE` scan one node's adjacency, so a group
+  spans the alternatives leaving (or entering) a single node. There is no global "all open groups"
+  index; link them from a stable node if you need to enumerate them.
+- **Confidence is stored rounded to six decimals** after normalization, so payloads stay readable.
+- **No validity intervals.** `as_of`/`since` props are a convention; the engine does no temporal
+  reasoning.
+- **Absence never means false.** `ERROR,node_not_found` and `matches=0` mean *nothing is recorded* —
+  a model must report that, not infer a negative.
 
 ### Choosing the retrieval command
 
@@ -918,10 +960,12 @@ WRITING a statement:
      value contains a space.
   4. Edge per relation: type = snake_case verb (owns, works_at, reports_to, has_trait,
      has_condition, lives_in, follows_diet).
-  5. weight = your confidence 0..1 (asserted fact 1.0, hedged "may/might/I think" 0.3-0.5).
-     Put the hedge itself in props: {"modality":"possible","verified":false}.
-  6. "either A or B": write BOTH edges, each with props {"oneof":"<group>"} and weights that sum
-     to ~1. Never collapse a disjunction into one guess and never drop it for lack of certainty.
+  5. confidence= is your certainty: omit it for a flat assertion, or pass a word
+     (ruled_out|unlikely|possible|probable|certain) or a number 0..1 for anything hedged.
+     Keep provenance in props: {"src":"<episode key>","source":"<who said it>"}.
+  6. "either A or B": one GRAPH_AMBIGUITY_SET with every reading in options= (add =<share> when
+     you lean one way). Never collapse a disjunction into one guess, never drop it for lack of
+     certainty, and resolve it with GRAPH_AMBIGUITY_RESOLVE when the answer arrives.
   7. Negation is an explicit edge (dislikes, or props {"negated":true}) — a missing edge means
      "unknown", not "false". Hearsay carries props {"source":"<who>"} and a lower weight.
   8. Never invent a relation the sentence does not state. Re-assert known nodes freely: writes upsert.

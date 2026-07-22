@@ -93,8 +93,8 @@ That is the whole consolidation input: one command, one page, `next_cursor` for 
 ### 2.2 Semantic: the graph, covered in the README
 
 See [Sentences → Graph → Answers](../README.md#sentences--graph--answers-llm-recipes). The only thing
-worth repeating here is the shape of a *good* fact: an edge whose type is a stable verb, whose weight
-is a confidence, and whose props carry `src` — the episodic key it came from.
+worth repeating here is the shape of a *good* fact: an edge whose type is a stable verb, whose
+`confidence` says how sure it is (§7), and whose props carry `src` — the episodic key it came from.
 
 ### 2.3 Procedural: prediction tables, section 8
 
@@ -142,14 +142,14 @@ this is one command and it prevents duplicate ids and contradictory writes:
 ```text
 > GRAPH_NEIGHBOR_TYPES id=cat:luna direction=out limit=16 weighted=1
 SUCCESS,count=3,next_cursor=*,payload=<base64>
-# decodes to: [{"type":"has_breed","count":1,"weighted":1},{"type":"has_trait","count":1,"weighted":0.9},{"type":"has_condition","count":1,"weighted":0.4}]
+# decodes to: [{"type":"has_breed","count":1,"weighted":1},{"type":"has_condition","count":1,"weighted":1},{"type":"has_trait","count":1,"weighted":1}]
 ```
 
 **Step 3 — write facts, batched.** One round trip for the whole extraction, with
 `continue_on_error=1` so a single malformed row does not lose the turn:
 
 ```text
-> GRAPH_EDGE_SET_BATCH items=<base64 of [{"from":"cat:luna","to":"trait:cute","type":"has_trait","weight":0.9}, {"from":"cat:luna","to":"trait:sweet","type":"has_trait","weight":0.9}, {"from":"cat:luna","to":"condition:sterile","type":"has_condition","weight":0.4,"props":{"modality":"possible","verified":false}}]> continue_on_error=1
+> GRAPH_EDGE_SET_BATCH items=<base64 of [{"from":"cat:luna","to":"trait:cute","type":"has_trait","weight":0.9}, {"from":"cat:luna","to":"trait:sweet","type":"has_trait","weight":0.9}, {"from":"cat:luna","to":"condition:sterile","type":"has_condition","confidence":"possible"}]> continue_on_error=1
 SUCCESS,requested=3,applied=3,created=3,updated=0,failed=0
 ```
 
@@ -162,9 +162,9 @@ the sentence that produced it:
 ```text
 > GRAPH_EDGE_GET from=cat:luna to=condition:sterile type=has_condition
 SUCCESS,id=…,payload=<base64>
-# decodes to: {"from":"cat:luna","to":"condition:sterile","type":"has_condition","weight":0.02,
-#              "props":{"ruled_out":true,"src":"42","verified":true},…}
-> READ 42
+# decodes to: {"from":"cat:luna","to":"condition:sterile","type":"has_condition","weight":1,
+#              "confidence":0,"modality":"ruled_out","props":{"source":"vet","src":"40"},…}
+> READ 40
 SUCCESS,size=46,value=The vet checked her: she is fertile after all.
 ```
 
@@ -188,18 +188,22 @@ omit. Two verified consequences that silently corrupt a memory:
 ```
 
 ```text
-> GRAPH_EDGE_SET from=a to=b type=likes weight=0.4 props={"modality":"possible"}
-> GRAPH_EDGE_SET from=a to=b type=likes props={"modality":"possible","seen":2}
+> GRAPH_EDGE_SET from=a to=b type=likes weight=0.4 props={"seen":1}
+> GRAPH_EDGE_SET from=a to=b type=likes props={"seen":2}
 > GRAPH_EDGE_GET from=a to=b type=likes
-# decodes to: {…,"weight":1,"props":{"modality":"possible","seen":2},…}
+# decodes to: {…,"weight":1,"props":{"seen":2},…}
 #             weight silently jumped 0.4 → 1.0, because omitted weight defaults to 1.0
 ```
 
-An "I only wanted to bump a counter" write turned a hedge into a certainty. **Rule: read the record,
-merge in the model, write the complete record.** Omitting a field is never a way to keep it — except
-for `labels`/`props` on a node, where omitting the *whole* argument does preserve the stored value.
-That asymmetry (omit entirely = keep, pass = replace) is the one exception, and it is not worth relying
-on: always write the full record.
+**Rule: read the record, merge in the model, write the complete record.** Omitting a field is not a
+way to keep it, with two deliberate exceptions:
+
+- `labels`/`props` on a node — omitting the *whole* argument preserves the stored value;
+- `confidence`/`modality`/`ambiguity` on an edge (§7) — a belief is preserved unless restated, because
+  a write that meant to touch a prop must not be able to promote a hedge to a certainty. Clear one on
+  purpose with `confidence=-`.
+
+`weight` has no such protection: it is traversal strength, and it resets.
 
 ---
 
@@ -229,7 +233,7 @@ Unknown: <what returned matches=0>.
 
 ---
 
-## 6. A six-turn session, end to end
+## 6. A seven-turn session, end to end
 
 One conversation, captured over TCP against a fresh database. Non-essential responses elided; every
 line shown is real. Watch the database change what the model can say.
@@ -247,22 +251,18 @@ SUCCESS,pair_set
 SUCCESS,node_set,id=person:owner
 > GRAPH_NODE_SET id=cat:luna labels=animal,cat props={"name":"Luna","sex":"female"}
 SUCCESS,node_set,id=cat:luna
-> GRAPH_EDGE_SET from=person:owner to=cat:luna type=owns weight=1.0 props={"src":"1"}
+> GRAPH_EDGE_SET from=person:owner to=cat:luna type=owns props={"src":"1"}
 SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8b3duc3xjYXQ6bHVuYQ
-> GRAPH_EDGE_SET from=cat:luna to=breed:siamese type=has_breed weight=1.0 props={"src":"1"}
+> GRAPH_EDGE_SET from=cat:luna to=breed:siamese type=has_breed props={"src":"1"}
 SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfYnJlZWR8YnJlZWQ6c2lhbWVzZQ
-> GRAPH_EDGE_SET from=cat:luna to=trait:sweet type=has_trait weight=0.9 props={"src":"1","intensity":"very"}
+> GRAPH_EDGE_SET from=cat:luna to=trait:sweet type=has_trait props={"src":"1","intensity":"very"}
 SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfdHJhaXR8dHJhaXQ6c3dlZXQ
-> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition weight=0.4 props={"src":"1","modality":"possible","verified":false}
+> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition confidence=possible props={"src":"1"}
 SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
-
-> GRAPH_NEIGHBOR_TYPES id=cat:luna direction=out limit=16 weighted=1
-SUCCESS,count=3,next_cursor=*,payload=<base64>
-# decodes to: [{"type":"has_breed","count":1,"weighted":1},{"type":"has_trait","count":1,"weighted":0.9},{"type":"has_condition","count":1,"weighted":0.4}]
 ```
 
-The `weighted` column already encodes the hedge: a `has_condition` worth 0.4 against a `has_breed`
-worth 1.0.
+Three facts are asserted flatly and one is hedged — *"may be"* becomes `confidence=possible`, not a
+different edge type and not a lowered `weight`. Every edge carries `src`, the episodic key.
 
 ### Turn 2 — ask, and hit a blocker
 
@@ -270,29 +270,29 @@ worth 1.0.
 
 ```text
 > INSERT:41 I would like to have a litter for my cat.
-SUCCESS,key=26
-> PAIR_SET episode:20260722T1703Z/002 26
+SUCCESS,key=24
+> PAIR_SET episode:20260722T1703Z/002 24
 SUCCESS,pair_set
 > GRAPH_NODE_SET id=intent:breed_litter labels=intent props={"goal":"litter","status":"open"}
 SUCCESS,node_set,id=intent:breed_litter
-> GRAPH_EDGE_SET from=person:owner to=intent:breed_litter type=wants weight=0.8 props={"src":"26"}
+> GRAPH_EDGE_SET from=person:owner to=intent:breed_litter type=wants props={"src":"24"}
 SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8d2FudHN8aW50ZW50OmJyZWVkX2xpdHRlcg
-> GRAPH_EDGE_SET from=intent:breed_litter to=cat:luna type=about weight=1.0
+> GRAPH_EDGE_SET from=intent:breed_litter to=cat:luna type=about
 SUCCESS,edge_set,id=MXxpbnRlbnQ6YnJlZWRfbGl0dGVyfGFib3V0fGNhdDpsdW5h
 
-> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.weight >= 0.3 RETURN paths LIMIT 8
+> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.modality >= 'possible' RETURN paths LIMIT 8
 SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"cat:luna","type":"has_condition","to":"condition:sterile","weight":0.4}]
+# decodes to: [{"from":"cat:luna","type":"has_condition","to":"condition:sterile","weight":1}]
 
-> GRAPH_EDGE_SET from=intent:breed_litter to=condition:sterile type=blocked_by weight=0.4
+> GRAPH_EDGE_SET from=intent:breed_litter to=condition:sterile type=blocked_by confidence=possible
 SUCCESS,edge_set,id=MXxpbnRlbnQ6YnJlZWRfbGl0dGVyfGJsb2NrZWRfYnl8Y29uZGl0aW9uOnN0ZXJpbGU
-> GRAPH_EDGE_SET from=intent:breed_litter to=action:vet_fertility_check type=requires weight=0.9
+> GRAPH_EDGE_SET from=intent:breed_litter to=action:vet_fertility_check type=requires
 SUCCESS,edge_set,id=MXxpbnRlbnQ6YnJlZWRfbGl0dGVyfHJlcXVpcmVzfGFjdGlvbjp2ZXRfZmVydGlsaXR5X2NoZWNr
 ```
 
-*"Luna is a female siamese, so a litter is possible — but there is an unverified sterility on record
-(confidence 0.4). Worth a vet fertility check first."* The plan is now **in the graph**, not only in
-the reply: `blocked_by` and `requires` survive the session.
+*"Luna is a female siamese, so a litter is possible — but there is a **possible** sterility on record.
+Worth a vet fertility check first."* The plan is now **in the graph**, not only in the reply, and the
+blocker inherits the same hedge as the fact behind it.
 
 ### Turn 3 — correction
 
@@ -300,29 +300,28 @@ the reply: `blocked_by` and `requires` survive the session.
 
 ```text
 > INSERT:46 The vet checked her: she is fertile after all.
-SUCCESS,key=42
-> PAIR_SET episode:20260722T1740Z/003 42
+SUCCESS,key=40
+> PAIR_SET episode:20260722T1740Z/003 40
 SUCCESS,pair_set
-> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition weight=0.02 props={"src":"42","verified":true,"ruled_out":true}
+> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition confidence=ruled_out props={"src":"40","source":"vet"}
 SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
 > GRAPH_EDGE_DEL from=intent:breed_litter to=condition:sterile type=blocked_by
 SUCCESS,edge_deleted,id=MXxpbnRlbnQ6YnJlZWRfbGl0dGVyfGJsb2NrZWRfYnl8Y29uZGl0aW9uOnN0ZXJpbGU
 > GRAPH_NODE_SET id=intent:breed_litter labels=intent props={"goal":"litter","status":"unblocked"}
 SUCCESS,node_set,id=intent:breed_litter
 
-> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.weight >= 0.3 RETURN count
+> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.modality >= 'possible' RETURN count
 SUCCESS,return=count,matches=0,next_cursor=*
 
-> GRAPH_QUERY MATCH (id='intent:breed_litter')-[:*]->(*) RETURN paths LIMIT 8
-SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"intent:breed_litter","type":"about","to":"cat:luna","weight":1},
-#              {"from":"intent:breed_litter","type":"requires","to":"action:vet_fertility_check","weight":0.9}]
+> GRAPH_QUERY MATCH (id='cat:luna')-[:has_condition]->(*) WHERE edge.modality = 'ruled_out' RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"cat:luna","type":"has_condition","to":"condition:sterile","weight":1}]
 ```
 
-Three properties of a correction done right: the belief is **demoted, not deleted** (`weight=0.02`,
-`ruled_out:true`, still answerable if the user asks "weren't you saying she was sterile?"); the
-**derived** edge that depended on it *is* deleted; and the confidence filter that used to return the
-blocker now returns `matches=0`.
+Three properties of a correction done right: the belief is **demoted, not deleted** (`ruled_out`, with
+`source:"vet"` recording who settled it, so *"weren't you saying she was sterile?"* is still
+answerable); the **derived** edge that depended on it *is* deleted; and the same filter that used to
+return the blocker now returns nothing, while an explicit `= 'ruled_out'` query still finds it.
 
 ### Turn 4 — a second domain, same mechanics
 
@@ -330,14 +329,14 @@ blocker now returns `matches=0`.
 
 ```text
 > INSERT:63 My friend Sara moved to Lisbon and she is strictly gluten free.
-SUCCESS,key=46
-> PAIR_SET episode:20260722T1802Z/004 46
+SUCCESS,key=43
+> PAIR_SET episode:20260722T1802Z/004 43
 SUCCESS,pair_set
 > GRAPH_NODE_SET id=person:sara labels=friend,person
 SUCCESS,node_set,id=person:sara
-> GRAPH_EDGE_SET from=person:sara to=city:lisbon type=lives_in weight=1.0 props={"src":"46"}
+> GRAPH_EDGE_SET from=person:sara to=city:lisbon type=lives_in props={"src":"43"}
 SUCCESS,edge_set,id=MXxwZXJzb246c2FyYXxsaXZlc19pbnxjaXR5Omxpc2Jvbg
-> GRAPH_EDGE_SET from=person:sara to=diet:gluten_free type=follows_diet weight=1.0 props={"src":"46","strict":true}
+> GRAPH_EDGE_SET from=person:sara to=diet:gluten_free type=follows_diet props={"src":"43","strict":true}
 SUCCESS,edge_set,id=MXxwZXJzb246c2FyYXxmb2xsb3dzX2RpZXR8ZGlldDpnbHV0ZW5fZnJlZQ
 ```
 
@@ -347,43 +346,63 @@ SUCCESS,edge_set,id=MXxwZXJzb246c2FyYXxmb2xsb3dzX2RpZXR8ZGlldDpnbHV0ZW5fZnJlZQ
 
 ```text
 > INSERT:52 Who could look after Luna if I travel to visit Sara?
-SUCCESS,key=59
-> PAIR_SET episode:20260722T1815Z/005 59
+SUCCESS,key=56
+> PAIR_SET episode:20260722T1815Z/005 56
 SUCCESS,pair_set
 
 > GRAPH_NEIGHBORS id=cat:luna direction=in type=catsits limit=8
 SUCCESS,count=0,next_cursor=*,payload=W10=
 # decodes to: []
+
+> GRAPH_NODE_SET id=hypothesis:catsitter labels=hypothesis props={"question":"who_catsits_luna","status":"open"}
+SUCCESS,node_set,id=hypothesis:catsitter
+> GRAPH_EDGE_SET from=person:owner to=hypothesis:catsitter type=unsure_about props={"src":"56"}
+SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8dW5zdXJlX2Fib3V0fGh5cG90aGVzaXM6Y2F0c2l0dGVy
+> GRAPH_EDGE_SET from=hypothesis:catsitter to=cat:luna type=about
+SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOmNhdHNpdHRlcnxhYm91dHxjYXQ6bHVuYQ
 ```
 
 `count=0` is the answer: *"I have nobody on record who looks after Luna."* The model must not fill the
-gap from its parameters. Instead it records the open question so the system can close it later:
+gap from its parameters — it records the open question instead, so the system can close it later.
+
+### Turn 6 — an answer that is itself ambiguous
+
+> *"Maybe Marco can catsit, or his brother Luca — I think Marco did it last summer."*
+
+Two readings, one of them favoured. Both go in, as a group:
 
 ```text
-> GRAPH_NODE_SET id=hypothesis:catsitter labels=hypothesis props={"question":"who_catsits_luna","status":"open"}
-SUCCESS,node_set,id=hypothesis:catsitter
-> GRAPH_EDGE_SET from=person:owner to=hypothesis:catsitter type=unsure_about weight=1.0 props={"src":"59"}
-SUCCESS,edge_set,id=MXxwZXJzb246b3duZXJ8dW5zdXJlX2Fib3V0fGh5cG90aGVzaXM6Y2F0c2l0dGVy
-> GRAPH_EDGE_SET from=hypothesis:catsitter to=cat:luna type=about weight=1.0
-SUCCESS,edge_set,id=MXxoeXBvdGhlc2lzOmNhdHNpdHRlcnxhYm91dHxjYXQ6bHVuYQ
+> INSERT:79 Maybe Marco can catsit, or his brother Luca - I think Marco did it last summer.
+SUCCESS,key=65
+> PAIR_SET episode:20260722T1817Z/006 65
+SUCCESS,pair_set
 
-> GRAPH_NEIGHBORS id=person:owner direction=out type=unsure_about limit=8
-SUCCESS,count=1,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"person:owner","to":"hypothesis:catsitter","type":"unsure_about","weight":1,"props":{"src":"59"},…}]
+> GRAPH_AMBIGUITY_SET from=hypothesis:catsitter type=candidate group=who_catsits options=person:marco=0.7,person:luca
+SUCCESS,ambiguity_set,group=who_catsits,options=2,confidence_sum=1.0000
+
+> GRAPH_AMBIGUITY_GET from=hypothesis:catsitter group=who_catsits
+SUCCESS,group=who_catsits,count=2,confidence_sum=1.0000,top=person:marco,top_modality=probable,payload=<base64>
+# decodes to: [{"from":"hypothesis:catsitter","to":"person:marco","type":"candidate","confidence":0.7,"modality":"probable","ambiguity":"who_catsits",…},
+#              {"from":"hypothesis:catsitter","to":"person:luca","type":"candidate","confidence":0.3,"modality":"unlikely","ambiguity":"who_catsits",…}]
 ```
 
-"What am I still unsure about?" is now a one-hop read — the agent can raise it later, unprompted.
+The declared 0.7 leaves 0.3 for the alternative, and each number gets its word. The assistant can now
+answer *"probably Marco, possibly his brother Luca"* — and `top`/`top_modality` give it that ranking
+without decoding anything.
 
-### Turn 6 — teach the missing fact, ask again
+### Turn 7 — confirmation collapses the group
 
-> *"Marco can catsit, he did it last summer."*
+> *"Confirmed, it was Marco."*
 
 ```text
-> INSERT:40 Marco can catsit, he did it last summer.
-SUCCESS,key=68
-> PAIR_SET episode:20260722T1817Z/006 68
+> INSERT:24 Confirmed, it was Marco.
+SUCCESS,key=74
+> PAIR_SET episode:20260722T1822Z/007 74
 SUCCESS,pair_set
-> GRAPH_EDGE_SET from=person:marco to=cat:luna type=catsits weight=1.0 props={"src":"68","last_time":"summer_2025"}
+
+> GRAPH_AMBIGUITY_RESOLVE from=hypothesis:catsitter group=who_catsits winner=person:marco
+SUCCESS,ambiguity_resolved,group=who_catsits,winner=person:marco,ruled_out=1,dropped=0
+> GRAPH_EDGE_SET from=person:marco to=cat:luna type=catsits props={"src":"74","last_time":"summer_2025"}
 SUCCESS,edge_set,id=MXxwZXJzb246bWFyY298Y2F0c2l0c3xjYXQ6bHVuYQ
 > GRAPH_NODE_SET id=hypothesis:catsitter labels=hypothesis props={"question":"who_catsits_luna","status":"resolved"}
 SUCCESS,node_set,id=hypothesis:catsitter
@@ -392,41 +411,98 @@ SUCCESS,edge_deleted,id=MXxwZXJzb246b3duZXJ8dW5zdXJlX2Fib3V0fGh5cG90aGVzaXM6Y2F0
 
 > GRAPH_QUERY MATCH (id='cat:luna')<-[:catsits]-(*) RETURN edges LIMIT 8
 SUCCESS,return=edges,matches=1,next_cursor=*,payload=<base64>
-# decodes to: [{"from":"person:marco","to":"cat:luna","type":"catsits","weight":1,"props":{"last_time":"summer_2025","src":"68"},…}]
+# decodes to: [{"from":"person:marco","to":"cat:luna","type":"catsits","weight":1,"props":{"last_time":"summer_2025","src":"74"},…}]
+
+> GRAPH_QUERY MATCH (id='hypothesis:catsitter')-[:candidate]->(*) WHERE edge.modality = 'ruled_out' RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"hypothesis:catsitter","type":"candidate","to":"person:luca","weight":1}]
 
 > GRAPH_NEIGHBORS id=person:owner direction=out type=unsure_about limit=8
 SUCCESS,count=0,next_cursor=*,payload=W10=
 ```
 
-The identical query that returned nothing in turn 5 now answers, and the open-questions list is empty
-again. That round trip — *ask → miss → record the gap → learn → answer* — is the entire thesis of this
-document, and it took six commands.
+The query that returned nothing in turn 5 now answers; the discarded reading survives as *excluded*
+rather than forgotten; and the open-questions list is empty again. That round trip — *ask → miss →
+record the gap → learn (ambiguously) → confirm → answer* — is the entire thesis of this document, and
+it cost about twenty commands.
 
 ### Where the session landed
 
 ```text
 > GRAPH_DEGREE id=cat:luna direction=both type=* weighted=1
-SUCCESS,id=cat:luna,direction=both,type=*,degree=7,weighted_degree=5.920000
+SUCCESS,id=cat:luna,direction=both,type=*,degree=7,weighted_degree=7.000000
 > PAIR_SUMMARY x01676e3a 1 8
-SUCCESS,command=PAIR_SUMMARY,count=12,total_payload_bytes=1579,min_payload_bytes=106,max_payload_bytes=199,min_key=2,max_key=69,max_depth=35,self_terminal=0,branch_count=5,branches=59:5;63:3;61:2;5a:1;64:1
+SUCCESS,command=PAIR_SUMMARY,count=13,total_payload_bytes=1681,min_payload_bytes=106,max_payload_bytes=199,min_key=2,max_key=70,max_depth=35,self_terminal=0,branch_count=5,branches=59:5;63:4;61:2;5a:1;64:1
 ```
 
-Twelve nodes, seven edges around Luna, six episodes — a whole conversational memory in ~1.5 KB of
-node payloads. `x01676e3a` is the reserved node namespace `\x01gn:` in hex; `count` is how many
-entities the agent knows.
+Note `weighted_degree` is now exactly the degree: with confidence stored in its own field, `weight`
+stays at its default and means only "traversal strength". Uncertainty no longer distorts graph
+statistics — which is precisely why it stopped living there.
 
 ---
 
-## 7. Uncertainty, in one paragraph
+## 7. Uncertainty and ambiguity
 
-Fully covered in
-[README → Recording uncertainty](../README.md#recording-uncertainty-alternatives-and-corrections):
-confidence in `weight`, the reason in `props` (`modality`, `verified`, `source`, `as_of`,
-`ruled_out`), and mutually exclusive readings as several edges sharing `props.oneof` with weights
-summing to ~1. The only addition for a learning agent: **an unverified fact and a missing fact are
-different states**, and both are different from a *ruled out* one. Keep them distinguishable
-(`verified:false` vs no edge vs `ruled_out:true`), because the three imply different next actions —
-confirm, ask, or stop asking.
+An agent that learns from conversation is wrong sometimes, half-sure often, and outright confused
+regularly. The engine carries all three states on the edge itself — see
+[README → Uncertainty and ambiguity](../README.md#uncertainty-and-ambiguity) for the full surface.
+What matters for the loop:
+
+**Say how sure you are, in either notation.** `confidence=` takes a number or a word from the ordered
+scale `ruled_out < unlikely < possible < probable < certain`; the missing one is derived. A model
+that phrases the user's hedge as a word ("she *may* be sterile" → `possible`) and a model that emits a
+softmax score both end up in the same store:
+
+```text
+> GRAPH_EDGE_SET from=cat:luna to=condition:sterile type=has_condition confidence=possible props={"src":"1"}
+SUCCESS,edge_set,id=MXxjYXQ6bHVuYXxoYXNfY29uZGl0aW9ufGNvbmRpdGlvbjpzdGVyaWxl
+> GRAPH_EDGE_GET from=cat:luna to=condition:sterile type=has_condition
+# decodes to: {…,"weight":1,"confidence":0.5,"modality":"possible","props":{"src":"1"},…}
+```
+
+**Four states, not two.** A learning agent must keep these distinguishable, because each implies a
+different next move:
+
+| State | How it looks | What the agent should do |
+| --- | --- | --- |
+| asserted | no `confidence` declared, or `certain` | answer with it |
+| hedged | `possible` / `probable` | answer *and* flag the hedge; consider confirming |
+| ruled out | `ruled_out` (0.0) | answer the negative, and stop re-asking |
+| unknown | no edge at all (`matches=0`) | say so, record a `hypothesis:` node (§6, turn 5) |
+
+Collapsing "ruled out" into "unknown" — by deleting instead of demoting — is the mistake that makes an
+assistant re-ask a question the user already answered.
+
+**Ambiguity is a group, not a guess.** When the sentence offers several readings, write them all:
+
+```text
+> GRAPH_AMBIGUITY_SET from=person:marco type=likes group=fav_color options=color:light_blue,color:aquamarine
+SUCCESS,ambiguity_set,group=fav_color,options=2,confidence_sum=1.0000
+> GRAPH_AMBIGUITY_GET from=person:marco group=fav_color
+SUCCESS,group=fav_color,count=2,confidence_sum=1.0000,top=color:aquamarine,top_modality=possible,payload=<base64>
+```
+
+`top`/`top_modality` are there for the moment a model *must* pick one: it gets the strongest reading
+and the word for how much to trust it, without decoding the payload. Lean one way with
+`options=city:lisbon=0.7,city:porto` (the rest splits the leftover) or with relative shares
+(`options=a=3,b=1` → 0.75/0.25).
+
+**The words are a filter.** Because the scale is ordered, the same query shape asks "what can I
+assert?" before and after the doubt is settled:
+
+```text
+> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.modality >= 'probable' RETURN count
+SUCCESS,return=count,matches=0,next_cursor=*
+> GRAPH_AMBIGUITY_RESOLVE from=person:marco group=fav_color winner=color:aquamarine
+SUCCESS,ambiguity_resolved,group=fav_color,winner=color:aquamarine,ruled_out=1,dropped=0
+> GRAPH_QUERY MATCH (id='person:marco')-[:likes]->(*) WHERE edge.modality >= 'probable' RETURN paths LIMIT 8
+SUCCESS,return=paths,matches=1,next_cursor=*,payload=<base64>
+# decodes to: [{"from":"person:marco","type":"likes","to":"color:aquamarine","weight":1}]
+```
+
+That is the retrieval-time contract worth building the answer template on: **filter by
+`edge.modality >= 'probable'` for what you are willing to state, and query the rest only when the user
+asks what you are unsure about.**
 
 ---
 
@@ -637,11 +713,13 @@ You convert user statements into cheetah-db commands. Emit only commands, one pe
    already used in this conversation; do not mint a variant.
 3. labels = kinds; props = compact JSON with no spaces (base64 if any value has a space).
 4. Edge per relation: snake_case verb, weight = confidence 0..1, props.src = the INSERT key.
-5. Hedges ("may", "I think") → weight 0.3-0.5 + props {"modality":"possible","verified":false}.
-   "Either A or B" → both edges, shared props.oneof, weights summing to ~1.
-6. To change an existing fact, write the COMPLETE record: omitted weight resets to 1.0 and omitted
-   props are replaced, not merged.
-7. Never write a relation the user did not state. Never write an answer you inferred.
+5. Hedges ("may", "I think") → confidence=possible (or probable/unlikely, or a number 0..1).
+   Omit confidence entirely for a flat assertion. Provenance goes in props: {"source":"elena"}.
+6. "Either A or B" → one GRAPH_AMBIGUITY_SET from=<anchor> group=<slug> options=A,B (add =<share>
+   when you lean one way), and GRAPH_AMBIGUITY_RESOLVE ... winner=<id> when it is settled.
+7. To change an existing fact, write the COMPLETE record: omitted weight resets to 1.0 and omitted
+   props are replaced, not merged (confidence/modality/ambiguity are the exception: they persist).
+8. Never write a relation the user did not state. Never write an answer you inferred.
 ```
 
 **Recaller (question → queries → grounded answer):**
@@ -654,8 +732,9 @@ You answer from the database only. Emit queries, read the rows, then answer.
    question is answered.
 3. Then the targeted read: GRAPH_NEIGHBORS (one hop; direction=in for reverse) or GRAPH_QUERY
    (WHERE predicates, HOPS 1..n, RETURN edges|nodes|paths|count).
-4. Report weight and modality as uncertainty in words: 1.0 = flat statement, 0.3-0.5 = "you
-   mentioned it might be", ruled_out = "you later corrected this".
+4. Report edge.modality in words: certain = flat statement, probable/possible = "you mentioned it
+   might be", ruled_out = "you later corrected this". Filter with WHERE edge.modality >= 'probable'
+   for anything you are going to state as fact.
 5. matches=0 / node_not_found = "I don't have that." Never fill the gap from your own knowledge.
    Record the gap: hypothesis:<slug> + <speaker> -[:unsure_about]-> it.
 6. End a resolved turn with the write-back: intent -[:blocked_by]-> …, -[:requires]-> …, or the
@@ -687,8 +766,11 @@ conversation.
 
 Design honestly around these; none of them has a workaround inside the server today.
 
-- **No `OR`/`NOT`/parentheses in `WHERE`** — predicates are AND-only. Disjunction is expressed as data
-  (`props.oneof`) and unioned client-side.
+- **No `OR`/`NOT`/parentheses in `WHERE`** — predicates are AND-only. A disjunction is therefore
+  stored as an ambiguity *group* and read back with one `edge.ambiguity` equality; anything richer is
+  a client-side union.
+- **Ambiguity groups are anchored to one node** and are normalized only when written through
+  `GRAPH_AMBIGUITY_SET`/`_RESOLVE`; a plain `GRAPH_EDGE_SET` on a member can unbalance the group.
 - **No atomicity.** Each command commits on its own; a batch that half-fails leaves half-written state,
   and there is no rollback. Make writes idempotent (they are upserts) and re-run.
 - **No vector search.** The trie is prefix-ordered, not metric. Coarse-bucketing a quantized embedding

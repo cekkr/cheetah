@@ -525,6 +525,26 @@ plus a property index.
   and flip the arrow (`(id='x')<-[:t]-(*)`), which means **every direction-dependent branch must
   mirror both endpoints** — see [direction mirroring](#pitfall-graph-direction).
 
+#### [`graph_uncertainty.go`](graph_uncertainty.go)
+
+First-class uncertainty and ambiguity on edges: the modality scale (words ↔ numbers) and the
+`GRAPH_AMBIGUITY_*` commands.
+
+- **Key symbols:** `graphModalityScale` (the five ordered anchors `ruled_out .25 possible .75 certain`)
+  and `graphModalityAliases`; `graphModalityByName`, `graphModalityForConfidence` (nearest anchor),
+  `graphModalityRank`, `graphParseConfidenceToken`, `graphResolveUncertaintyArgs` (the
+  `confidence=`/`modality=` pair, with the "not passed vs passed" distinction);
+  `graphEffectiveConfidence`/`graphEffectiveModality` (an undeclared edge reads as `certain`);
+  `graphParseAmbiguityOptions`, `graphParseAmbiguityShare`, `graphDistributeAmbiguity` (probability vs
+  relative-share reading), `graphRoundConfidence`; handlers `handleGraphAmbiguitySet/Get/Resolve` and
+  `graphCollectAmbiguityGroup`.
+- **Depends on:** [`graph.go`](graph.go) (record, upsert, adjacency scan). **Tests:**
+  [`graph_uncertainty_test.go`](graph_uncertainty_test.go).
+- **Common mistakes:** `GraphEdgeRecord.Confidence` is a `*float64` because `0` means `ruled_out` and
+  must stay distinct from "never declared". Inside a group, option shares may exceed 1 (they are
+  relative and get normalized); a standalone `confidence=` may not. Groups are anchored to one node's
+  adjacency — there is no global group index.
+
 ### Cluster coordination
 
 #### [`cluster_scheduler.go`](cluster_scheduler.go)
@@ -738,6 +758,21 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Constraints:** left node ID-anchored; reserved `\x01..\x04` + `graph/idx/` prefixes; a reverse
   `<-[:t]-` pattern anchors on the left node and reads the `adj/in` index.
 
+### Edge uncertainty + ambiguity — Shipped
+
+- **Behavior:** an edge carries `confidence` (0–1), `modality` (a word on the ordered scale
+  `ruled_out < unlikely < possible < probable < certain`, with aliases) and `ambiguity` (the group of
+  mutually exclusive readings it belongs to). Either notation sets both. `GRAPH_AMBIGUITY_SET/GET/
+  RESOLVE` write, read and collapse a whole alternative set; `WHERE` gained `edge.confidence`
+  (number *or* word), `edge.modality` (word for `=`/`!=`, rank for the ordering operators) and
+  `edge.ambiguity`.
+- **Owners:** [`graph_uncertainty.go`](graph_uncertainty.go) + the record/upsert/predicate paths in
+  [`graph.go`](graph.go). **Tests:** [`graph_uncertainty_test.go`](graph_uncertainty_test.go).
+- **Constraints:** an edge that declares nothing reads as `certain`; belief fields **persist across a
+  partial upsert** (unlike `weight`, which resets to 1.0) and are cleared with `confidence=-`; a group
+  is normalized only when written through the `GRAPH_AMBIGUITY_*` commands and is anchored to one
+  node's adjacency.
+
 ### Prediction tables + context matrices — Shipped (GPU path simulated)
 
 - **Behavior:** `PREDICT_SET/QUERY/TRAIN/CTX/INHERIT(+batch/async)/BACKEND/BENCH` over fixed-byte
@@ -848,6 +883,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `PAIR_SCAN`, `PAIR_SUMMARY` | [`database.go`](database.go) (`PairScanWithOptions`, `PairSummaryWithOptions`) |
 | `PAIR_REDUCE(_ASYNC/_STATUS/_FETCH)` | [`database.go`](database.go) + [`reducers.go`](reducers.go) + [`reduce_jobs.go`](reduce_jobs.go) |
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](graph.go) |
+| `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](graph_uncertainty.go) |
 | `PREDICT_*` | [`prediction_table.go`](prediction_table.go), [`prediction_manager.go`](prediction_manager.go), [`predict_jobs.go`](predict_jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](cluster_scheduler.go), [`cluster_gossip.go`](cluster_gossip.go) |
 | `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](database.go), [`resource_monitor.go`](resource_monitor.go), [`logger.go`](logger.go), [`file_manager.go`](file_manager.go) |
@@ -994,6 +1030,9 @@ seen in old docs are **client-side**; the server does not read them.
 | Batch edge upsert (+ continue-on-error) | [`TestGraphEdgeSetBatchAndDegree`](graph_test.go), [`TestGraphEdgeSetBatchContinueOnError`](graph_test.go) |
 | Multi-hop bounds + cost limits | [`TestGraphQueryMultiHopBoundsAndCost`](graph_test.go) |
 | Reverse (`<-[:t]-`) single hop matches `direction=in` adjacency | [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](graph_test.go) |
+| Confidence/modality round trip, default `certain`, persistence across partial upserts | [`TestGraphConfidence*`](graph_uncertainty_test.go) |
+| Modality predicates compare by rank; ambiguity groups set/get/resolve/drop and share distribution | [`TestGraphModalityPredicateOrdering`/`TestGraphAmbiguity*`](graph_uncertainty_test.go) |
+| Batch edge upsert carries confidence (number or word) and group tags | [`TestGraphEdgeBatchCarriesUncertainty`](graph_uncertainty_test.go) |
 | `LOG_FLUSH` answers on one line and leaves the next response aligned | [`TestLogFlush*`](logger_test.go) |
 | Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](graph_test.go) |
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](graph_test.go) |
