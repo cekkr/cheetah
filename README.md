@@ -10,12 +10,14 @@ other dense analytical slices must be served with predictable latency.
 
 - **Byte-faithful layout.** Every entry is cataloged by byte length, table ID, and entry index, so
   reads turn into deterministic `ReadAt` calls instead of scanning variable-length payloads.
-- **Trie-indexed pair table.** The `pairs/` directory holds fixed-size nodes that behave like a
-  prefix tree. Nodes index a single byte per hop by default to keep tables compact, while the optional
-  2-byte stride (set via `pair_index_bytes`) trades extra disk usage for shallower lookups. `PAIR_SCAN`
-  and `PAIR_REDUCE` walk that trie, making namespace sweeps and reducer workloads practical even when
-  the keyspace spans billions of n-gram contexts. Unique suffixes automatically collapse into jump
-  nodes so single-key branches no longer allocate full tables.
+- **Trie-indexed pair table.** The `pairs/` directory holds nodes that behave like a prefix tree.
+  Nodes index a single byte per hop by default, while the optional 2-byte stride (set via
+  `pair_index_bytes`) buys shallower lookups. `PAIR_SCAN` and `PAIR_REDUCE` walk that trie, making
+  namespace sweeps and reducer workloads practical even when the keyspace spans billions of n-gram
+  contexts. Unique suffixes automatically collapse into jump nodes so single-key branches no longer
+  allocate full tables, and **adaptive node indexing** keeps a sparse node as a compact
+  binary-searched list instead of reserving its whole branch array — so the wide stride no longer
+  costs ~707 KB per node.
 - **Payload caching.** `database.go` keeps a bounded cache (defaults: 16k entries ≈64 MB) keyed by
   `<value_size, table_id, entry_id>` so hot payloads never hit disk. Tune it with
   `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
@@ -95,12 +97,22 @@ Prefer declarative settings? Copy `config.example.ini` to `config.ini` (or point
 `CHEETAH_CONFIG_PATH` at a custom file) and edit:
 
 - `[server]` covers `listen_addr`, `data_dir`, and `default_database`.
-- `[database]` sets `pair_index_bytes` (1 or 2) plus payload-cache sizing.
-- `[tuning]` exposes `max_pair_tables` so you can pin the open-file budget.
+- `[database]` sets `pair_index_bytes` (1 or 2) and `adaptive_pair_index` (default `true`), plus
+  payload-cache sizing.
+- `[tuning]` exposes `max_pair_tables` so you can pin the open-file budget,
+  `pair_list_max_bytes` (default 4096) — the sorted-list size at which an adaptive node expands into
+  a direct-mapped array, which also decides which nodes use a list at all — and the optional
+  `pair_list_max_fill_percent` (default 0, off).
 
 Per-database overrides can be forced at runtime via CLI/TCP commands—append
-`key=value` tokens such as `pair_bytes=1` or `payload_cache_entries=0` to the
-`DATABASE`/`RESET_DB` commands to rebuild a trie with different settings.
+`key=value` tokens such as `pair_bytes=1`, `adaptive_pair_index=0`, or `payload_cache_entries=0` to
+the `DATABASE`/`RESET_DB` commands to rebuild a trie with different settings.
+
+`pair_index_bytes` and `adaptive_pair_index` are recorded in `pairs/format.dat` when a database is
+created and that marker wins on every later open, so editing `config.ini` never reinterprets existing
+on-disk data. Use `RESET_DB <name> [pair_bytes=…] [adaptive_pair_index=…]` to rebuild with new
+settings. A `pairs/` directory written before this format existed is refused at open with
+`incompatible_pair_format_rebuild_required`; rebuild it and re-ingest.
 
 The binary prints `[cheetah_data/default]>` when ready. Use `DATABASE <name>` (CLI) to switch between
 logical databases or send the same command over TCP.
@@ -191,9 +203,10 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
   (`graph/idx/<prop>/<value>/...`) for fast filtering.
 - Reducer modes `degree`, `triangle`, and `pagerank_seed` operate directly on graph adjacency
   namespaces (`adj/out` / `adj/in`) so graph statistics can stream without full edge hydration.
-- `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`)
-  to rebuild a specific database with narrower trie nodes or a different payload-cache budget without
-  editing `config.ini`.
+- `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`,
+  plus `adaptive_pair_index=`, `pair_list_max_bytes=`, and `pair_list_max_fill_percent=`) to rebuild a specific database with different
+  trie-node geometry or payload-cache budget without editing `config.ini`. Trie-format overrides only
+  take effect when the database is created, so pair them with `RESET_DB`.
 - `SYSTEM_STATS` emits `logical_cores`, GOMAXPROCS, goroutine counts, CPU percentages, and
   per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
   out to `top`/`iostat`. The payload cache now reports `payload_cache_*` fields (entries/bytes,
@@ -487,10 +500,23 @@ defined in [`types.go`](types.go) and the traversal logic lives in [`database.go
   inside the root pair table and either follows a child table ID or marks the node as terminal with
   the absolute payload key. A single node can be both terminal and a parent, so `ctx:` and
   `ctx:BERLIN` can both carry values.
-- `PAIR_SCAN` snapshots each node and streams children in lexical order, so namespace enumeration only
-  touches the branches that exist. Nodes allocate exactly `∑_{i=1..pair_index_bytes} 256^i` slots
-  (256 entries when indexing a single byte, 256 + 65,536 entries when indexing two bytes), so the
-  engine can seek directly via `branchIndex * PairEntrySize` with no heap allocations.
+- `PAIR_SCAN` streams children in lexical order, so namespace enumeration only touches the branches
+  that exist. A node spans `∑_{i=1..pair_index_bytes} 256^i` logical branches (256 when indexing a
+  single byte, 256 + 65,536 when indexing two).
+- **Adaptive node storage** (`adaptive_pair_index`, on by default) decouples that logical span from
+  what a node actually costs. Each node file carries a small header and stores its entries either as
+  a sorted, binary-searched list of `[branchKey|entry]` records (sparse nodes) or as the classic
+  direct-mapped array reached by `PairHeaderSize + branchIndex * PairEntrySize` (populated nodes). A
+  node uses a list only when its dense array would exceed `pair_list_max_bytes` (4 KiB), and converts
+  to the array once the list passes that budget. A 1-byte-stride node is 2,828 bytes — already inside
+  one filesystem block — so it stays dense and keeps its original behaviour; the list container
+  therefore applies to 2-byte-stride nodes. That is where it matters, since such a node previously
+  reserved ~707 KB even when holding a handful of children: on a 20k-key benchmark the `pairs/`
+  directory drops from 776.5 MiB to 4.7 MiB apparent (~81–87 MiB to 4.5 MiB actually allocated) and a
+  full-trie enumeration drops from ~1.6–1.9 s to 5 ms, while insert and lookup stay within run-to-run
+  noise. Since a 1-byte-stride database gets no benefit, the savings require `pair_index_bytes = 2`.
+  The stride and the flag are pinned per database in `pairs/format.dat`; changing them requires
+  `RESET_DB`.
 - Jump nodes collapse unique suffixes into a compact segment so single-key branches no longer
   allocate entire tables. `PAIR_SET` writes the remainder of a key into a jump node whenever a branch
   has no siblings, and the node is split automatically if a later key shares part of that suffix. On

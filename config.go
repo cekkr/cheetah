@@ -24,6 +24,19 @@ type DatabaseConfig struct {
 	PairIndexBytes      int
 	PayloadCacheEntries int
 	PayloadCacheBytes   int64
+	// AdaptivePairIndex enables the adaptive per-node trie container: sparse
+	// nodes are stored as a binary-searched sorted list and only densify into a
+	// direct-mapped array once populated. Disabling it forces every node to the
+	// dense array from creation (legacy performance profile).
+	AdaptivePairIndex bool
+	// PairListMaxBytes is the sorted-list size (bytes) at which a node densifies.
+	// It also decides which nodes use a list at all: a node whose dense array
+	// already fits in this budget (any 1-byte-stride node) is dense from creation.
+	PairListMaxBytes int
+	// PairListMaxFillPercent optionally densifies a list node once it passes this
+	// percentage of branch capacity. 0 (default) disables it. Only meaningful for
+	// wide (2-byte-stride) nodes, which are the only ones that use lists.
+	PairListMaxFillPercent int
 }
 
 // DatabaseOverrides carries optional overrides collected via CLI/API commands.
@@ -31,7 +44,12 @@ type DatabaseOverrides struct {
 	PairIndexBytes      *int
 	PayloadCacheEntries *int
 	PayloadCacheBytes   *int64
+	AdaptivePairIndex   *bool
+	PairListMaxBytes    *int
+	PairListMaxFillPct  *int
 }
+
+const defaultPairListMaxBytes = 4096
 
 func defaultConfig() Config {
 	return Config{
@@ -43,6 +61,8 @@ func defaultConfig() Config {
 			PairIndexBytes:      1,
 			PayloadCacheEntries: defaultPayloadCacheEntries,
 			PayloadCacheBytes:   defaultPayloadCacheBytes,
+			AdaptivePairIndex:   true,
+			PairListMaxBytes:    defaultPairListMaxBytes,
 		},
 	}
 }
@@ -121,6 +141,8 @@ func assignConfigValue(section, key, val string, cfg *Config) {
 			if v := parseIntAllowZero(val, int(cfg.DatabaseDefaults.PayloadCacheBytes)); v >= 0 {
 				cfg.DatabaseDefaults.PayloadCacheBytes = int64(v)
 			}
+		case "adaptive_pair_index":
+			cfg.DatabaseDefaults.AdaptivePairIndex = parseBool(val, cfg.DatabaseDefaults.AdaptivePairIndex)
 		}
 	case "tuning":
 		switch key {
@@ -128,6 +150,12 @@ func assignConfigValue(section, key, val string, cfg *Config) {
 			if v := parsePositiveInt(val); v > 0 {
 				cfg.MaxPairTables = v
 			}
+		case "pair_list_max_bytes":
+			if v := parsePositiveInt(val); v > 0 {
+				cfg.DatabaseDefaults.PairListMaxBytes = v
+			}
+		case "pair_list_max_fill_percent":
+			cfg.DatabaseDefaults.PairListMaxFillPercent = parseIntAllowZero(val, cfg.DatabaseDefaults.PairListMaxFillPercent)
 		}
 	}
 }
@@ -155,6 +183,17 @@ func parseIntAllowZero(val string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func parseBool(val string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "1", "true", "yes", "on", "enable", "enabled":
+		return true
+	case "0", "false", "no", "off", "disable", "disabled":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func parseInt64AllowZero(val string, fallback int64) int64 {
@@ -201,6 +240,15 @@ func applyEnvOverrides(cfg *Config) {
 	if v := parsePositiveInt(os.Getenv("CHEETAH_MAX_PAIR_TABLES")); v > 0 {
 		cfg.MaxPairTables = v
 	}
+	if raw := strings.TrimSpace(os.Getenv("CHEETAH_ADAPTIVE_PAIR_INDEX")); raw != "" {
+		cfg.DatabaseDefaults.AdaptivePairIndex = parseBool(raw, cfg.DatabaseDefaults.AdaptivePairIndex)
+	}
+	if v := parsePositiveInt(os.Getenv("CHEETAH_PAIR_LIST_MAX_BYTES")); v > 0 {
+		cfg.DatabaseDefaults.PairListMaxBytes = v
+	}
+	if raw := strings.TrimSpace(os.Getenv("CHEETAH_PAIR_LIST_MAX_FILL_PERCENT")); raw != "" {
+		cfg.DatabaseDefaults.PairListMaxFillPercent = parseIntAllowZero(raw, cfg.DatabaseDefaults.PairListMaxFillPercent)
+	}
 }
 
 func (cfg *Config) normalize() {
@@ -225,6 +273,12 @@ func (cfg *Config) normalize() {
 	if cfg.DatabaseDefaults.PayloadCacheEntries < 0 {
 		cfg.DatabaseDefaults.PayloadCacheEntries = defaultPayloadCacheEntries
 	}
+	if cfg.DatabaseDefaults.PairListMaxBytes <= 0 {
+		cfg.DatabaseDefaults.PairListMaxBytes = defaultPairListMaxBytes
+	}
+	if cfg.DatabaseDefaults.PairListMaxFillPercent < 0 || cfg.DatabaseDefaults.PairListMaxFillPercent > 100 {
+		cfg.DatabaseDefaults.PairListMaxFillPercent = 0
+	}
 	if cfg.MaxPairTables < 0 {
 		cfg.MaxPairTables = 0
 	}
@@ -243,6 +297,15 @@ func mergeDatabaseConfig(base DatabaseConfig, override DatabaseOverrides) Databa
 	}
 	if override.PayloadCacheBytes != nil {
 		result.PayloadCacheBytes = *override.PayloadCacheBytes
+	}
+	if override.AdaptivePairIndex != nil {
+		result.AdaptivePairIndex = *override.AdaptivePairIndex
+	}
+	if override.PairListMaxBytes != nil {
+		result.PairListMaxBytes = *override.PairListMaxBytes
+	}
+	if override.PairListMaxFillPct != nil {
+		result.PairListMaxFillPercent = *override.PairListMaxFillPct
 	}
 	return result
 }
@@ -279,6 +342,20 @@ func parseDatabaseOverrideTokens(tokens []string) (DatabaseOverrides, error) {
 		case "payload_cache_bytes":
 			parsed := parseInt64AllowZero(val, 0)
 			overrides.PayloadCacheBytes = ptrInt64(parsed)
+		case "adaptive_pair_index":
+			overrides.AdaptivePairIndex = ptrBool(parseBool(val, true))
+		case "pair_list_max_bytes":
+			if v := parsePositiveInt(val); v > 0 {
+				overrides.PairListMaxBytes = ptrInt(v)
+			} else {
+				return overrides, fmt.Errorf("pair_list_max_bytes must be >0")
+			}
+		case "pair_list_max_fill_percent":
+			v := parseIntAllowZero(val, -1)
+			if v < 0 || v > 100 {
+				return overrides, fmt.Errorf("pair_list_max_fill_percent must be 0..100")
+			}
+			overrides.PairListMaxFillPct = ptrInt(v)
 		default:
 			return overrides, fmt.Errorf("unknown override %s", key)
 		}
@@ -288,6 +365,7 @@ func parseDatabaseOverrideTokens(tokens []string) (DatabaseOverrides, error) {
 
 func ptrInt(v int) *int       { return &v }
 func ptrInt64(v int64) *int64 { return &v }
+func ptrBool(v bool) *bool    { return &v }
 
 func parseDatabaseTarget(arg string) (string, *DatabaseOverrides, error) {
 	arg = strings.TrimSpace(arg)

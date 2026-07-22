@@ -22,35 +22,38 @@ import (
 )
 
 type Database struct {
-	name             string
-	path             string
-	highestKey       atomic.Uint64
-	nextPairTableID  atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
-	mainKeys         *MainKeysTable
-	valuesTables     sync.Map
-	recycleTables    sync.Map
-	pairTables       sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
-	fileManager      *FileManager
-	pairTableCache   *pairTableCache
-	payloadCache     *payloadCache
-	mu               sync.Mutex
-	pairDir          string // Path alla cartella /pairs
-	nextPairIDPath   string // Path al file che memorizza il contatore
-	jumpDataPath     string
-	jumpIndexPath    string
-	jumpMu           sync.Mutex
-	resources        *ResourceMonitor
-	settings         DatabaseConfig
-	branchCodec      pairBranchCodec
-	jumpDir          string
-	nextJumpIDPath   string
-	nextJumpID       atomic.Uint32
-	forkScheduler    *ForkScheduler
-	predictStore     *PredictionManager
-	clusterMessenger *ClusterMessenger
-	reduceJobs       *reduceJobManager
-	predictJobs      *predictInheritJobManager
-	reducers         *ReducerRegistry
+	name               string
+	path               string
+	highestKey         atomic.Uint64
+	nextPairTableID    atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
+	mainKeys           *MainKeysTable
+	valuesTables       sync.Map
+	recycleTables      sync.Map
+	pairTables         sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
+	fileManager        *FileManager
+	pairTableCache     *pairTableCache
+	payloadCache       *payloadCache
+	mu                 sync.Mutex
+	pairDir            string // Path alla cartella /pairs
+	nextPairIDPath     string // Path al file che memorizza il contatore
+	jumpDataPath       string
+	jumpIndexPath      string
+	jumpMu             sync.Mutex
+	resources          *ResourceMonitor
+	settings           DatabaseConfig
+	branchCodec        pairBranchCodec
+	adaptivePairs      bool // adaptive per-node LIST/DENSE container enabled
+	pairListMaxBytes   int  // LIST densify byte budget
+	pairListMaxFillPct int  // optional extra densify cap (% of capacity, 0 = off)
+	jumpDir            string
+	nextJumpIDPath     string
+	nextJumpID         atomic.Uint32
+	forkScheduler      *ForkScheduler
+	predictStore       *PredictionManager
+	clusterMessenger   *ClusterMessenger
+	reduceJobs         *reduceJobManager
+	predictJobs        *predictInheritJobManager
+	reducers           *ReducerRegistry
 }
 
 type pairTableCache struct {
@@ -349,33 +352,55 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		return nil, err
 	}
 
-	codec, err := newPairBranchCodec(cfg.PairIndexBytes)
+	// Resolve the pair-trie container format. The per-database marker
+	// (pairs/format.dat) is authoritative once written: it pins the stride and
+	// the adaptive flag so a database is always reopened with the same layout it
+	// was built with. A directory that already holds legacy (headerless) pair
+	// tables but no marker is refused — the operator must RESET_DB to rebuild it
+	// in the current format.
+	pairFmt, err := resolvePairFormat(pairDir, cfg)
 	if err != nil {
 		return nil, err
 	}
 
+	codec, err := newPairBranchCodec(pairFmt.stride)
+	if err != nil {
+		return nil, err
+	}
+
+	// Keep the recorded settings consistent with the format actually in use: the
+	// marker can legitimately differ from the supplied config on reopen.
+	effective := cfg
+	effective.PairIndexBytes = pairFmt.stride
+	effective.AdaptivePairIndex = pairFmt.adaptive
+	effective.PairListMaxBytes = pairFmt.listMaxBytes
+	effective.PairListMaxFillPercent = pairFmt.listMaxFillPct
+
 	pairLimit := resolvePairTableLimit(maxPairTables)
 	fileManager := NewFileManager(pairLimit, monitor)
 	db := &Database{
-		name:           name,
-		path:           path,
-		pairDir:        pairDir,
-		nextPairIDPath: filepath.Join(pairDir, "next_id.dat"),
-		mainKeys:       mkt,
-		payloadCache:   newPayloadCacheFromConfig(cfg),
-		resources:      monitor,
-		fileManager:    fileManager,
-		pairTableCache: newPairTableCache(pairLimit),
-		settings:       cfg,
-		branchCodec:    codec,
-		jumpDir:        jumpDir,
-		jumpDataPath:   filepath.Join(jumpDir, "jumps.bin"),
-		jumpIndexPath:  filepath.Join(jumpDir, "index.bin"),
-		nextJumpIDPath: filepath.Join(jumpDir, "next_id.dat"),
-		forkScheduler:  newForkScheduler(path),
-		reduceJobs:     newReduceJobManager(),
-		predictJobs:    newPredictInheritJobManager(),
-		reducers:       newReducerRegistry(),
+		name:               name,
+		path:               path,
+		pairDir:            pairDir,
+		nextPairIDPath:     filepath.Join(pairDir, "next_id.dat"),
+		mainKeys:           mkt,
+		payloadCache:       newPayloadCacheFromConfig(cfg),
+		resources:          monitor,
+		fileManager:        fileManager,
+		pairTableCache:     newPairTableCache(pairLimit),
+		settings:           effective,
+		branchCodec:        codec,
+		adaptivePairs:      pairFmt.adaptive,
+		pairListMaxBytes:   pairFmt.listMaxBytes,
+		pairListMaxFillPct: pairFmt.listMaxFillPct,
+		jumpDir:            jumpDir,
+		jumpDataPath:       filepath.Join(jumpDir, "jumps.bin"),
+		jumpIndexPath:      filepath.Join(jumpDir, "index.bin"),
+		nextJumpIDPath:     filepath.Join(jumpDir, "next_id.dat"),
+		forkScheduler:      newForkScheduler(path),
+		reduceJobs:         newReduceJobManager(),
+		predictJobs:        newPredictInheritJobManager(),
+		reducers:           newReducerRegistry(),
 	}
 	db.predictStore = newPredictionManager(path)
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
@@ -518,7 +543,7 @@ func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
 
 	// Il nome del file +-+ l'ID in esadecimale
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
-	newTable, err := NewPairTable(db.fileManager, db.pairTableCache, tableID, path, db.branchCodec.branchCount)
+	newTable, err := NewPairTable(db.fileManager, db.pairTableCache, tableID, path, db.branchCodec.branchCount, db.adaptivePairs, db.pairListMaxBytes, db.pairListMaxFillPct)
 	if err != nil {
 		return nil, err
 	}
@@ -1248,29 +1273,23 @@ func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, bool,
 			if err != nil {
 				return nil, false, false, 0, 0, nil, nil, false, err
 			}
-			branchCount := table.BranchCount()
-			var branchEntry []byte
-			branchIndex := -1
-			nonEmpty := 0
-			for i := 0; i < branchCount; i++ {
-				e, err := table.ReadEntry(uint32(i))
-				if err != nil {
-					return nil, false, false, 0, 0, nil, nil, false, err
-				}
-				if len(e) == 0 || entryIsEmpty(e) {
-					continue
-				}
-				nonEmpty++
-				branchEntry = e
-				branchIndex = i
-				if nonEmpty > 1 {
-					return nil, false, false, 0, 0, nil, nil, false, nil
-				}
+			branchIndex, single, err := table.SinglePopulatedBranch()
+			if err != nil {
+				return nil, false, false, 0, 0, nil, nil, false, err
 			}
-			if nonEmpty == 0 {
+			if !single {
+				// zero or multiple populated branches: not a single-branch path.
 				return nil, false, false, 0, 0, nil, nil, false, nil
 			}
-			chunk, ok := db.branchCodec.decode(uint32(branchIndex))
+			branchEntry, err := table.ReadEntry(branchIndex)
+			if err != nil {
+				return nil, false, false, 0, 0, nil, nil, false, err
+			}
+			if len(branchEntry) == 0 || entryIsEmpty(branchEntry) {
+				// Raced with a concurrent delete; treat as non-collapsible.
+				return nil, false, false, 0, 0, nil, nil, false, nil
+			}
+			chunk, ok := db.branchCodec.decode(branchIndex)
 			if !ok {
 				return nil, false, false, 0, 0, nil, nil, false, fmt.Errorf("invalid branch index %d", branchIndex)
 			}
@@ -2097,8 +2116,14 @@ func (db *Database) walkPairSummary(
 		}
 		return err
 	}
-	branchCount := table.BranchCount()
-	for branch := uint32(0); branch < uint32(branchCount); branch++ {
+	indices, err := table.PopulatedBranchIndices()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, branch := range indices {
 		if abort != nil && abort.Load() {
 			return nil
 		}
@@ -2217,8 +2242,14 @@ func (db *Database) walkPairTable(
 		}
 		return err
 	}
-	branchCount := table.BranchCount()
-	for branch := uint32(0); branch < uint32(branchCount); branch++ {
+	indices, err := table.PopulatedBranchIndices()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, branch := range indices {
 		if abort != nil && abort.Load() {
 			return nil
 		}

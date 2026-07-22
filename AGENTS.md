@@ -63,10 +63,9 @@ this repository**. Do not link it; do not assume it exists.
 - **Record new roadmap work in [`NEXT_STEPS.md`](NEXT_STEPS.md)**, not as prose in this handbook.
 - **Never commit runtime data.** [`.gitignore`](.gitignore) excludes the `cheetah-server` binary and
   `cheetah_data/*`. Do not add generated databases, `.table`/`.bin` files, or benchmark logs.
-- **Format before committing.** `gofmt` currently flags [`benchmark_test.go`](benchmark_test.go),
-  [`jump_store.go`](jump_store.go), [`tables.go`](tables.go), and [`types.go`](types.go) as
-  unformatted (pre-existing). Run `gofmt -w` on files you touch; do not mass-reformat unrelated files
-  in a behavior change.
+- **Format before committing.** The tree is currently `gofmt`-clean (`gofmt -l .` prints nothing).
+  Run `gofmt -w` on files you touch and keep it clean; do not mass-reformat unrelated files in a
+  behavior change.
 - **Preserve unrelated working-tree changes.** Never use destructive git cleanup to simplify a task.
 - **Tests must pass.** Run `go build ./...`, `go vet ./...`, and `go test .` before committing. The
   benchmark test is gated behind `CHEETAHDB_BENCH=1` and does not run by default.
@@ -123,11 +122,33 @@ because they mutate per-connection "current database" state.
   `FlagHidden` ([`types.go`](types.go)) coexist on one entry. A node can be *both* a terminal and a
   parent — this is what lets `ctx:` and `ctx:BERLIN` both hold values. Never treat "has child" as
   "not terminal" (regression risk in [`deletePairAt`](database.go) / [`insertPairAt`](database.go)).
-- **`pair_index_bytes` is 1 or 2 and fixed per database.** Set at creation via config/override; the
-  branch codec ([`pair_codec.go`](pair_codec.go)) pre-allocates `∑ 256^i` slots per node. Rebuild
-  (`RESET_DB … pair_bytes=2`) to change it — you cannot flip it on a populated trie. Note
-  [`Config.normalize`](config.go) coerces a `≤0` value to **2**, while [`defaultConfig`](config.go)
-  ships **1**; an explicitly zeroed `pair_index_bytes` becomes 2, not 1.
+- **`pair_index_bytes` is 1 or 2 and pinned per database at creation.** It sets the branch codec
+  ([`pair_codec.go`](pair_codec.go)) stride, giving `∑ 256^i` logical branches per node. It is
+  persisted in `pairs/format.dat` ([`pair_format.go`](pair_format.go)) and that marker is
+  **authoritative on reopen** — a later config change cannot silently reinterpret an existing trie.
+  Rebuild (`RESET_DB … pair_bytes=2`) to change it. Note [`Config.normalize`](config.go) coerces a
+  `≤0` value to **2**, while [`defaultConfig`](config.go) ships **1**; an explicitly zeroed
+  `pair_index_bytes` becomes 2, not 1.
+- **Pair-node files are self-describing and adaptive.** Each `pairs/<hexid>.table` begins with a
+  `PairHeaderSize` (12-byte) header (`"CHPT"`, version, mode, keyWidth, entry count —
+  [`types.go`](types.go)) followed by either a sorted, binary-searched **LIST** body of
+  `[branchKey|entry]` records (sparse nodes) or a direct-mapped **DENSE** array at
+  `PairHeaderSize + branchIndex*PairEntrySize`. The 11-byte `PairEntry` layout is unchanged — only its
+  container adapts. All of this is encapsulated in [`tables.go`](tables.go); callers keep addressing
+  entries by branch index.
+- **A node uses LIST only when its dense form exceeds `pair_list_max_bytes`.** `NewPairTable` computes
+  `denseBytes = PairHeaderSize + branchCount*PairEntrySize` and sets `listEligible` only when that
+  exceeds the budget. A 1-byte-stride node is **2,828 B** — already inside one 4 KiB filesystem block
+  — so it is DENSE from creation (and preallocated) even with adaptive indexing on: listing it would
+  save no space and only add search cost. In practice LIST applies to **2-byte-stride nodes only**.
+  An eligible node densifies once it passes the byte budget, and never de-densifies.
+  `pair_list_max_fill_percent` is an **optional** extra cap (percentage of branch capacity, default
+  **0 = off**); at the default 4 KiB budget it can never bind, since 1% of 65,792 is 657 against a
+  byte capacity of 292.
+- **A dense node file is sparse: never bulk-`ReadAt` the whole span in one call.**
+  [`ManagedFile.ReadAt`](file_manager.go) stops at the first sector entirely past EOF, so a single
+  read across a hole silently truncates and hides every later entry. Use
+  [`readSpanTolerant`](tables.go), which reads one sector at a time and tolerates `io.EOF`.
 - **Payload cache must be invalidated on mutation.** `DELETE`/`EDIT` MUST call
   [`invalidatePayload`](database.go); the cache copies bytes on `Get`/`Add`
   ([`cloneBytes`](cache.go)) so callers may not mutate returned slices in place.
@@ -235,7 +256,8 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
   `mergeDatabaseConfig`, `parseDatabaseTarget`.
 - **Config keys** (`config.ini`): `[server] listen_addr, data_dir, default_database,
   keepalive_seconds|tcp_keepalive_seconds`; `[database] pair_bytes|pair_index_bytes,
-  payload_cache_entries, payload_cache_mb, payload_cache_bytes`; `[tuning] max_pair_tables`.
+  payload_cache_entries, payload_cache_mb, payload_cache_bytes, adaptive_pair_index`;
+  `[tuning] max_pair_tables, pair_list_max_bytes, pair_list_max_fill_percent`.
 - **Common mistakes:** `normalize` clamps `pair_index_bytes` into `[1,2]` but maps `≤0`→**2** (not the
   `defaultConfig` value of 1). All env keys are enumerated in [Configuration reference](#configuration-reference).
 
@@ -246,8 +268,10 @@ The on-disk format constants and the 5-byte value pointer. This is the wire form
 
 - **Key symbols:** size constants (`ValueLocationIndexSize`, `MainKeysEntrySize`,
   `EntriesPerValueTable`, `PairEntry*`, `PairTablePreallocatedSize`); flag bits (`FlagIsTerminal`,
-  `FlagHasChild`, `FlagHasJump`, `FlagHidden`); `ValueLocationIndex` with `Encode`/
-  `DecodeValueLocationIndex` (note: `TableID` is truncated to 24 bits on disk).
+  `FlagHasChild`, `FlagHasJump`, `FlagHidden`); the adaptive pair-node container constants
+  (`PairFileMagic`, `PairFormatVersion`, `PairHeaderSize`, `PairModeList`, `PairModeDense`) and the
+  per-database marker magic (`PairFormatFileMagic`, `PairFormatFileVersion`); `ValueLocationIndex`
+  with `Encode`/`DecodeValueLocationIndex` (note: `TableID` is truncated to 24 bits on disk).
 - **Common mistakes:** `Encode` returns 5 bytes packing a 3-byte table id + 2-byte entry id; do not
   assume a full 32-bit table id survives a round trip.
 
@@ -299,12 +323,22 @@ The four on-disk table abstractions. Each maps a logical structure onto files (v
 
 - **Key types:** `MainKeysTable` (per-key metadata, striped locks), `ValuesTable` (fixed-width blobs,
   async write loop), `RecycleTable` (LIFO tombstone stack per value size), `PairTable` (a single trie
-  node: fixed slot array, lazily opened `ManagedFile`, `Snapshot`/`ReadEntry`/`WriteEntry`,
-  `IsEmpty`), plus the `pairTableTracker` interface the fd-cache implements.
-- **Depends on:** [`file_manager.go`](file_manager.go). **Tests:** exercised indirectly by
+  node in the adaptive LIST/DENSE container), plus the `pairTableTracker` interface the fd-cache
+  implements.
+- **`PairTable` key symbols:** `NewPairTable` (takes `adaptive`/`listMaxBytes`/`listMaxFillPercent`,
+  derives `listEligible`, and preallocates the array for every node that starts dense), `loadHeader`/`writeHeaderLocked`, `ReadEntry`/`WriteEntry`
+  (mode-dispatched; a missing branch reads back as a zero entry, never `io.EOF`),
+  `writeListLocked` (sorted insert / in-place replace / record delete), `densifyLocked` (LIST→DENSE,
+  clearing the old LIST region so unpopulated dense slots read zero), `listSearchLocked` (binary
+  search), `PopulatedBranchIndices` (ordered iterator used by every enumeration path),
+  `readSpanTolerant`, `branchKeyWidth`, `IsEmpty`, `Snapshot`.
+- **Depends on:** [`file_manager.go`](file_manager.go). **Tests:**
+  [`pair_adaptive_test.go`](pair_adaptive_test.go); also exercised indirectly by
   [`benchmark_test.go`](benchmark_test.go).
 - **Common mistakes:** `PairTable` handles are reference-counted/idle-closed; call `ReleaseFile` paths
-  through the cache rather than closing files directly. (`gofmt` currently flags this file.)
+  through the cache rather than closing files directly. In-memory `mode`/`count` survive fd eviction
+  (only the `*ManagedFile` is released), so the header is read once at open — never re-read it under
+  a read lock. Do not bulk-read a dense span with one `ReadAt` (see the sparse-file contract above).
 
 #### [`helpers.go`](helpers.go)
 
@@ -333,6 +367,23 @@ Translates key bytes into trie branch indices for the configured stride.
   `decode`, `walkKey` (drives one branch per 1- or 2-byte chunk).
 - **Common mistakes:** the codec encapsulates the `pair_index_bytes` stride; trie code should walk keys
   via `walkKey` instead of hand-rolling byte stepping, or 2-byte databases break.
+
+#### [`pair_format.go`](pair_format.go)
+
+Pins and persists a database's pair-trie container format in `pairs/format.dat`, and guards against
+opening a legacy (headerless) directory.
+
+- **Key symbols:** `pairFormat` (stride / adaptive / listMaxBytes / listMaxFillPct),
+  `resolvePairFormat` (marker wins
+  if present, else derive from config and write it), `loadPairFormat`, `writePairFormat`,
+  `pairDirHasTableFiles`.
+- **Behavior:** a `pairs/` directory holding `*.table` files but **no** marker is refused with
+  `incompatible_pair_format_rebuild_required` rather than silently misread — the operator rebuilds
+  with `RESET_DB`. A fresh directory gets a marker written from config.
+- **Common mistakes:** the marker is authoritative on reopen, so changing `pair_index_bytes` or
+  `adaptive_pair_index` in `config.ini` does **not** affect an existing database (by design — the old
+  behavior silently reinterpreted on-disk data). `RESET_DB <name> [pair_bytes=…] [adaptive_pair_index=…]`
+  is the way to adopt new settings.
 
 #### [`jump_store.go`](jump_store.go)
 
@@ -525,7 +576,7 @@ nodes are reused — keep automated runs to a few hundred edges.
 
 - `cheetah-server` — the built binary (`.gitignore`d).
 - `cheetah_data/<db>/` — per-database directory: `main_keys.table`, `values_<size>_<id>.table`,
-  `values_<size>.recycle.table`, `pairs/<hexid>.table` + `pairs/next_id.dat`,
+  `values_<size>.recycle.table`, `pairs/<hexid>.table` + `pairs/next_id.dat` + `pairs/format.dat`,
   `pair_jumps/{jumps.bin,index.bin,next_id.dat}`, `prediction_<name>.table`, `cluster_topology.json`.
   Source of truth is the engine; these are outputs.
 
@@ -551,6 +602,35 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Constraints:** cursor continuation is positional (`PAIR_SCAN <prefix> <limit> <cursor>`);
   `include_hidden=1` surfaces hidden terminals. **Gaps:** rolling-hash/Top-K digests are roadmap
   ([`NEXT_STEPS.md`](NEXT_STEPS.md)).
+
+### Adaptive pair-node indexing — Shipped
+
+- **Behavior:** each trie node picks its own physical container. Sparse nodes are a sorted,
+  binary-searched LIST of `[branchKey|entry]` records; a node densifies into the direct-mapped array
+  once it passes `pair_list_max_bytes` (4096), and never reverts.
+  Enabled by default (`adaptive_pair_index`), disable for the legacy always-dense profile. The stride
+  and the flag are pinned per database in `pairs/format.dat`.
+- **Why:** a 2-byte-stride node reserved ~707 KB (65,792 slots × 11 B) even when holding a handful of
+  children, and every enumeration scanned all 65,792 slots. Measured on a 20k-key workload
+  (`TestAdaptivePairIndexBenchmark`), **stride 2**: `pairs/` **776.5 MiB → 4.7 MiB apparent**
+  (−99.4%), **~81–87 MiB → 4.5 MiB allocated** (−94%; the fixed figure varies with sparse-file
+  allocation), full-trie enumeration **1.6–1.9 s → 5 ms** (−99.7%). Insert and lookup are within
+  run-to-run noise — the win is storage and enumeration, not point-operation speed. Both modes
+  visited an identical 21,124 entries.
+- **Where it does not apply:** **stride 1**. An earlier revision did list narrow nodes and measured
+  no size win (24.7 MiB either way) plus *slower* enumeration (110ms → 145ms over 6,331 nodes).
+  Narrow nodes are now excluded by the `denseBytes > pair_list_max_bytes` rule, so stride 1 keeps the
+  original dense behaviour exactly — re-measured at 156ms vs 149ms, i.e. parity within noise.
+  **Consequence:** `adaptive_pair_index` is a no-op for 1-byte databases, which is the
+  [`defaultConfig`](config.go) stride; the savings require `pair_index_bytes = 2`.
+- **Flow & owners:** [`pair_format.go`](pair_format.go) (pin/guard) → [`database.go`](database.go)
+  (`NewDatabase` resolves the format, `getPairTable` passes it) → [`tables.go`](tables.go)
+  (`PairTable` container + `PopulatedBranchIndices`). Enumeration callers
+  (`walkPairTable`, `walkPairSummary`, `collectSingleBranchPath`) iterate populated branches only.
+- **Tests:** [`pair_adaptive_test.go`](pair_adaptive_test.go), benchmark
+  [`pair_adaptive_bench_test.go`](pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`).
+- **Constraints:** existing pre-format databases must be rebuilt (`RESET_DB`); there is no in-place
+  migration.
 
 ### Reducers — Shipped
 
@@ -697,6 +777,13 @@ Throughput benchmark (writes a client-rotated log; long-running):
 CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v .
 ```
 
+Adaptive pair-index comparison (storage + throughput, adaptive vs always-dense, both strides;
+~4 min at the default 20k keys, tune with `CHEETAHDB_ADAPTIVE_BENCH_KEYS`):
+
+```bash
+CHEETAHDB_ADAPTIVE_BENCH=1 go test -run TestAdaptivePairIndexBenchmark -count=1 -v -timeout 1800s .
+```
+
 Cross-compile (Windows builds cleanly):
 
 ```bash
@@ -733,6 +820,10 @@ Environment variables read by the server (all verified in-tree):
 - **Server:** `CHEETAH_CONFIG_PATH`, `CHEETAH_LISTEN_ADDR`, `CHEETAH_DATA_DIR`, `CHEETAH_DEFAULT_DB`,
   `CHEETAH_TCP_KEEPALIVE_SECONDS`, `CHEETAH_MAX_PAIR_TABLES`, `CHEETAH_PAIR_INDEX_BYTES`,
   `CHEETAH_HEADLESS`, `CHEETAH_LOG_LEVEL`.
+- **Adaptive pair index:** `CHEETAH_ADAPTIVE_PAIR_INDEX` (default on; accepts `1/0`, `true/false`,
+  `yes/no`, `on/off`), `CHEETAH_PAIR_LIST_MAX_BYTES` (default 4096),
+  `CHEETAH_PAIR_LIST_MAX_FILL_PERCENT` (default 0 = off). All only apply when a database is
+  **created** — thereafter `pairs/format.dat` wins ([`pair_format.go`](pair_format.go)).
 - **Payload cache:** `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`,
   `CHEETAH_PAYLOAD_CACHE_BYTES` (any `=0` disables caching).
 - **Managed-file cache** ([`file_manager.go`](file_manager.go)): `CHEETAH_FLUSH_WORKERS`,
@@ -758,6 +849,12 @@ seen in old docs are **client-side**; the server does not read them.
 | Subsystem / contract | Focused test |
 | --- | --- |
 | Size-changing `EDIT` relocates + recycles | [`TestEditResizesValues`](benchmark_test.go) |
+| Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](pair_adaptive_test.go) |
+| LIST→DENSE densify + ordered `PopulatedBranchIndices` over a sparse body | [`TestPairTableListToDense`](pair_adaptive_test.go) |
+| LIST insert/replace/delete ordering + count | [`TestPairTableListDelete`](pair_adaptive_test.go), [`TestAdaptivePairListLifecycle`](pair_adaptive_test.go) |
+| Legacy-directory guard + format marker pinned across reopen | [`TestPairFormatGuardRejectsLegacy`](pair_adaptive_test.go), [`TestPairFormatPinnedAcrossReopen`](pair_adaptive_test.go) |
+| Adaptive vs fixed storage/throughput comparison | [`TestAdaptivePairIndexBenchmark`](pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`) |
+| Known trie defects (documented, skipped) | [`TestPreexistingJumpTerminalDefects`](pair_adaptive_test.go) |
 | Throughput / concurrency under load | [`TestCheetahDBBenchmark`](benchmark_test.go) (gated by `CHEETAHDB_BENCH=1`) |
 | Graph edge lifecycle + query | [`TestGraphEdgeLifecycleAndQuery`](graph_test.go) |
 | `GRAPH_QUERY` parser rules | [`TestParseGraphQueryRules`](graph_test.go) |
@@ -782,10 +879,12 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
   by the engine; the `cheetah-server` binary, benchmark logs, and demo `reports/` are derived. Only
   `cheetah_data/*` and the binary are `.gitignore`d.
 - **On-disk compatibility:** the byte formats in [`types.go`](types.go) and the `CHPREDTB` prediction
-  format are unversioned wire contracts. Legacy migrations that *do* exist: per-file `.jump` →
-  `pair_jumps/*.bin` ([`jump_store.go`](jump_store.go)), and prediction `.json` → binary
-  ([`prediction_table.go`](prediction_table.go)). New format changes need an explicit version byte and
-  a read-old/write-new path.
+  format are unversioned wire contracts. The pair-node container **is** versioned (`"CHPT"` header +
+  `PairFormatVersion`) and pinned per database by `pairs/format.dat` (`"CHPF"`). Legacy migrations
+  that *do* exist: per-file `.jump` → `pair_jumps/*.bin` ([`jump_store.go`](jump_store.go)), and
+  prediction `.json` → binary ([`prediction_table.go`](prediction_table.go)). The pre-header pair
+  format has **no** migration: such a directory is refused at open and must be rebuilt with
+  `RESET_DB`. New format changes need an explicit version byte and a read-old/write-new path.
 - **Trust / validation:** the protocol is unauthenticated plaintext over TCP on `0.0.0.0:4455` by
   default. There is **no auth, TLS, or access control** — bind it to a trusted network or loopback.
   `CLUSTER_GOSSIP` accepts base64 JSON from peers and applies fork payloads; only enable clustering
@@ -823,13 +922,34 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 <a id="known-gaps"></a>
 ### Known gaps
 
+- **Trie loses data on prefix-overlapping keys (3 confirmed defects).** All predate the adaptive
+  container, reproduce on both strides, and are independent of it (adaptive and non-adaptive agree —
+  [`TestAdaptiveMatchesFixed`](pair_adaptive_test.go)). Documented and reproduced by the skipped
+  [`TestPreexistingJumpTerminalDefects`](pair_adaptive_test.go):
+  1. **Storing a key that is a strict prefix of an existing key fails** with `offset beyond key
+     length` (`nextChunk` called with `offset == len(key)`). Most severe: the write is rejected, so a
+     **prefix-free key set is currently a hard requirement**.
+  2. **Lookup ignores a terminal sharing its entry with a jump** — `PAIR_SCAN` returns the key but
+     `PAIR_GET` reports not-found (`lookupPairAt` tests `entryHasJump` before the entry's terminal).
+  3. **Deleting one of two prefix-sharing keys drops its sibling** (`promoteChildToJump` /
+     `collectSingleBranchPath` collapse a node still holding a live terminal).
+- **`PAIR_SUMMARY` deadlocks on any non-trivial trie.** [`walkPairSummary`](database.go) enqueues
+  child tasks with a **blocking** send (`tasks <- pairSummaryTask{…}`) into a channel sized
+  `workers*4` (~32), and has no inline-drain fallback. Once the queue fills, every worker blocks
+  sending and the call hangs forever at 0% CPU — reproduced on a 20k-key trie (both strides).
+  [`walkPairTable`](database.go) avoids this with its `enqueue` helper (`select` + `default` →
+  process inline); summary needs the same treatment.
+- **Cursor pagination is lossy and nondeterministic past the first page.** A full paginated
+  `PAIR_SCAN` over 12k keys returned 11,727 / 11,727 / 11,726 / 11,705 across four runs on identical
+  data (parallel collection + limit/abort + cursor). Single-page scans are stable. There is currently
+  **no** reliable whole-trie traversal over the protocol — scan is lossy and summary hangs.
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](cluster_scheduler.go) `load`). Matches [`NEXT_STEPS.md`](NEXT_STEPS.md) #1.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the
   server does not implement (see [pitfall](#pitfall-doc-command-drift)).
 - **Missing `AI_REFERENCE.md`** — referenced by README/notes but absent here.
 - **Thin tests** for trie mutation, prediction, cluster, and caches (see test gaps above).
-- **`gofmt` drift** in four files (listed in [maintenance rules](#collaboration-and-maintenance-rules)).
+- **`Database.Close` is not idempotent** — a second call panics inside `FileManager.Close`.
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))
 
