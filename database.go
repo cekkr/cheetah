@@ -586,64 +586,45 @@ func (db *Database) setPairValue(value []byte, absKey uint64, hidden bool) error
 }
 
 func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey uint64, hidden bool) error {
-	chunk, index, isLast, err := db.nextChunk(key, offset)
-	if err != nil {
-		return err
-	}
 	table, err := db.getPairTable(tableID)
 	if err != nil {
 		return err
 	}
-	var entry []byte
-	retries := 0
-	for {
-		if retries >= maxJumpReloadAttempts {
-			return fmt.Errorf("jump reload limit exceeded (insert table=%d index=%d)", tableID, index)
-		}
-		entry, err = table.ReadEntry(index)
+	label := fmt.Sprintf("insert table=%d offset=%d", tableID, offset)
+	for retries := 0; retries < maxJumpReloadAttempts; retries++ {
+		branch, err := db.selectPairBranch(table, key, offset, label)
 		if err != nil {
 			return err
 		}
-		if entryHasJump(entry) {
-			if err := db.insertThroughJump(tableID, table, index, entry, key, offset+len(chunk), absKey, hidden); err != nil {
+		nextOffset := offset + len(branch.chunk)
+		entry := branch.entry
+		if nextOffset == len(key) {
+			// Chiave che finisce qui: si accende il terminale sull'entry e si
+			// lascia intatto un eventuale jump, che serve alle chiavi più
+			// lunghe che passano di qui.
+			setEntryTerminal(entry, absKey, hidden)
+			return table.WriteEntry(branch.index, entry)
+		}
+		if branch.jump != nil {
+			if err := db.insertThroughJump(tableID, table, branch.index, entry, key, nextOffset, absKey, hidden); err != nil {
 				if shouldRetryJump(err) {
-					retries++
 					continue
 				}
 				return err
 			}
 			return nil
 		}
-		break
-	}
-	nextOffset := offset + len(chunk)
-	if isLast {
-		setEntryTerminal(entry, absKey, hidden)
-		if err := table.WriteEntry(index, entry); err != nil {
+		if entryHasChild(entry) {
+			return db.insertPairAt(entryChildID(entry), key, nextOffset, absKey, hidden)
+		}
+		jumpID, err := db.createJump(key[nextOffset:], true, absKey, hidden, 0)
+		if err != nil {
 			return err
 		}
-		return nil
+		setEntryJump(entry, jumpID)
+		return table.WriteEntry(branch.index, entry)
 	}
-	if entryHasChild(entry) {
-		return db.insertPairAt(entryChildID(entry), key, nextOffset, absKey, hidden)
-	}
-	remainder := key[nextOffset:]
-	if len(remainder) == 0 {
-		setEntryTerminal(entry, absKey, hidden)
-		if err := table.WriteEntry(index, entry); err != nil {
-			return err
-		}
-		return nil
-	}
-	jumpID, err := db.createJump(remainder, true, absKey, hidden, 0)
-	if err != nil {
-		return err
-	}
-	setEntryJump(entry, jumpID)
-	if err := table.WriteEntry(index, entry); err != nil {
-		return err
-	}
-	return nil
+	return fmt.Errorf("jump reload limit exceeded (%s)", label)
 }
 
 func (db *Database) insertThroughJump(tableID uint32, parent *PairTable, branchIndex uint32, entry []byte, key []byte, offset int, absKey uint64, hidden bool) error {
@@ -755,49 +736,38 @@ func (db *Database) insertSuffixWithContinuation(tableID uint32, suffix []byte, 
 	current := tableID
 	offset := 0
 	for {
-		chunk, index, isLast, err := db.nextChunk(suffix, offset)
-		if err != nil {
-			return err
-		}
 		table, err := db.getPairTable(current)
 		if err != nil {
 			return err
 		}
-		entry, err := table.ReadEntry(index)
+		// Stessa scelta di ramo del lookup: se un ramo corto esiste già, la
+		// coda va infilata sotto quello e non su un ramo allineato accanto.
+		branch, err := db.selectPairBranch(table, suffix, offset, fmt.Sprintf("insert suffix table=%d offset=%d", current, offset))
 		if err != nil {
 			return err
 		}
-		nextOffset := offset + len(chunk)
-		if isLast {
+		entry := branch.entry
+		nextOffset := offset + len(branch.chunk)
+		if nextOffset == len(suffix) {
 			if hasTerminal {
 				setEntryTerminal(entry, terminalKey, terminalHidden)
 			}
 			if nextTableID != 0 {
 				setEntryChild(entry, nextTableID)
 			}
-			return table.WriteEntry(index, entry)
+			return table.WriteEntry(branch.index, entry)
 		}
 		if entryHasChild(entry) {
 			current = entryChildID(entry)
 			offset = nextOffset
 			continue
 		}
-		remainder := suffix[nextOffset:]
-		if len(remainder) == 0 {
-			if hasTerminal {
-				setEntryTerminal(entry, terminalKey, terminalHidden)
-			}
-			if nextTableID != 0 {
-				setEntryChild(entry, nextTableID)
-			}
-			return table.WriteEntry(index, entry)
-		}
-		jumpID, err := db.createJump(remainder, hasTerminal, terminalKey, terminalHidden, nextTableID)
+		jumpID, err := db.createJump(suffix[nextOffset:], hasTerminal, terminalKey, terminalHidden, nextTableID)
 		if err != nil {
 			return err
 		}
 		setEntryJump(entry, jumpID)
-		return table.WriteEntry(index, entry)
+		return table.WriteEntry(branch.index, entry)
 	}
 }
 
@@ -822,63 +792,43 @@ func (db *Database) getPairValue(value []byte) (uint64, error) {
 }
 
 func (db *Database) lookupPairAt(tableID uint32, key []byte, offset int) (uint64, error) {
-	chunk, index, isLast, err := db.nextChunk(key, offset)
-	if err != nil {
-		return 0, err
-	}
 	table, err := db.getPairTable(tableID)
 	if err != nil {
 		return 0, err
 	}
-	nextOffset := offset + len(chunk)
-	var entry []byte
-	retries := 0
-	for {
-		if retries >= maxJumpReloadAttempts {
-			return 0, fmt.Errorf("jump reload limit exceeded (lookup table=%d index=%d)", tableID, index)
-		}
-		entry, err = table.ReadEntry(index)
-		if err != nil {
-			return 0, err
-		}
-		if len(entry) == 0 {
-			return 0, errPairNotFound
-		}
-		if entryHasJump(entry) {
-			node, loadErr := db.loadJump(entryJumpID(entry))
-			if loadErr != nil {
-				if shouldRetryJump(loadErr) {
-					retries++
-					continue
-				}
-				return 0, loadErr
-			}
-			remainder := key[nextOffset:]
-			if !bytes.HasPrefix(remainder, node.Bytes) {
-				return 0, errPairNotFound
-			}
-			childOffset := nextOffset + len(node.Bytes)
-			if childOffset == len(key) {
-				if node.HasTerminal {
-					return node.TerminalKey, nil
-				}
-				return 0, errPairNotFound
-			}
-			if node.NextTableID == 0 {
-				return 0, errPairNotFound
-			}
-			return db.lookupPairAt(node.NextTableID, key, childOffset)
-		}
-		break
+	branch, err := db.selectPairBranch(table, key, offset, fmt.Sprintf("lookup table=%d offset=%d", tableID, offset))
+	if err != nil {
+		return 0, err
 	}
-	if isLast {
-		if entryHasTerminal(entry) {
-			return decodeAbsoluteKey(entry), nil
+	nextOffset := offset + len(branch.chunk)
+	if nextOffset == len(key) {
+		// La chiave finisce su questo ramo. Terminale, figlio e jump sono flag
+		// indipendenti, quindi il terminale dell'entry va letto prima di
+		// scendere: un jump accanto porta solo chiavi più lunghe.
+		if entryHasTerminal(branch.entry) {
+			return decodeAbsoluteKey(branch.entry), nil
 		}
 		return 0, errPairNotFound
 	}
-	if entryHasChild(entry) {
-		return db.lookupPairAt(entryChildID(entry), key, nextOffset)
+	if branch.jump != nil {
+		node := branch.jump
+		if !bytes.HasPrefix(key[nextOffset:], node.Bytes) {
+			return 0, errPairNotFound
+		}
+		childOffset := nextOffset + len(node.Bytes)
+		if childOffset == len(key) {
+			if node.HasTerminal {
+				return node.TerminalKey, nil
+			}
+			return 0, errPairNotFound
+		}
+		if node.NextTableID == 0 {
+			return 0, errPairNotFound
+		}
+		return db.lookupPairAt(node.NextTableID, key, childOffset)
+	}
+	if entryHasChild(branch.entry) {
+		return db.lookupPairAt(entryChildID(branch.entry), key, nextOffset)
 	}
 	return 0, errPairNotFound
 }
@@ -886,7 +836,7 @@ func (db *Database) lookupPairAt(tableID uint32, key []byte, offset int) (uint64
 // entryIsPopulated dice se un'entry porta davvero informazione: un ramo mai
 // scritto si rilegge come entry azzerata, non come errore.
 func entryIsPopulated(entry []byte) bool {
-	return len(entry) > 0 && (entryHasTerminal(entry) || entryHasChild(entry) || entryHasJump(entry))
+	return !entryIsEmpty(entry)
 }
 
 // readBranchEntry legge un ramo risolvendo l'eventuale jump, con i tentativi
@@ -915,40 +865,67 @@ func (db *Database) readBranchEntry(table *PairTable, index uint32, label string
 	return nil, nil, fmt.Errorf("jump reload limit exceeded (%s)", label)
 }
 
-// readPrefixBranch legge il ramo che prosegue il prefisso a partire da offset.
-// Prova prima il chunk allineato allo stride; se quel ramo è vuoto ripiega sul
-// ramo da 1 byte, perché lo split di un jump può materializzare un ramo corto
-// con continuazione anche in mezzo alla chiave (splitJumpIntoChild →
-// insertSuffixWithContinuation), lasciando il nodo figlio disallineato rispetto
-// ai chunk da 2 byte.
-func (db *Database) readPrefixBranch(table *PairTable, key []byte, offset int, label string) ([]byte, []byte, *JumpNode, error) {
+// pairBranch è il ramo di un nodo che prosegue una chiave: il chunk che lo
+// indirizza, la sua posizione nel nodo e l'entry, con l'eventuale jump già
+// risolto.
+type pairBranch struct {
+	chunk []byte
+	index uint32
+	entry []byte
+	jump  *JumpNode
+}
+
+func (b pairBranch) populated() bool {
+	return entryIsPopulated(b.entry)
+}
+
+// selectPairBranch sceglie il ramo che prosegue la chiave a partire da offset.
+// Normalmente è il chunk allineato allo stride, ma un nodo non è per forza
+// allineato: lo split di un jump reinserisce la vecchia coda con
+// insertSuffixWithContinuation, che per una coda di lunghezza dispari lascia un
+// ramo da **1 byte con continuazione**, e da lì in giù il nodo figlio comincia
+// a un offset dispari. Quando il ramo allineato è vuoto si ripiega quindi sul
+// ramo corto. Ogni cammino della trie — lookup, insert, delete, risoluzione dei
+// prefissi — deve usare questa scelta, altrimenti una chiave finisce
+// raggiungibile da una parte e assente dall'altra.
+//
+// Il ramo corto viene letto solo quando quello allineato è vuoto: questo tiene
+// una sola lettura per nodo sul percorso caldo, e il caso "entrambi popolati"
+// non nasce più, perché anche l'inserimento segue il ramo corto esistente
+// invece di crearne uno allineato accanto. Un database scritto prima di questa
+// correzione può però contenerlo, e lì vince il ramo allineato: le chiavi
+// nascoste dietro quello corto restano visibili solo a PAIR_SCAN finché non si
+// ricostruisce il database.
+func (db *Database) selectPairBranch(table *PairTable, key []byte, offset int, label string) (pairBranch, error) {
 	chunk, index, _, err := db.nextChunk(key, offset)
 	if err != nil {
-		return nil, nil, nil, err
+		return pairBranch{}, err
 	}
 	entry, node, err := db.readBranchEntry(table, index, label)
 	if err != nil {
-		return nil, nil, nil, err
+		return pairBranch{}, err
 	}
-	if entryIsPopulated(entry) || len(chunk) <= 1 {
-		return chunk, entry, node, nil
+	aligned := pairBranch{chunk: chunk, index: index, entry: entry, jump: node}
+	if aligned.populated() || len(chunk) <= 1 {
+		return aligned, nil
 	}
 	shortChunk := chunk[:1]
 	shortIndex, err := db.branchCodec.branchIndexFromChunk(shortChunk)
 	if err != nil {
-		return nil, nil, nil, err
+		return pairBranch{}, err
 	}
 	shortEntry, shortNode, err := db.readBranchEntry(table, shortIndex, label)
 	if err != nil {
 		if errors.Is(err, errPairNotFound) {
-			return chunk, entry, node, nil
+			return aligned, nil
 		}
-		return nil, nil, nil, err
+		return pairBranch{}, err
 	}
-	if entryIsPopulated(shortEntry) {
-		return shortChunk, shortEntry, shortNode, nil
+	short := pairBranch{chunk: shortChunk, index: shortIndex, entry: shortEntry, jump: shortNode}
+	if short.populated() {
+		return short, nil
 	}
-	return chunk, entry, node, nil
+	return aligned, nil
 }
 
 // resolveScanPrefix cammina il prefisso fino al nodo da cui far partire la
@@ -973,10 +950,11 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 		if err != nil {
 			return 0, path, nil, err
 		}
-		chunk, entry, node, err := db.readPrefixBranch(table, pref, offset, fmt.Sprintf("resolve scan prefix %x", prefix))
+		branch, err := db.selectPairBranch(table, pref, offset, fmt.Sprintf("resolve scan prefix %x", prefix))
 		if err != nil {
 			return 0, path, nil, err
 		}
+		chunk, entry, node := branch.chunk, branch.entry, branch.jump
 		path = append(path, chunk...)
 		offset += len(chunk)
 		if offset == targetLen && acc != nil && entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
@@ -1047,10 +1025,11 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 		if err != nil {
 			return 0, path, nil, err
 		}
-		chunk, entry, node, err := db.readPrefixBranch(table, pref, offset, fmt.Sprintf("resolve summary prefix %x", prefix))
+		branch, err := db.selectPairBranch(table, pref, offset, fmt.Sprintf("resolve summary prefix %x", prefix))
 		if err != nil {
 			return 0, path, nil, err
 		}
+		chunk, entry, node := branch.chunk, branch.entry, branch.jump
 		path = append(path, chunk...)
 		offset += len(chunk)
 		if offset == targetLen && entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
@@ -1115,78 +1094,78 @@ func (db *Database) deletePairValue(value []byte) (bool, error) {
 }
 
 func (db *Database) deletePairAt(tableID uint32, key []byte, offset int) (bool, bool, error) {
-	chunk, index, isLast, err := db.nextChunk(key, offset)
-	if err != nil {
-		return false, false, err
-	}
 	table, err := db.getPairTable(tableID)
 	if err != nil {
 		return false, false, err
 	}
-	nextOffset := offset + len(chunk)
-	var entry []byte
-	retries := 0
-	for {
-		if retries >= maxJumpReloadAttempts {
-			return false, false, fmt.Errorf("jump reload limit exceeded (delete table=%d index=%d)", tableID, index)
-		}
-		entry, err = table.ReadEntry(index)
+	label := fmt.Sprintf("delete table=%d offset=%d", tableID, offset)
+	for retries := 0; retries < maxJumpReloadAttempts; retries++ {
+		branch, err := db.selectPairBranch(table, key, offset, label)
 		if err != nil {
 			return false, false, err
 		}
-		if len(entry) == 0 {
+		if !branch.populated() {
 			return false, false, errPairNotFound
 		}
-		if entryHasJump(entry) {
-			deleted, empty, derr := db.deleteWithinJump(table, index, entry, key, nextOffset)
+		nextOffset := offset + len(branch.chunk)
+		entry := branch.entry
+		if nextOffset == len(key) {
+			// Simmetrico all'inserimento: si spegne solo il terminale, jump e
+			// figlio restano a servire le chiavi più lunghe.
+			if !entryHasTerminal(entry) {
+				return false, false, errPairNotFound
+			}
+			clearEntryTerminal(entry)
+			if err := table.WriteEntry(branch.index, entry); err != nil {
+				return false, false, err
+			}
+			empty, err := table.IsEmpty()
+			if err != nil {
+				return false, false, err
+			}
+			return true, empty, nil
+		}
+		if branch.jump != nil {
+			deleted, empty, derr := db.deleteWithinJump(table, branch.index, entry, key, nextOffset)
 			if derr != nil {
 				if shouldRetryJump(derr) {
-					retries++
 					continue
 				}
 				return false, false, derr
 			}
 			return deleted, empty, nil
 		}
-		break
-	}
-	if isLast {
-		if !entryHasTerminal(entry) {
-			return false, false, errPairNotFound
-		}
-		clearEntryTerminal(entry)
-		empty := entryIsEmpty(entry)
-		if err := table.WriteEntry(index, entry); err != nil {
-			return false, false, err
-		}
-		return true, empty, nil
-	}
-	if entryHasChild(entry) {
-		childID := entryChildID(entry)
-		deleted, childEmpty, err := db.deletePairAt(childID, key, nextOffset)
-		if err != nil {
-			return deleted, false, err
-		}
-		if !deleted {
-			return false, false, errPairNotFound
-		}
-		if childEmpty {
-			if err := db.deletePairTable(childID); err != nil {
+		if entryHasChild(entry) {
+			childID := entryChildID(entry)
+			deleted, childEmpty, err := db.deletePairAt(childID, key, nextOffset)
+			if err != nil {
+				return deleted, false, err
+			}
+			if !deleted {
+				return false, false, errPairNotFound
+			}
+			if childEmpty {
+				if err := db.deletePairTable(childID); err != nil {
+					return false, false, err
+				}
+				clearEntryChild(entry)
+			} else {
+				if err := db.promoteChildToJump(tableID, branch.index, entry); err != nil {
+					return false, false, err
+				}
+			}
+			if err := table.WriteEntry(branch.index, entry); err != nil {
 				return false, false, err
 			}
-			clearEntryChild(entry)
-		} else {
-			if err := db.promoteChildToJump(tableID, index, entry); err != nil {
+			empty, err := table.IsEmpty()
+			if err != nil {
 				return false, false, err
 			}
+			return true, empty, nil
 		}
-		empty := entryIsEmpty(entry)
-		if err := table.WriteEntry(index, entry); err != nil {
-			return false, false, err
-		}
-		return true, empty, nil
+		return false, false, errPairNotFound
 	}
-	return false, false, errPairNotFound
+	return false, false, fmt.Errorf("jump reload limit exceeded (%s)", label)
 }
 
 func (db *Database) deleteWithinJump(parent *PairTable, branchIndex uint32, entry []byte, key []byte, offset int) (bool, bool, error) {
@@ -1210,8 +1189,11 @@ func (db *Database) deleteWithinJump(parent *PairTable, branchIndex uint32, entr
 				return false, false, err
 			}
 			clearEntryJump(entry)
-			empty := entryIsEmpty(entry)
 			if err := parent.WriteEntry(branchIndex, entry); err != nil {
+				return false, false, err
+			}
+			empty, err := parent.IsEmpty()
+			if err != nil {
 				return false, false, err
 			}
 			return true, empty, nil
@@ -1242,8 +1224,11 @@ func (db *Database) deleteWithinJump(parent *PairTable, branchIndex uint32, entr
 			return false, false, err
 		}
 		clearEntryJump(entry)
-		empty := entryIsEmpty(entry)
 		if err := parent.WriteEntry(branchIndex, entry); err != nil {
+			return false, false, err
+		}
+		empty, err := parent.IsEmpty()
+		if err != nil {
 			return false, false, err
 		}
 		return true, empty, nil
@@ -1321,6 +1306,12 @@ func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, bool,
 			chunk, ok := db.branchCodec.decode(branchIndex)
 			if !ok {
 				return nil, false, false, 0, 0, nil, nil, false, fmt.Errorf("invalid branch index %d", branchIndex)
+			}
+			if entryHasTerminal(branchEntry) && (entryHasChild(branchEntry) || entryHasJump(branchEntry)) {
+				// L'entry è terminale *e* prosegue: un jump porta un solo
+				// terminale, quello in fondo, quindi collassare questo cammino
+				// cancellerebbe la chiave che finisce qui. Nodo non collassabile.
+				return nil, false, false, 0, 0, nil, nil, false, nil
 			}
 			path = append(path, chunk...)
 			terminal = entryHasTerminal(branchEntry)

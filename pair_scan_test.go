@@ -129,7 +129,7 @@ func TestPairSummaryDrainsSaturatedQueue(t *testing.T) {
 // dei ~300 prefissi provati (scan vuoto), sempre quelli che cadono a metà
 // ramo o che attraversano un nodo disallineato da uno split di jump.
 func TestPairScanPrefixParityAcrossStrides(t *testing.T) {
-	words := prefixFreeWords(t, 120)
+	words := overlappingWords(t, 120)
 	prefixes := map[string]bool{"": true}
 	for _, w := range words {
 		for i := 1; i <= len(w); i++ {
@@ -166,17 +166,17 @@ func TestPairScanPrefixParityAcrossStrides(t *testing.T) {
 	}
 }
 
-// prefixFreeWords genera chiavi casuali (seed fisso) su un alfabeto stretto,
-// così i prefissi si sovrappongono spesso e il trie collassa e rispezza jump.
-// Scarta le chiavi che sono prefisso stretto di un'altra: memorizzarle è un
-// difetto noto e distinto (vedi TestPreexistingJumpTerminalDefects).
-func prefixFreeWords(t *testing.T, count int) []string {
+// overlappingWords genera chiavi casuali (seed fisso) su un alfabeto stretto,
+// così i prefissi si sovrappongono spesso e il trie collassa e rispezza jump di
+// continuo. L'insieme include chiavi che sono prefisso stretto di un'altra:
+// memorizzarle era un difetto noto, ora coperto da TestJumpTerminalOverlaps.
+func overlappingWords(t *testing.T, count int) []string {
 	t.Helper()
 	const alphabet = "abc"
 	rnd := rand.New(rand.NewSource(42))
 	set := make(map[string]bool, count)
 	for len(set) < count {
-		size := 3 + rnd.Intn(6)
+		size := 2 + rnd.Intn(7)
 		word := make([]byte, size)
 		for i := range word {
 			word[i] = alphabet[rnd.Intn(len(alphabet))]
@@ -185,17 +185,57 @@ func prefixFreeWords(t *testing.T, count int) []string {
 	}
 	words := make([]string, 0, len(set))
 	for word := range set {
-		strictPrefix := false
-		for other := range set {
-			if other != word && strings.HasPrefix(other, word) {
-				strictPrefix = true
-				break
-			}
-		}
-		if !strictPrefix {
-			words = append(words, word)
-		}
+		words = append(words, word)
 	}
 	sort.Strings(words)
 	return words
+}
+
+// TestPairSetGetDeleteRoundTrip è il contratto di base della trie sotto
+// sovrapposizione di prefissi: ogni chiave scritta si rilegge, cancellarne metà
+// non tocca l'altra metà, e la scansione finale coincide con i sopravvissuti.
+// Il caso critico è lo stride 2, dove uno split di jump lascia nodi
+// disallineati: lookup, insert e delete devono scegliere lo stesso ramo
+// (selectPairBranch), altrimenti una chiave risulta assente a PAIR_GET pur
+// comparendo in PAIR_SCAN.
+func TestPairSetGetDeleteRoundTrip(t *testing.T) {
+	words := overlappingWords(t, 120)
+	for _, stride := range []int{1, 2} {
+		t.Run(fmt.Sprintf("stride%d", stride), func(t *testing.T) {
+			db := newAdaptiveTestDB(t, stride, true, 4096)
+			keys := make(map[string]uint64, len(words))
+			for _, w := range words {
+				keys[w] = mustInsertPair(t, db, w)
+			}
+			for _, w := range words {
+				got, err := db.getPairValue([]byte(w))
+				if err != nil || got != keys[w] {
+					t.Fatalf("PAIR_GET %q = %d (%v), want %d", w, got, err, keys[w])
+				}
+			}
+
+			deleted, kept := words[:len(words)/2], words[len(words)/2:]
+			for _, w := range deleted {
+				if ok, err := db.deletePairValue([]byte(w)); err != nil || !ok {
+					t.Fatalf("PAIR_DEL %q: ok=%v err=%v", w, ok, err)
+				}
+			}
+			for _, w := range deleted {
+				if _, err := db.getPairValue([]byte(w)); err == nil {
+					t.Errorf("PAIR_GET %q still resolves after delete", w)
+				}
+			}
+			for _, w := range kept {
+				got, err := db.getPairValue([]byte(w))
+				if err != nil || got != keys[w] {
+					t.Errorf("delete dropped %q: got %d (%v), want %d", w, got, err, keys[w])
+				}
+			}
+			want := append([]string{}, kept...)
+			sort.Strings(want)
+			if got := scannedValues(t, db, ""); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("PAIR_SCAN after delete returned %d keys, want %d", len(got), len(want))
+			}
+		})
+	}
 }

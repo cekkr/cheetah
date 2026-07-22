@@ -121,7 +121,12 @@ because they mutate per-connection "current database" state.
 - **Pair-trie entry flags are independent bits.** `FlagIsTerminal`, `FlagHasChild`, `FlagHasJump`,
   `FlagHidden` ([`types.go`](types.go)) coexist on one entry. A node can be *both* a terminal and a
   parent — this is what lets `ctx:` and `ctx:BERLIN` both hold values. Never treat "has child" as
-  "not terminal" (regression risk in [`deletePairAt`](database.go) / [`insertPairAt`](database.go)).
+  "not terminal" (regression risk in [`deletePairAt`](database.go) / [`insertPairAt`](database.go)),
+  and always answer "does the key end on this entry?" before following its jump.
+- **A node does not always start on a stride boundary.** Splitting a jump can leave a 1-byte branch
+  with a continuation, so the child below it is offset by one byte. Every key walk must resolve its
+  branch through [`selectPairBranch`](database.go), which falls back from the stride-aligned branch
+  to the short one; hand-rolled `nextChunk` stepping loses keys on 2-byte databases.
 - **`pair_index_bytes` is 1 or 2 and pinned per database at creation.** It sets the branch codec
   ([`pair_codec.go`](pair_codec.go)) stride, giving `∑ 256^i` logical branches per node. It is
   persisted in `pairs/format.dat` ([`pair_format.go`](pair_format.go)) and that marker is
@@ -292,12 +297,14 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
   `setEntryTerminal/setEntryChild/setEntryJump` — the bit-level accessors over an 11-byte entry.
 - **Trie mutation:** `insertPairAt`, `insertThroughJump`, `splitJumpWithCommonPrefix`,
   `splitJumpIntoChild`, `insertSuffixWithContinuation`, `deletePairAt`, `deleteWithinJump`,
-  `promoteChildToJump`, `collectSingleBranchPath` — the jump-node collapse/split logic. High regression
-  density; see [Jump-node invariants](#pitfall-jump-nodes).
+  `promoteChildToJump`, `collectSingleBranchPath` — the jump-node collapse/split logic. All key walks
+  pick their branch through `selectPairBranch`, and delete reports emptiness per **node**
+  (`PairTable.IsEmpty`), never per entry. High regression density; see
+  [Prefix overlaps](#pitfall-jump-nodes).
 - **Scan / summary / reduce:** `PairScanWithOptions`, `PairSummaryWithOptions`, `handlePairReduce`,
   `reduceWithPayload`, `parallelCollectPairEntries`, `parallelSummarizePairEntries`, `walkPairTable`,
   `walkPairSummary`, prefix resolution (`resolveScanPrefix`/`resolveSummaryPrefix`,
-  `readPrefixBranch`, `readBranchEntry`, `branchMatchesPartial`), cursor helpers
+  `selectPairBranch`, `readBranchEntry`, `branchMatchesPartial`), cursor helpers
   (`comparePrefixToCursor`, `nextCursorForPrefix`), accumulators, and the async reduce handlers.
   Both parallel walks size their task queue on the branch fan-out and drain inline (`select` +
   `default`) when it is full — a blocking send there deadlocked `PAIR_SUMMARY` forever.
@@ -417,6 +424,12 @@ memory-pressure eviction, an fd cap, and a checkpoint controller.
   descriptor mid-IO. Never read the field directly — pass the `*os.File` down (`readWithCache`,
   `writeWithCache`, `getSector`, `ensureSector` all take it as a parameter) and fsync via
   `syncHandle`. Lock order is `handleMu` → `cacheMu`/`pendingMu`, never the reverse.
+- **Sector contract:** `cacheMu` guards the sector *map* and the `dirty` flag; the *contents* of a
+  `sectorEntry` are guarded by its own `dataMu`, because two `cacheMu` read locks do not exclude each
+  other — two writers to one sector, or a writer against the flusher's copy, would race. Go through
+  `sectorEntry.readInto`/`writeFrom`/`clone` rather than touching `entry.data` directly, and do not
+  nil out `data` on eviction: dropping the entry from the map is enough, and a reader may still hold
+  the pointer.
 - **Common mistakes:** this is the only correct path to the backing files; bypassing it drops dirty
   data and defeats the fd cap that prevents "too many open files".
 
@@ -555,15 +568,17 @@ Scan/summary contracts that are independent of the container format:
 stride 1, for `PAIR_SCAN` and `PAIR_SUMMARY`), `TestPairScanPrefixParityAcrossStrides` (the same
 contract over ~300 prefixes of a deterministic random key set — it caught 141 wrong prefixes before
 the fix), and `TestPairSummaryDrainsSaturatedQueue` (the summary walk must finish with a task queue
-too small for the fan-out — the old blocking send hung there). Provides `mustInsertPair`, which
-writes a real payload because `PAIR_SUMMARY` reads value sizes, and `prefixFreeWords`.
+too small for the fan-out — the old blocking send hung there), and `TestPairSetGetDeleteRoundTrip`
+(set/get/delete/scan over the same overlapping key set: the stride-2 case fails whenever insert,
+lookup and delete disagree on which branch continues a key). Provides `mustInsertPair`, which writes
+a real payload because `PAIR_SUMMARY` reads value sizes, and `overlappingWords`.
 
 #### [`file_manager_test.go`](file_manager_test.go)
 
 `TestManagedFileConcurrentHandleLifecycle` — reads, writes, `Flush`, `ForceCheckpoint(CloseHandles)`
-and `forceCloseHandle` in parallel on one `ManagedFile`; run it with `-race` (it fails there without
-the `handleMu` protection of `ManagedFile.file`). Uses a cache-disabled file so it does not also trip
-the separate, still-open sector-payload race (see [Known Gaps](#known-gaps)).
+and `forceCloseHandle` in parallel on one `ManagedFile`, in a cache-disabled (`direct`) and a
+cache-enabled (`cached`) variant. Run it with `-race`: `direct` fails without the `handleMu`
+protection of `ManagedFile.file`, `cached` without the per-`sectorEntry` `dataMu`.
 
 #### [`benchmark_test.go`](benchmark_test.go)
 
@@ -634,9 +649,9 @@ nodes are reused — keep automated runs to a few hundred edges.
   boundary: at stride 2 an odd-length prefix ends *inside* a branch, and a jump split can leave a
   1-byte branch mid-key. `resolveScanPrefix`/`resolveSummaryPrefix` therefore return the unconsumed
   bytes as a **partial**, which [`branchMatchesPartial`](database.go) applies as a filter on the seed
-  node's branches (1-byte branches must equal it, 2-byte branches must start with it), and
-  [`readPrefixBranch`](database.go) falls back to the short branch when the aligned one is empty.
-  Any new prefix walk must reuse those helpers instead of assuming `len(prefix) % stride == 0`.
+  node's branches (1-byte branches must equal it, 2-byte branches must start with it), while
+  [`selectPairBranch`](database.go) handles the unaligned-node case for every walk. Any new prefix
+  walk must reuse those helpers instead of assuming `len(prefix) % stride == 0`.
 
 ### Adaptive pair-node indexing — Shipped
 
@@ -724,16 +739,33 @@ nodes are reused — keep automated runs to a few hundred edges.
   `DATABASE`/`RESET_DB`. Continue a scan with `PAIR_SCAN <prefix> <limit> <cursor>`.
 
 <a id="pitfall-jump-nodes"></a>
-### Pitfall: jump-node collapse/split invariants
+### Pitfall: prefix overlaps in the trie (jump collapse/split)
 
-- **Symptom:** inserting a key that shares a prefix with a collapsed suffix drops or duplicates
-  entries; deletes leave orphaned child tables.
-- **Cause:** jump nodes store a unique tail in one segment; a later overlapping key must split the jump
-  (`splitJumpWithCommonPrefix`/`splitJumpIntoChild`), and a delete must re-check whether a child table
-  fell back to a single branch and re-promote it (`promoteChildToJump`/`collectSingleBranchPath`).
-- **Safe pattern:** keep terminal/child/jump flags independent; never infer one from another. Exercise
-  prefix-sharing insert+delete cycles when touching [`database.go`](database.go) trie mutation or
-  [`jump_store.go`](jump_store.go). **Status:** working; regression risk is high, tests are thin here.
+- **Symptom:** a key that shares a prefix with another is stored but unreadable, or a delete takes
+  siblings (or a whole subtree) with it. Four such defects existed and are now fixed and pinned by
+  [`TestJumpTerminalOverlaps`](pair_adaptive_test.go) +
+  [`TestPairSetGetDeleteRoundTrip`](pair_scan_test.go): a strict-prefix key being rejected, a
+  terminal beside a jump reading back as not-found, delete dropping a sibling, and — at stride 2
+  only — `PAIR_GET` missing keys parked behind an unaligned branch.
+- **Causes, all one rule broken:** terminal, child and jump are *independent* flags, and a node's
+  chunks do not always start where the stride says.
+  - A key can end on an entry that also carries a child or a jump, so **every** path must test "does
+    the key end here?" **before** following the jump (`lookupPairAt`, `insertPairAt`,
+    `deletePairAt`); a jump beside a terminal only holds longer keys.
+  - Splitting a jump re-inserts the old tail with `insertSuffixWithContinuation`, which for an
+    odd-length tail parks a **1-byte branch with a continuation** — from there down the child node
+    starts at an odd offset. Readers must fall back to that short branch when the stride-aligned one
+    is empty; [`selectPairBranch`](database.go) is the single place that decides, and lookup,
+    insert, delete and prefix resolution all go through it.
+  - The second return value of `deletePairAt`/`deleteWithinJump` means "**this node** is now empty"
+    (`PairTable.IsEmpty`), never "this entry is now empty" — the caller deletes the child table on
+    it, so the entry-level answer wipes live siblings.
+  - `collectSingleBranchPath` refuses to collapse a path through an entry that is terminal *and*
+    continues: a jump carries exactly one terminal, the one at its end.
+- **Safe pattern:** never infer one flag from another; route every key walk through
+  `selectPairBranch`; exercise prefix-sharing insert+get+delete cycles on **both** strides when
+  touching [`database.go`](database.go) trie mutation or [`jump_store.go`](jump_store.go).
+  **Status:** working, with randomized cross-stride coverage; regression risk stays high.
 
 <a id="pitfall-cli-tcp-parity"></a>
 ### Pitfall: CLI/TCP command divergence
@@ -892,10 +924,11 @@ seen in old docs are **client-side**; the server does not read them.
 | LIST insert/replace/delete ordering + count | [`TestPairTableListDelete`](pair_adaptive_test.go), [`TestAdaptivePairListLifecycle`](pair_adaptive_test.go) |
 | Legacy-directory guard + format marker pinned across reopen | [`TestPairFormatGuardRejectsLegacy`](pair_adaptive_test.go), [`TestPairFormatPinnedAcrossReopen`](pair_adaptive_test.go) |
 | Adaptive vs fixed storage/throughput comparison | [`TestAdaptivePairIndexBenchmark`](pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`) |
-| Known trie defects (documented, skipped) | [`TestPreexistingJumpTerminalDefects`](pair_adaptive_test.go) |
+| Prefix overlaps: terminal beside a jump, sibling-safe delete, strict-prefix keys | [`TestJumpTerminalOverlaps`](pair_adaptive_test.go) |
+| Set/get/delete/scan round trip over overlapping keys, both strides | [`TestPairSetGetDeleteRoundTrip`](pair_scan_test.go) |
 | Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](pair_scan_test.go) |
 | `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](pair_scan_test.go) |
-| `ManagedFile` handle lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](file_manager_test.go) |
+| `ManagedFile` handle + sector-cache lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](file_manager_test.go) |
 | Throughput / concurrency under load | [`TestCheetahDBBenchmark`](benchmark_test.go) (gated by `CHEETAHDB_BENCH=1`) |
 | Graph edge lifecycle + query | [`TestGraphEdgeLifecycleAndQuery`](graph_test.go) |
 | `GRAPH_QUERY` parser rules | [`TestParseGraphQueryRules`](graph_test.go) |
@@ -906,9 +939,9 @@ seen in old docs are **client-side**; the server does not read them.
 | Graph-NELL demo eval/loader math (AUC/AP/P@K, models, split, loader) | [`TestRankingMetrics`/`TestBuildModels`/`TestLoadNELLEdges`/…](demo/graph-nell/main_test.go) |
 | End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
 
-**Known test gaps:** no focused coverage for jump-node split/promote cycles, prediction-table
-train/inherit, cluster scheduling/gossip, the payload cache, the managed-file sector cache (only the
-handle lifecycle is covered), or cursor pagination edge cases. Add tests alongside changes in those areas. The graph subsystem now has both in-process unit
+**Known test gaps:** no focused coverage for prediction-table train/inherit, cluster
+scheduling/gossip, the payload cache, or cursor pagination edge cases. Jump split/promote cycles are
+now exercised indirectly by the randomized overlap tests, not by a targeted unit test. Add tests alongside changes in those areas. The graph subsystem now has both in-process unit
 coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over TCP
 ([`demo/graph-nell/main_test.go`](demo/graph-nell/main_test.go)).
 
@@ -963,36 +996,11 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 <a id="known-gaps"></a>
 ### Known gaps
 
-- **Trie loses data on prefix-overlapping keys (3 confirmed defects).** All predate the adaptive
-  container, reproduce on both strides, and are independent of it (adaptive and non-adaptive agree —
-  [`TestAdaptiveMatchesFixed`](pair_adaptive_test.go)). Documented and reproduced by the skipped
-  [`TestPreexistingJumpTerminalDefects`](pair_adaptive_test.go):
-  1. **Storing a key that is a strict prefix of an existing key fails** with `offset beyond key
-     length` (`nextChunk` called with `offset == len(key)`). Most severe: the write is rejected, so a
-     **prefix-free key set is currently a hard requirement**.
-  2. **Lookup ignores a terminal sharing its entry with a jump** — `PAIR_SCAN` returns the key but
-     `PAIR_GET` reports not-found (`lookupPairAt` tests `entryHasJump` before the entry's terminal).
-  3. **Deleting one of two prefix-sharing keys drops its sibling** (`promoteChildToJump` /
-     `collectSingleBranchPath` collapse a node still holding a live terminal).
-- **`PAIR_GET` loses keys at `pair_index_bytes = 2` after a jump split (4th trie defect).** Splitting
-  a jump re-inserts the old tail with [`insertSuffixWithContinuation`](database.go), which parks a
-  **1-byte** branch that still has a child — so the child node starts at an odd offset while
-  [`lookupPairAt`](database.go) keeps walking 2-byte chunks from the node start and reads an empty
-  branch. Repro: `PAIR_SET alpha/alpine/album` on a stride-2 database, then `PAIR_GET alpha` →
-  not-found (stride 1 is fine). `PAIR_SCAN`/`PAIR_SUMMARY` **do** find those keys: enumeration walks
-  populated branches whatever their width, and prefix resolution now falls back to the short branch
-  ([`readPrefixBranch`](database.go)). The real fix belongs in the insert/lookup/delete trio, which
-  must agree on where a node's chunks start.
 - **Cursor pagination is lossy and nondeterministic past the first page.** A full paginated
   `PAIR_SCAN` over 12k keys returned 11,727 / 11,727 / 11,726 / 11,705 across four runs on identical
   data (parallel collection + limit/abort + cursor). Single-page scans are stable, and
   `PAIR_SUMMARY` now traverses the whole trie without hanging, so an unpaginated summary is the
   reliable way to count.
-- **Sector payloads race under concurrent writers.** `writeWithCache` copies into `entry.data`
-  outside `cacheMu` while `flushSectorInternal` clones the same buffer under `cacheMu.RLock`; two
-  writers to one sector race the same way. `go test -race` flags it as soon as a `ManagedFile` with
-  the cache enabled is written concurrently. Distinct from the (fixed) `ManagedFile.file` race —
-  fixing it needs a per-`sectorEntry` lock, since `cacheMu` read locks do not exclude each other.
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](cluster_scheduler.go) `load`). Matches [`NEXT_STEPS.md`](NEXT_STEPS.md) #1.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the

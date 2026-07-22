@@ -533,12 +533,47 @@ func (fm *FileManager) checkpointFile(file *ManagedFile, opts FileCheckpointOpti
 }
 
 type sectorEntry struct {
+	// dataMu protegge il *contenuto* di data. cacheMu protegge la mappa e i
+	// flag (dirty), ma è un RWMutex: due lettori non si escludono, quindi da
+	// solo non basta a serializzare due scritture sullo stesso settore né una
+	// scrittura contro la copia che il flusher porta su disco.
+	dataMu     sync.RWMutex
 	data       []byte
 	dirty      bool
 	lastAccess int64
 	lastWrite  int64
 	readHits   uint64
 	writeHits  uint64
+}
+
+// readInto copia dal settore verso p sotto il lock del contenuto.
+func (e *sectorEntry) readInto(p []byte, offset int64) {
+	e.dataMu.RLock()
+	defer e.dataMu.RUnlock()
+	if int64(len(e.data)) <= offset {
+		for i := range p {
+			p[i] = 0
+		}
+		return
+	}
+	copy(p, e.data[offset:])
+}
+
+// writeFrom copia p dentro il settore sotto il lock del contenuto.
+func (e *sectorEntry) writeFrom(p []byte, offset int64) {
+	e.dataMu.Lock()
+	defer e.dataMu.Unlock()
+	if int64(len(e.data)) <= offset {
+		return
+	}
+	copy(e.data[offset:], p)
+}
+
+// clone restituisce una copia stabile del settore per la scrittura su disco.
+func (e *sectorEntry) clone() []byte {
+	e.dataMu.RLock()
+	defer e.dataMu.RUnlock()
+	return append([]byte(nil), e.data...)
 }
 
 type ManagedFile struct {
@@ -790,16 +825,16 @@ func (mf *ManagedFile) readWithCache(file *os.File, p []byte, off int64) (int, e
 		sectorIdx := (off + int64(read)) / mf.sectorSize
 		sectorOffset := (off + int64(read)) % mf.sectorSize
 		chunk := int(min64(mf.sectorSize-sectorOffset, int64(len(p)-read)))
-		buf, err := mf.getSector(file, sectorIdx)
+		entry, err := mf.getSector(file, sectorIdx)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return read, err
 		}
-		if buf == nil {
+		if entry == nil {
 			for i := 0; i < chunk; i++ {
 				p[read+i] = 0
 			}
 		} else {
-			copy(p[read:read+chunk], buf[sectorOffset:int64(sectorOffset)+int64(chunk)])
+			entry.readInto(p[read:read+chunk], sectorOffset)
 		}
 		read += chunk
 		if err == io.EOF {
@@ -838,21 +873,21 @@ func (mf *ManagedFile) writeWithCache(file *os.File, p []byte, off int64) (int, 
 		sectorIdx := (off + int64(written)) / mf.sectorSize
 		sectorOffset := (off + int64(written)) % mf.sectorSize
 		chunk := int(min64(mf.sectorSize-sectorOffset, int64(len(p)-written)))
-		buf, err := mf.ensureSector(file, sectorIdx)
+		entry, err := mf.ensureSector(file, sectorIdx)
 		if err != nil {
 			return written, err
 		}
-		copy(buf[sectorOffset:int64(sectorOffset)+int64(chunk)], p[written:written+chunk])
+		entry.writeFrom(p[written:written+chunk], sectorOffset)
 		mf.markDirty(sectorIdx)
 		written += chunk
 	}
 	return written, nil
 }
 
-func (mf *ManagedFile) ensureSector(file *os.File, idx int64) ([]byte, error) {
-	buf, err := mf.getSector(file, idx)
-	if buf != nil || err != io.EOF {
-		return buf, err
+func (mf *ManagedFile) ensureSector(file *os.File, idx int64) (*sectorEntry, error) {
+	entry, err := mf.getSector(file, idx)
+	if entry != nil || err != io.EOF {
+		return entry, err
 	}
 	// create zero-filled sector when EOF and no data
 	mf.cacheMu.Lock()
@@ -863,10 +898,10 @@ func (mf *ManagedFile) ensureSector(file *os.File, idx int64) ([]byte, error) {
 		mf.sectors[uint64(idx)] = entry
 	}
 	atomic.StoreInt64(&entry.lastAccess, time.Now().UnixNano())
-	return entry.data, nil
+	return entry, nil
 }
 
-func (mf *ManagedFile) getSector(file *os.File, idx int64) ([]byte, error) {
+func (mf *ManagedFile) getSector(file *os.File, idx int64) (*sectorEntry, error) {
 	key := uint64(idx)
 	now := time.Now()
 	mf.cacheMu.RLock()
@@ -874,10 +909,9 @@ func (mf *ManagedFile) getSector(file *os.File, idx int64) ([]byte, error) {
 		ts := now.UnixNano()
 		atomic.StoreInt64(&entry.lastAccess, ts)
 		atomic.AddUint64(&entry.readHits, 1)
-		buf := entry.data
 		mf.cacheMu.RUnlock()
 		mf.recordRead(now)
-		return buf, nil
+		return entry, nil
 	}
 	mf.cacheMu.RUnlock()
 
@@ -885,11 +919,10 @@ func (mf *ManagedFile) getSector(file *os.File, idx int64) ([]byte, error) {
 	if entry, ok := mf.sectors[key]; ok {
 		ts := time.Now().UnixNano()
 		atomic.StoreInt64(&entry.lastAccess, ts)
-		entry.readHits++
-		buf := entry.data
+		atomic.AddUint64(&entry.readHits, 1)
 		mf.cacheMu.Unlock()
 		mf.recordRead(time.Unix(0, ts))
-		return buf, nil
+		return entry, nil
 	}
 	if mf.sectors == nil {
 		mf.sectors = make(map[uint64]*sectorEntry)
@@ -917,7 +950,7 @@ func (mf *ManagedFile) getSector(file *os.File, idx int64) ([]byte, error) {
 	mf.evictIfNeeded()
 	mf.cacheMu.Unlock()
 	mf.recordRead(time.Unix(0, ts))
-	return entry.data, err
+	return entry, err
 }
 
 func (mf *ManagedFile) evictIfNeeded() {
@@ -1028,7 +1061,7 @@ func (mf *ManagedFile) flushSectorInternal(key uint64, force bool) {
 	var flushedWrite int64
 	if dirty {
 		flushedWrite = atomic.LoadInt64(&entry.lastWrite)
-		buf = append([]byte(nil), entry.data...)
+		buf = entry.clone()
 	}
 	mf.cacheMu.RUnlock()
 	if !dirty {
@@ -1228,8 +1261,10 @@ func (mf *ManagedFile) flushAndDrop(key uint64) bool {
 	mf.flushSectorImmediate(key)
 	mf.cacheMu.Lock()
 	defer mf.cacheMu.Unlock()
-	if entry, ok := mf.sectors[key]; ok {
-		entry.data = nil
+	if _, ok := mf.sectors[key]; ok {
+		// Solo rimozione dalla mappa: azzerare entry.data correrebbe con un
+		// lettore che ha già il puntatore all'entry. Il GC la libera appena
+		// nessuno la riferisce.
 		delete(mf.sectors, key)
 		return true
 	}

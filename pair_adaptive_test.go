@@ -325,51 +325,61 @@ func TestPairTableListDelete(t *testing.T) {
 	}
 }
 
-// TestPreexistingJumpTerminalDefects documents two data-loss defects in the trie
-// that are INDEPENDENT of the pair-node container format: both reproduce
-// identically on the pre-adaptive code and in adaptive and non-adaptive modes
-// alike (TestAdaptiveMatchesFixed proves the two modes agree). They are the
-// "jump-node collapse/split invariant" pitfall called out in AGENTS.md.
+// TestJumpTerminalOverlaps pins the three prefix-overlap cases that used to lose
+// data in the trie, independently of the pair-node container format (they
+// reproduced on the pre-adaptive code and in both modes alike). All three are the
+// same underlying rule: terminal, child and jump are independent flags, so a key
+// that ends where another one continues must survive both the read and the
+// collapse paths.
 //
-//  1. Lookup ignores a terminal that shares its entry with a jump. Inserting
-//     "banana","band","bandana" stores all three (PAIR_SCAN returns "band"), but
-//     getPairValue("band") reports not-found: lookupPairAt tests entryHasJump
-//     before the entry's own terminal, and bails when the remaining key does not
-//     prefix-match the jump segment.
-//  2. Deleting one of two prefix-sharing keys drops its sibling: after deleting
-//     "apricot", "apple" is unreachable (promoteChildToJump/collectSingleBranchPath
-//     collapse a node that still holds a live terminal).
-//  3. Storing a key that is a strict prefix of an already-stored key fails
-//     outright with "offset beyond key length" (nextChunk called with
-//     offset == len(key)). This is the most severe of the three: the write is
-//     rejected, so a prefix-free key set is currently a hard requirement.
-//
-// Skipped so the suite stays green; unskip when fixing the trie.
-func TestPreexistingJumpTerminalDefects(t *testing.T) {
-	t.Skip("pre-existing trie defects, unrelated to adaptive indexing; see comment")
+//  1. A terminal sharing its entry with a jump must be readable: "banana",
+//     "band", "bandana" all coexist, and "band" ends on the entry that carries
+//     the jump into "ana".
+//  2. Deleting one of two prefix-sharing keys must not drop its sibling.
+//  3. A key that is a strict prefix of a stored key must be storable, and both
+//     keys must read back.
+func TestJumpTerminalOverlaps(t *testing.T) {
+	for _, stride := range []int{1, 2} {
+		t.Run(fmt.Sprintf("stride%d", stride), func(t *testing.T) {
+			db := newAdaptiveTestDB(t, stride, true, 4096)
+			words := []string{"banana", "band", "bandana"}
+			for i, w := range words {
+				mustSetPair(t, db, w, uint64(100+i))
+			}
+			for i, w := range words {
+				if got := mustGetPair(t, db, w); got != uint64(100+i) {
+					t.Fatalf("terminal beside a jump: %s = %d, want %d", w, got, 100+i)
+				}
+			}
 
-	db := newAdaptiveTestDB(t, 1, true, 4096)
-	for i, w := range []string{"banana", "band", "bandana"} {
-		mustSetPair(t, db, w, uint64(100+i))
-	}
-	if got := mustGetPair(t, db, "band"); got != 101 {
-		t.Fatalf("defect 1: band = %d, want 101", got)
-	}
+			db2 := newAdaptiveTestDB(t, stride, true, 4096)
+			mustSetPair(t, db2, "apple", 1)
+			mustSetPair(t, db2, "apricot", 2)
+			if ok, err := db2.deletePairValue([]byte("apricot")); err != nil || !ok {
+				t.Fatalf("delete apricot: ok=%v err=%v", ok, err)
+			}
+			if got := mustGetPair(t, db2, "apple"); got != 1 {
+				t.Fatalf("delete dropped the sibling: apple = %d, want 1", got)
+			}
+			if got := len(scanAll(t, db2, "")); got != 1 {
+				t.Fatalf("scan after delete returned %d keys, want 1", got)
+			}
 
-	db2 := newAdaptiveTestDB(t, 1, true, 4096)
-	mustSetPair(t, db2, "apple", 1)
-	mustSetPair(t, db2, "apricot", 2)
-	if ok, err := db2.deletePairValue([]byte("apricot")); err != nil || !ok {
-		t.Fatalf("delete apricot: ok=%v err=%v", ok, err)
-	}
-	if got := mustGetPair(t, db2, "apple"); got != 1 {
-		t.Fatalf("defect 2: apple = %d, want 1", got)
-	}
-
-	db3 := newAdaptiveTestDB(t, 1, true, 4096)
-	mustSetPair(t, db3, "alphabet", 1)
-	if err := db3.setPairValue([]byte("alpha"), 2, false); err != nil {
-		t.Fatalf("defect 3: storing a strict prefix of an existing key: %v", err)
+			db3 := newAdaptiveTestDB(t, stride, true, 4096)
+			mustSetPair(t, db3, "alphabet", 1)
+			if err := db3.setPairValue([]byte("alpha"), 2, false); err != nil {
+				t.Fatalf("storing a strict prefix of an existing key: %v", err)
+			}
+			if got := mustGetPair(t, db3, "alpha"); got != 2 {
+				t.Fatalf("alpha = %d, want 2", got)
+			}
+			if got := mustGetPair(t, db3, "alphabet"); got != 1 {
+				t.Fatalf("alphabet = %d, want 1", got)
+			}
+			if got := len(scanAll(t, db3, "alpha")); got != 2 {
+				t.Fatalf("scan alpha returned %d keys, want 2", got)
+			}
+		})
 	}
 }
 

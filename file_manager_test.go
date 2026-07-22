@@ -10,22 +10,33 @@ import (
 
 // TestManagedFileConcurrentHandleLifecycle esercita il descrittore mentre
 // letture, scritture, Flush e chiusure forzate (FILE_CHECKPOINT close_handles,
-// cap sugli fd, idle close) corrono in parallelo. Prima della protezione di
-// mf.file con handleMu, `go test -race` segnalava una data race fra Flush /
-// ReadAt / WriteAt e forceCloseHandle, e la chiusura poteva invalidare un fd
-// già in uso da un'altra goroutine.
+// cap sugli fd, idle close) corrono in parallelo, con e senza cache dei
+// settori. Va eseguito con -race: prima della protezione di mf.file con
+// handleMu segnalava una race fra Flush / ReadAt / WriteAt e forceCloseHandle
+// (e la chiusura poteva invalidare un fd già in uso da un'altra goroutine); con
+// la cache attiva scopriva anche la race sul contenuto dei settori fra
+// writeWithCache e il flusher.
 func TestManagedFileConcurrentHandleLifecycle(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		name := "direct"
+		if cached {
+			name = "cached"
+		}
+		t.Run(name, func(t *testing.T) { runManagedFileHandleChurn(t, cached) })
+	}
+}
+
+func runManagedFileHandleChurn(t *testing.T, cached bool) {
+	t.Helper()
 	manager := NewFileManager(2, nil)
 	defer manager.Close()
 
-	// Cache disattivata: le operazioni vanno dritte sul descrittore, che è
-	// esattamente il campo sotto esame. (Con la cache attiva questo test
-	// inciamperebbe anche nella race — distinta e preesistente — sui buffer
-	// dei settori fra writeWithCache e il flusher.)
 	path := filepath.Join(t.TempDir(), "handle_race.table")
 	mf, err := NewManagedFile(manager, path, ManagedFileOptions{
-		CacheEnabled: false,
-		SectorSize:   512,
+		CacheEnabled:     cached,
+		FlushInterval:    time.Millisecond,
+		SectorSize:       512,
+		MaxCachedSectors: 4,
 	})
 	if err != nil {
 		t.Fatalf("NewManagedFile: %v", err)
@@ -52,7 +63,9 @@ func TestManagedFileConcurrentHandleLifecycle(t *testing.T) {
 	}
 
 	for i := 0; i < 4; i++ {
-		off := int64(i) * 512
+		// Due scrittori insistono sullo stesso settore, così la race sul
+		// contenuto (non solo quella sul descrittore) ha modo di emergere.
+		off := int64(i%2) * 512
 		spawn(func() {
 			if _, err := mf.WriteAt(payload, off); err != nil {
 				t.Errorf("WriteAt(%d): %v", off, err)
