@@ -361,7 +361,9 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
 The primitive KV + pair-mapping operations invoked by `ExecuteCommand`.
 
 - **Key functions:** `Insert`/`persistPayload` (size-partitioned write + recycle reuse), `Read`, `Edit`
-  (relocates on size change), `Delete` (tombstone + recycle + cache invalidate), `PairSet`,
+  (relocates on size change), `Delete` (tombstone, then recycle the value slot *and* the key row,
+  then invalidate the cache — the tombstone goes first so a half-failure leaks instead of
+  double-allocating), `PairSet`,
   `PairSetHidden`, `PairGet`, `PairDel`, `PairPurge`/`purgePairEntries` (batched namespace wipe).
 - **Depends on:** [`tables.go`](src/tables.go), [`helpers.go`](src/helpers.go), [`cache.go`](src/cache.go).
 - **Common mistakes:** `Insert` validates that a `INSERT:<n>` declared size matches the payload; the
@@ -727,8 +729,10 @@ nodes are reused — keep automated runs to a few hundred edges.
 ### Runtime / generated (never edited or committed)
 
 - `cheetah-server` — the built binary (`.gitignore`d).
-- `cheetah_data/<db>/` — per-database directory: `main_keys.table`, `values_<size>_<id>.table`,
-  `values_<size>.recycle.table`, `pairs/<hexid>.table` + `pairs/next_id.dat` + `pairs/format.dat`,
+- `cheetah_data/<db>/` — per-database directory: `main_keys.table`, `main_keys.recycle.table`
+  (free list of deleted key rows), `values_<size>_<id>.table`,
+  `values_<size>.recycle.table` (free list of value slots; both carry the `"CHRL"` header),
+  `pairs/<hexid>.table` + `pairs/next_id.dat` + `pairs/format.dat`,
   `pair_jumps/{jumps.bin,index.bin,next_id.dat}`, `prediction_<name>.table`, `cluster_topology.json`.
   Source of truth is the engine; these are outputs.
 
@@ -1196,6 +1200,13 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 <a id="known-gaps"></a>
 ### Known gaps
 
+- **`INSERT` overwrites payloads of the same size** — `getAvailableLocation`
+  ([`helpers.go`](src/helpers.go)) derives the next `EntryID` from the values file's size on disk,
+  but `ValuesTable.WriteAt` ([`tables.go`](src/tables.go)) queues the write and returns, so
+  consecutive inserts of one payload size all land on `EntryID 0`. Three 6-byte inserts leave a
+  6-byte file; a restart then reads the last payload back for every one of those keys. **The most
+  severe open defect** — full repro in [`NEXT_STEPS.md`](NEXT_STEPS.md). Note this is slot
+  allocation, not key allocation: `main_keys` rows are handed out correctly.
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](src/cluster_scheduler.go) `load`). First open item in
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.

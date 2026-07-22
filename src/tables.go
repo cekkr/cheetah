@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -184,12 +185,31 @@ func (t *ValuesTable) Close() {
 }
 
 // --- RecycleTable ---
+
+// RecycleTable è la free list del database: uno stack LIFO su file di record a
+// dimensione fissa. Serve due utenti con lo stesso codice, distinti solo da
+// entrySize — gli slot dei valori liberati da DELETE/EDIT (5 byte di
+// ValueLocationIndex) e le righe di main_keys liberate da DELETE (8 byte di
+// chiave). LIFO e non FIFO di proposito: l'ultimo record liberato è quello con
+// più probabilità di essere ancora in page cache.
+//
+// La profondità dello stack vive in memoria e viene riscritta sul file a ogni
+// mutazione, quindi Pop costa una lettura più una scrittura invece delle due
+// letture e una scrittura della versione precedente, che rileggeva il contatore
+// da disco ogni volta.
 type RecycleTable struct {
-	file *ManagedFile
-	mu   sync.Mutex
+	file      *ManagedFile
+	path      string
+	entrySize int64
+	mu        sync.Mutex
+	depth     uint64
 }
 
-func NewRecycleTable(manager *FileManager, path string) (*RecycleTable, error) {
+// NewRecycleTable apre (o crea) una free list di record da entrySize byte.
+func NewRecycleTable(manager *FileManager, path string, entrySize int) (*RecycleTable, error) {
+	if entrySize <= 0 || entrySize > 255 {
+		return nil, fmt.Errorf("invalid recycle entry size %d for %q", entrySize, path)
+	}
 	opts := ManagedFileOptions{
 		CacheEnabled:     false,
 		SectorSize:       defaultSectorSize,
@@ -199,7 +219,106 @@ func NewRecycleTable(manager *FileManager, path string) (*RecycleTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RecycleTable{file: file}, nil
+	t := &RecycleTable{file: file, path: path, entrySize: int64(entrySize)}
+	if err := t.load(); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return t, nil
+}
+
+// load riconosce il file all'apertura: intestazione corrente, file vuoto, o il
+// vecchio layout senza intestazione, che viene migrato sul posto conservando le
+// entrate già registrate (sono al massimo 65_535 record, un rewrite da 320 KB).
+func (t *RecycleTable) load() error {
+	info, err := os.Stat(t.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return t.writeHeader(0)
+		}
+		return err
+	}
+	size := info.Size()
+	if size == 0 {
+		return t.writeHeader(0)
+	}
+
+	hdr := make([]byte, RecycleHeaderSize)
+	if n, err := t.file.ReadAt(hdr, 0); err != nil && n < RecycleHeaderSize {
+		if !errors.Is(err, io.EOF) {
+			return err
+		}
+	}
+	if size >= RecycleHeaderSize && string(hdr[0:4]) == RecycleFileMagic {
+		if hdr[4] != RecycleFileVersion {
+			return fmt.Errorf("unsupported recycle format version %d in %q", hdr[4], t.path)
+		}
+		if int64(hdr[5]) != t.entrySize {
+			return fmt.Errorf("recycle entry size mismatch in %q: file says %d, expected %d", t.path, hdr[5], t.entrySize)
+		}
+		depth := binary.BigEndian.Uint64(hdr[8:16])
+		// Una profondità oltre la fine del file significa intestazione mezza
+		// scritta: ci si ferma al numero di record effettivamente presenti
+		// invece di leggere spazzatura.
+		if max := uint64((size - RecycleHeaderSize) / t.entrySize); depth > max {
+			depth = max
+		}
+		t.depth = depth
+		return nil
+	}
+	return t.migrateLegacy(size)
+}
+
+// migrateLegacy converte il layout precedente (contatore uint16 a offset 0,
+// record da ValueLocationIndexSize a seguire). Solo la free list degli slot
+// valore è mai esistita in quel formato: qualunque altro entrySize su un file
+// senza intestazione è un file estraneo, non un legacy.
+func (t *RecycleTable) migrateLegacy(size int64) error {
+	if t.entrySize != ValueLocationIndexSize {
+		return fmt.Errorf("unrecognized recycle file %q: no %q header", t.path, RecycleFileMagic)
+	}
+	counter := make([]byte, RecycleCounterSize)
+	if _, err := t.file.ReadAt(counter, 0); err != nil {
+		return err
+	}
+	depth := uint64(binary.BigEndian.Uint16(counter))
+	if max := uint64((size - RecycleCounterSize) / t.entrySize); depth > max {
+		depth = max
+	}
+	if depth > 0 {
+		payload := make([]byte, int64(depth)*t.entrySize)
+		if _, err := t.file.ReadAt(payload, RecycleCounterSize); err != nil {
+			return err
+		}
+		if _, err := t.file.WriteAt(payload, RecycleHeaderSize); err != nil {
+			return err
+		}
+	}
+	if err := t.writeHeader(depth); err != nil {
+		return err
+	}
+	t.depth = depth
+	logInfof("recycle: migrated %q to the %s header format (%d entries carried over)", t.path, RecycleFileMagic, depth)
+	return nil
+}
+
+func (t *RecycleTable) writeHeader(depth uint64) error {
+	hdr := make([]byte, RecycleHeaderSize)
+	copy(hdr[0:4], RecycleFileMagic)
+	hdr[4] = RecycleFileVersion
+	hdr[5] = byte(t.entrySize)
+	binary.BigEndian.PutUint64(hdr[8:16], depth)
+	_, err := t.file.WriteAt(hdr, 0)
+	return err
+}
+
+// writeDepth persiste solo il campo profondità, gli 8 byte che cambiano a ogni
+// Push/Pop.
+func (t *RecycleTable) writeDepth(depth uint64) error {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, depth)
+	_, err := t.file.WriteAt(buf, 8)
+	return err
 }
 
 func (t *RecycleTable) Close() {
@@ -208,50 +327,71 @@ func (t *RecycleTable) Close() {
 	}
 }
 
+// Depth restituisce quanti record sono riutilizzabili.
+func (t *RecycleTable) Depth() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.depth
+}
+
+// Pop stacca il record in cima. La profondità viene persistita *prima* del
+// ritorno: se il processo muore subito dopo, il record risulta ancora preso e
+// al più si perde uno slot, mentre l'ordine inverso lo consegnerebbe due volte.
 func (t *RecycleTable) Pop() ([]byte, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	counterBytes := make([]byte, RecycleCounterSize)
-	if _, err := t.file.ReadAt(counterBytes, 0); err != nil {
-		return nil, false // File vuoto o errore
-	}
-	count := binary.BigEndian.Uint16(counterBytes)
-	if count == 0 {
+	if t.depth == 0 {
 		return nil, false
 	}
-
-	offset := int64(RecycleCounterSize) + int64(count-1)*ValueLocationIndexSize
-	locBytes := make([]byte, ValueLocationIndexSize)
-	if _, err := t.file.ReadAt(locBytes, offset); err != nil {
+	offset := RecycleHeaderSize + int64(t.depth-1)*t.entrySize
+	buf := make([]byte, t.entrySize)
+	if _, err := t.file.ReadAt(buf, offset); err != nil {
+		logErrorf("recycle: reading entry at %d of %q: %v", offset, t.path, err)
 		return nil, false
 	}
-
-	binary.BigEndian.PutUint16(counterBytes, count-1)
-	if _, err := t.file.WriteAt(counterBytes, 0); err != nil {
-		// Errore critico, ma l'indice Γö£┬┐ stato letto. Potremmo loggarlo.
+	if err := t.writeDepth(t.depth - 1); err != nil {
+		logErrorf("recycle: persisting depth for %q: %v", t.path, err)
+		return nil, false
 	}
-	return locBytes, true
+	t.depth--
+	return buf, true
 }
 
-func (t *RecycleTable) Push(locationBytes []byte) error {
+// Push rimette un record sulla cima. Prima il record, poi la profondità: un
+// crash fra i due lascia un record invisibile in coda al file, mai una
+// profondità che punta a byte non scritti.
+func (t *RecycleTable) Push(entry []byte) error {
+	if int64(len(entry)) != t.entrySize {
+		return fmt.Errorf("recycle push of %d bytes into a %d-byte list (%q)", len(entry), t.entrySize, t.path)
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	counterBytes := make([]byte, RecycleCounterSize)
-	count := uint16(0)
-	if _, err := t.file.ReadAt(counterBytes, 0); err == nil {
-		count = binary.BigEndian.Uint16(counterBytes)
-	}
-
-	offset := int64(RecycleCounterSize) + int64(count)*ValueLocationIndexSize
-	if _, err := t.file.WriteAt(locationBytes, offset); err != nil {
+	offset := RecycleHeaderSize + int64(t.depth)*t.entrySize
+	if _, err := t.file.WriteAt(entry, offset); err != nil {
 		return err
 	}
+	if err := t.writeDepth(t.depth + 1); err != nil {
+		return err
+	}
+	t.depth++
+	return nil
+}
 
-	binary.BigEndian.PutUint16(counterBytes, count+1)
-	_, err := t.file.WriteAt(counterBytes, 0)
-	return err
+// PushKey e PopKey sono la vista tipizzata sulla free list delle chiavi.
+func (t *RecycleTable) PushKey(key uint64) error {
+	buf := make([]byte, RecycleKeyEntrySize)
+	binary.BigEndian.PutUint64(buf, key)
+	return t.Push(buf)
+}
+
+func (t *RecycleTable) PopKey() (uint64, bool) {
+	buf, ok := t.Pop()
+	if !ok {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(buf), true
 }
 
 // /

@@ -16,8 +16,25 @@ const (
 	// Values Table
 	EntriesPerValueTable = 1 << 16
 
-	// Recycle Table
-	RecycleCounterSize = 2
+	// Recycle Table (free list). The stack counter used to be a uint16 written at
+	// offset 0, which wrapped silently at 65_536 entries and orphaned the whole
+	// list. The current file is self-describing and counts in uint64.
+	//
+	// Header layout (RecycleHeaderSize bytes):
+	//   [0:4]  magic "CHRL"
+	//   [4]    format version
+	//   [5]    entry size in bytes (5 for value locations, 8 for keys)
+	//   [6:8]  reserved
+	//   [8:16] stack depth (uint64)
+	RecycleFileMagic    = "CHRL"
+	RecycleFileVersion  = 1
+	RecycleHeaderSize   = 16
+	RecycleCounterSize  = 2 // legacy headerless layout: uint16 depth at offset 0
+	RecycleKeyEntrySize = 8 // free main_keys row: one uint64 key
+
+	// MaxValueTableID is what fits in the 3 bytes a ValueLocationIndex reserves
+	// for the table id.
+	MaxValueTableID = 1<<24 - 1
 
 	// Pair Table (TreeTable)
 	PairEntryKeySize          = 6
@@ -63,11 +80,19 @@ type ValueLocationIndex struct {
 	EntryID uint16
 }
 
+// Encode scrive [TableID:3][EntryID:2]. La versione precedente usava
+// PutUint32(buf, TableID), i cui byte 0..2 sono i *più significativi* del
+// uint32: il byte basso dell'ID finiva in buf[3] e veniva subito sovrascritto
+// da EntryID, quindi ogni TableID veniva salvato diviso per 256 (1..255 → 0).
+// Chi supera le 65_536 entrate per dimensione — la prima tabella oltre la 0 —
+// leggeva il payload dal file sbagliato.
 func (vli ValueLocationIndex) Encode() []byte {
 	buf := make([]byte, ValueLocationIndexSize)
-	binary.BigEndian.PutUint32(buf, vli.TableID)
+	buf[0] = byte(vli.TableID >> 16)
+	buf[1] = byte(vli.TableID >> 8)
+	buf[2] = byte(vli.TableID)
 	binary.BigEndian.PutUint16(buf[3:], vli.EntryID)
-	return buf[:5]
+	return buf
 }
 
 func DecodeValueLocationIndex(data []byte) ValueLocationIndex {

@@ -48,13 +48,19 @@ func (db *Database) persistPayload(value []byte, specifiedSize int) (uint64, str
 	}
 	db.cachePayload(sizeField, location, value)
 
-	newKey := db.highestKey.Add(1)
+	newKey, err := db.nextKey()
+	if err != nil {
+		return 0, "ERROR,cannot_get_key", err
+	}
 	entry := make([]byte, MainKeysEntrySize)
 	writeValueSize(entry, sizeField)
 	copy(entry[ValueSizeBytes:], location.Encode())
 
 	if err := db.mainKeys.WriteEntry(newKey, entry); err != nil {
-		db.highestKey.Add(^uint64(0))
+		// Restituire la chiave alla free list invece di decrementare il
+		// contatore: il decremento consegnava la stessa chiave a chi nel
+		// frattempo ne aveva già presa una più alta, sovrascrivendone la riga.
+		db.releaseKey(newKey)
 		return 0, "ERROR,key_write_failed", err
 	}
 
@@ -186,7 +192,6 @@ func (db *Database) Delete(key uint64) (string, error) {
 		return "ERROR,already_deleted", nil
 	}
 
-	// Aggiungi l'indice alla tabella di riciclo
 	locationBytes := make([]byte, ValueLocationIndexSize)
 	copy(locationBytes, entry[ValueSizeBytes:])
 	location := DecodeValueLocationIndex(locationBytes)
@@ -196,20 +201,20 @@ func (db *Database) Delete(key uint64) (string, error) {
 	if err != nil {
 		return "ERROR,cannot_load_recycle_table", err
 	}
+
+	// L'azzeramento della riga viene prima delle due Push, ed è l'ordine che
+	// rende la cancellazione sicura a metà: se qui si muore, riga e slot
+	// restano occupati e non si perde nulla. Riciclare per primi invece
+	// significherebbe, in caso di errore sull'azzeramento, avere uno slot in
+	// free list ancora puntato da una riga viva — cioè un INSERT successivo che
+	// sovrascrive un payload buono.
+	if err := db.mainKeys.writeEntryToFile(key, make([]byte, MainKeysEntrySize)); err != nil {
+		return "ERROR,key_delete_failed", err
+	}
 	if err := rTable.Push(locationBytes); err != nil {
 		return "ERROR,recycle_failed", err
 	}
-
-	// Azzera la chiave nella tabella principale
-	if err := db.mainKeys.writeEntryToFile(key, make([]byte, MainKeysEntrySize)); err != nil {
-		// Qui servirebbe un rollback del Push, ma per ora lo omettiamo
-		return "ERROR,key_delete_failed", err
-	}
-
-	// Se abbiamo eliminato la chiave più alta, trova la nuova
-	if key == db.highestKey.Load() {
-		db.findNewHighestKey(key)
-	}
+	db.releaseKey(key)
 
 	return fmt.Sprintf("SUCCESS,key=%d_deleted", key), nil
 }

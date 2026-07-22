@@ -28,6 +28,7 @@ type Database struct {
 	highestKey         atomic.Uint64
 	nextPairTableID    atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
 	mainKeys           *MainKeysTable
+	keyRecycle         *RecycleTable // Righe di main_keys liberate da DELETE, riusate dal prossimo INSERT
 	valuesTables       sync.Map
 	recycleTables      sync.Map
 	pairTables         sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
@@ -425,6 +426,25 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		mkt.Close()
 		return nil, err
 	}
+
+	// La free list delle chiavi va aperta dopo loadHighestKey: se manca, viene
+	// seminata con le righe già cancellate, e per farlo serve sapere fin dove
+	// arriva main_keys.
+	keyRecyclePath := filepath.Join(path, "main_keys.recycle.table")
+	_, missing := os.Stat(keyRecyclePath)
+	keyRecycle, err := NewRecycleTable(fileManager, keyRecyclePath, RecycleKeyEntrySize)
+	if err != nil {
+		mkt.Close()
+		return nil, err
+	}
+	db.keyRecycle = keyRecycle
+	if os.IsNotExist(missing) {
+		if err := db.seedKeyRecycle(); err != nil {
+			keyRecycle.Close()
+			mkt.Close()
+			return nil, err
+		}
+	}
 	return db, nil
 }
 
@@ -447,6 +467,9 @@ func (db *Database) Close() error {
 func (db *Database) shutdown() error {
 	var firstErr error
 	db.mainKeys.Close()
+	if db.keyRecycle != nil {
+		db.keyRecycle.Close()
+	}
 	db.valuesTables.Range(func(key, value interface{}) bool {
 		if table, ok := value.(interface{ Close() }); ok {
 			table.Close()
@@ -509,7 +532,7 @@ func (db *Database) getRecycleTable(size uint32) (*RecycleTable, error) {
 		return table.(*RecycleTable), nil
 	}
 	path := filepath.Join(db.path, fmt.Sprintf("values_%d.recycle.table", size))
-	newTable, err := NewRecycleTable(db.fileManager, path)
+	newTable, err := NewRecycleTable(db.fileManager, path, ValueLocationIndexSize)
 	if err != nil {
 		return nil, err
 	}
