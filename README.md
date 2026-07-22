@@ -18,14 +18,14 @@ other dense analytical slices must be served with predictable latency.
   allocate full tables, and **adaptive node indexing** keeps a sparse node as a compact
   binary-searched list instead of reserving its whole branch array — so the wide stride no longer
   costs ~707 KB per node.
-- **Payload caching.** `database.go` keeps a bounded cache (defaults: 16k entries ≈64 MB) keyed by
+- **Payload caching.** `src/database.go` keeps a bounded cache (defaults: 16k entries ≈64 MB) keyed by
   `<value_size, table_id, entry_id>` so hot payloads never hit disk. Tune it with
   `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
   `CHEETAH_PAYLOAD_CACHE_BYTES`, or disable caching entirely by setting any of them to `0`.
 - **Resource-aware reducers.** The server detects available CPU cores at startup, samples live
   CPU/I/O pressure, and scales reducer worker pools accordingly so concurrent connections avoid
   exhausting compute or disk bandwidth.
-- **Multi-tenant databases.** `engine.go` multiplexes logical databases under `cheetah_data/<name>`
+- **Multi-tenant databases.** `src/engine.go` multiplexes logical databases under `cheetah_data/<name>`
   and exposes them over both CLI and TCP, making it easy to isolate experiments or pilot rollouts.
 - **Reducer streaming.** Reducers stream inline payloads through a bounded worker pool, overlap disk
   reads with encoding work, and emit cursor tokens so callers can page through arbitrarily large
@@ -33,11 +33,15 @@ other dense analytical slices must be served with predictable latency.
 
 ## Architecture at a Glance
 
-- `main.go` boots the TCP listener (`0.0.0.0:4455` by default) plus the local CLI and routes commands
+All server sources live in `src/` (`package main`, import path `cheetahdb/src`). The repository root
+holds documentation, `config.example.ini`, `build.sh`, and the two standalone build targets `gold/`
+(reference prototype) and `demo/graph-nell/` (benchmark client).
+
+- `src/main.go` boots the TCP listener (`0.0.0.0:4455` by default) plus the local CLI and routes commands
   to database handles returned by `engine.GetDatabase(name)`.
-- `engine.go` lazily instantiates `Database` structs backed by `cheetah_data/<dbname>` and ensures all
+- `src/engine.go` lazily instantiates `Database` structs backed by `cheetah_data/<dbname>` and ensures all
   tables (main keys, values, recycling queues, pair trie) flush cleanly at shutdown.
-- `database.go` orchestrates CRUD operations:
+- `src/database.go` orchestrates CRUD operations:
   - `MainKeysTable` stores compact metadata describing payload size + pointer offsets.
   - `ValuesTable` files hold fixed-width blobs grouped by byte length and table ID so offsets remain
     arithmetic instead of scan-based.
@@ -45,7 +49,7 @@ other dense analytical slices must be served with predictable latency.
     compaction pauses.
   - `PairTable` nodes store child pointers and terminal flags independently, unlocking
     prefix-sharing namespaces such as `ctx:`, `ctxv:`, `prob:`, or `meta:`.
-- `server.go` accepts newline-delimited commands (`INSERT`, `READ`, `PAIR_SCAN`, `PAIR_REDUCE`, …)
+- `src/server.go` accepts newline-delimited commands (`INSERT`, `READ`, `PAIR_SCAN`, `PAIR_REDUCE`, …)
   over TCP so external adapters can talk to the engine without embedding Go code.
 
 ## Heavy Statistical Workloads
@@ -58,7 +62,7 @@ continuation metadata, and concept caches:
 - Mirror Top-K caches, follow-up penalties, or other heavy slices directly into the trie so cache
   lookups never re-open SQLite or object stores.
 - When benchmarking reducers, export `CHEETAHDB_BENCH=1` and run
-  `go test -run TestCheetahDBBenchmark -count=1 -v` for reproducible throughput snapshots.
+  `go test -run TestCheetahDBBenchmark -count=1 -v ./src` for reproducible throughput snapshots.
 - See [`AGENTS.md`](AGENTS.md) for cache-sizing guidance, launch recipes, and namespace
   troubleshooting notes when you run sustained ingest/eval loops.
 
@@ -79,7 +83,7 @@ continuation metadata, and concept caches:
 ## Building & Running
 
 ```bash
-bash build.sh              # produces ./cheetah-server (or: go build -o cheetah-server .)
+bash build.sh              # produces ./cheetah-server (or: go build -o cheetah-server ./src)
 ./cheetah-server           # interactive CLI + TCP listener
 # or launch headless
 CHEETAH_HEADLESS=1 ./cheetah-server
@@ -277,7 +281,7 @@ SUCCESS,key=1_deleted
   SUCCESS,reducer=counts,count=1,next_cursor=x0000af,items=6378743a4245524c494e:42:AAEAAAABAAAD
   ```
 
-  Reducers control the payload schema; if you extend `commands.go` with a new reducer you only need
+  Reducers control the payload schema; if you extend `src/commands.go` with a new reducer you only need
   to document how to decode its base64 block.
 - `PAIR_PURGE <prefix> [page_size]` wipes every pair entry beneath the prefix and deletes the backing
   payload keys inside Go. Use `PAIR_PURGE ctx:` (or `*` to nuke the entire trie) when you need a hot
@@ -287,7 +291,7 @@ SUCCESS,key=1_deleted
   empty so hot-path clients can wipe everything (pairs, value tables, metadata) with a single command.
   Omitting the name resets whichever database is currently selected on the connection/CLI prompt.
 - `SYSTEM_STATS` is a cheap heartbeat: call it between ingest/reduce loops to track CPU, memory, and
-  fd counts without spawning `top`. Because `database.go` formats it in CSV-like key/value pairs, it
+  fd counts without spawning `top`. Because `src/database.go` formats it in CSV-like key/value pairs, it
   can be parsed by shell scripts (`awk -F,`) or structured log scrapers.
 
 - **Prediction tables & context matrices.** The database can now host multiple prediction tables
@@ -296,7 +300,7 @@ SUCCESS,key=1_deleted
 
   - `PREDICT_SET key=<prefix> value=<bytes> prob=<0-1> [weights=<base64 json>] [table=name]` stores a
     candidate value for the given prefix. Context weights use the `ContextWeight` JSON schema defined
-    in [`prediction_table.go`](prediction_table.go) (encode the JSON blob, then pass it as base64).
+    in [`src/prediction_table.go`](src/prediction_table.go) (encode the JSON blob, then pass it as base64).
   - `PREDICT_QUERY key=<prefix> [keys=a,b,c] [ctx=<base64 json>] [windows=<base64 json>]
     [key_windows=<base64 json>] [merge=avg|sum|max] [table=name]` evaluates one or many prefixes and
     merges their probability windows. `ctx` may be a base64-encoded JSON array (`[[...], ...]`) or an
@@ -478,7 +482,7 @@ SUCCESS,return=paths,matches=2,next_cursor=*,payload=<base64>
 Graph statistics can also stream through the reducer language: `PAIR_REDUCE degree|triangle|pagerank_seed <adj-hex-prefix>`
 runs directly over the `adj/out`/`adj/in` namespaces without hydrating edges. For the authoritative
 argument grammar of every command above, the source of truth is the `handleGraph*` dispatch in
-[`graph.go`](graph.go) (routed from `ExecuteCommand` in [`database.go`](database.go)) — this section
+[`src/graph.go`](src/graph.go) (routed from `ExecuteCommand` in [`src/database.go`](src/database.go)) — this section
 documents that behavior, not a separate spec. A runnable, end-to-end example of the whole language
 (ingest → adjacency → query → predict over TCP) lives in
 [`demo/graph-nell/`](demo/graph-nell/README.md). For worked examples of turning natural-language
@@ -868,7 +872,7 @@ The rest of the vocabulary still lives in `props`, because it is provenance rath
 Where the query language stops, and what to do about it:
 
 - **`WHERE` is AND-only** — no `OR`, no `NOT`, no parentheses (see
-  [`parseGraphWhereClause`](graph.go), which splits on `AND`). This is why a disjunction is stored as
+  [`parseGraphWhereClause`](src/graph.go), which splits on `AND`). This is why a disjunction is stored as
   a *group* rather than expressed as a query: one `edge.ambiguity` equality returns the whole set.
   `!=` covers per-field negation, and anything richer belongs in the client.
 - **Exclusivity is enforced at write time, not as an invariant.** `GRAPH_AMBIGUITY_SET` and
@@ -1000,7 +1004,7 @@ with `PREDICT_TRAIN`, consolidation and forgetting, and the adapter contract —
 
 - `PAIR_REDUCE counts ctx:` aggregates follower counts directly inside Go and emits the packed
   payloads inline, allowing MKNS-style reducers or other statistical aggregators to run without SQL.
-- Custom reducers can be registered in Go via the reducer registry (see `reducers.go`). Each reducer
+- Custom reducers can be registered in Go via the reducer registry (see `src/reducers.go`). Each reducer
   receives the pair-trie iterator and can emit any payload format; clients decode the base64 payload
   per reducer contract.
 
@@ -1026,8 +1030,8 @@ cheetah-db’s performance hinges on a deterministic, trie-backed index that tre
 key prefix as a path through fixed-size `PairTable` nodes. Each node has fixed-span children (one raw
 byte per hop by default, optionally two when configured) plus independent terminal/child/jump flags,
 so the same structure that indexes keys also highlights “hot” shared prefixes. The entry layout is
-defined in [`types.go`](types.go) and the traversal logic lives in [`database.go`](database.go) and
-[`pair_codec.go`](pair_codec.go):
+defined in [`src/types.go`](src/types.go) and the traversal logic lives in [`src/database.go`](src/database.go) and
+[`src/pair_codec.go`](src/pair_codec.go):
 
 - Every namespace (e.g., `ctx:BERLIN`) is stored as raw bytes. Walking those bytes selects a slot
   inside the root pair table and either follows a child table ID or marks the node as terminal with

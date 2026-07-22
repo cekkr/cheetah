@@ -1,11 +1,17 @@
 # cheetah-db — AI Agent Reference
 
 `cheetah-db` is a standalone, single-binary **Go** key/value + graph + prediction database server
-(`package main`, module `cheetahdb`, Go 1.24). It stores byte-encoded payloads partitioned by value
+(`package main` in [`src/`](src/), import path `cheetahdb/src`, module `cheetahdb`, Go 1.24). It stores
+byte-encoded payloads partitioned by value
 size, indexes namespace prefixes through an on-disk **pair trie**, and speaks a newline-delimited text
 protocol over TCP and an interactive CLI. It was built to stage dense statistical datasets (n-gram
 counts, probabilities, continuation metadata, context vectors) and later grew graph storage, matrix
 prediction tables, and cluster-fork scheduling.
+
+**Repository layout:** [`src/`](src/) holds the whole server (`package main`, all `*.go` and `*_test.go`
+of the engine); [`gold/`](gold/) and [`demo/graph-nell/`](demo/graph-nell/) are separate `package main`
+build targets; everything else at the root is docs, config, and the build script. Build with
+`go build -o cheetah-server ./src`, test with `go test ./src`.
 
 This file is the fast-access operational map for agents working in this repository. Read it before
 editing, and update it in the same change that alters a documented fact (see
@@ -14,9 +20,10 @@ editing, and update it in the same change that alters a documented fact (see
 **What this repository is NOT:**
 
 - It is **not** the Python "DB-SLM"/"lmdb" project that consumes this server. This repo contains **no
-  Python**, no `src/` tree, no `train.py`/`run.py`, no SQLite, and no `DBSLM_*` behavior. Any such
-  reference in prose docs is a vestige of the parent monorepo this was extracted from — treat those
-  names as an *external client*, not code here. See
+  Python**, no `train.py`/`run.py`, no SQLite, and no `DBSLM_*` behavior. The `src/` directory here is
+  **Go server code**; it is *not* that project's `src/` package tree, so `src/train.py`,
+  `src/db_slm/…` and `src/helpers/…` paths in prose docs are a vestige of the parent monorepo this was
+  extracted from — treat those names as an *external client*, not code here. See
   [Vestigial parent-monorepo references](#pitfall-vestigial-references).
 - It is **not** LMDB. The name collision is incidental; there is no `mmap` B-tree here.
 - The [`gold/`](gold/) tree is a teaching prototype, not the shipping engine. The
@@ -30,13 +37,13 @@ Authority order for this repository (highest first). When sources disagree, insp
 mismatch within task scope, and update stale docs in the same change.
 
 1. [`LICENSE`](LICENSE) — MIT license terms.
-2. **Go source + tests** (this directory's `*.go` files) — the executable contract and the ground
-   truth for behavior. Tests in [`graph_test.go`](graph_test.go) and
-   [`benchmark_test.go`](benchmark_test.go) assert the pieces they cover.
+2. **Go source + tests** ([`src/`](src/)`/*.go`) — the executable contract and the ground
+   truth for behavior. Tests in [`src/graph_test.go`](src/graph_test.go) and
+   [`src/benchmark_test.go`](src/benchmark_test.go) assert the pieces they cover.
 3. [`config.example.ini`](config.example.ini) — the authoritative shape of `config.ini` settings.
 4. [`README.md`](README.md) — operator/user guide. High-signal but partially stale: it documents
    `RECYCLE` and a standalone TCP `CURSOR` command that the dispatcher does **not** implement. Verify
-   commands against [`ExecuteCommand`](database.go) before trusting them.
+   commands against [`ExecuteCommand`](src/database.go) before trusting them.
 5. [`CONCEPTS.md`](CONCEPTS.md) — original design intent and the context-relativism / reducer payload
    contracts. Written from the parent project's perspective; the `ctx:`/`ctxv:`/`cnt:`/`prob:` layouts
    it describes are *client conventions*, not enforced by this server (the server treats all prefixes
@@ -69,7 +76,9 @@ handbook here is `AGENTS.md`, and [`README.md`](README.md) links it as such.
   Run `gofmt -w` on files you touch and keep it clean; do not mass-reformat unrelated files in a
   behavior change.
 - **Preserve unrelated working-tree changes.** Never use destructive git cleanup to simplify a task.
-- **Tests must pass.** Run `go build ./...`, `go vet ./...`, and `go test .` before committing. The
+- **Server code lives in [`src/`](src/).** New engine `.go` files go there, not at the repository root;
+  the root holds only docs, `config.example.ini`, `build.sh`, and the `gold/`/`demo/` build targets.
+- **Tests must pass.** Run `go build ./...`, `go vet ./...`, and `go test ./src` before committing. The
   benchmark test is gated behind `CHEETAHDB_BENCH=1` and does not run by default.
 - **Comments in this codebase are frequently Italian.** Match the surrounding language and density
   when editing; do not machine-translate existing comments as a side effect.
@@ -81,34 +90,34 @@ handbook here is `AGENTS.md`, and [`README.md`](README.md) links it as such.
 ### Fixed-byte, offset-addressable storage
 
 Every payload is located by arithmetic, never by scanning. A value's home is a
-`<value_size, table_id, entry_id>` triple encoded as a 5-byte [`ValueLocationIndex`](types.go);
+`<value_size, table_id, entry_id>` triple encoded as a 5-byte [`ValueLocationIndex`](src/types.go);
 `READ` becomes a single `ReadAt`. **Consequence:** any change to the byte widths in
-[`types.go`](types.go) (`ValueLocationIndexSize`, `MainKeysEntrySize`, `PairEntrySize`, …) silently
+[`types.go`](src/types.go) (`ValueLocationIndexSize`, `MainKeysEntrySize`, `PairEntrySize`, …) silently
 corrupts every existing `cheetah_data/` directory. Such a change requires a format-version bump and a
 migration path, not an in-place edit.
 
 ### Namespaces are opaque byte paths through a trie
 
 The server assigns **no meaning** to prefixes like `ctx:`, `prob:2`, or `graph/idx/`. It walks the raw
-bytes of a key one branch-span at a time ([`pair_codec.go`](pair_codec.go)) and stores child pointers,
-terminal keys, and jump segments in fixed-size [`PairTable`](tables.go) nodes. Semantic conventions
+bytes of a key one branch-span at a time ([`pair_codec.go`](src/pair_codec.go)) and stores child pointers,
+terminal keys, and jump segments in fixed-size [`PairTable`](src/tables.go) nodes. Semantic conventions
 (`ctx:`/`ctxv:`/`cnt:` layouts in [`CONCEPTS.md`](CONCEPTS.md)) live entirely in clients. **Do not add
 namespace-specific parsing to the trie core.**
 
 ### Prune aggressively; degrade, don't stall
 
 Reducer and summary work is bounded by live CPU/IO telemetry
-([`ResourceMonitor.RecommendedWorkers`](resource_monitor.go)), while a scan bounds itself by page
-(see [`collectPairEntries`](database.go)); the payload cache
-([`cache.go`](cache.go)) and managed-file sector cache ([`file_manager.go`](file_manager.go)) shed
+([`ResourceMonitor.RecommendedWorkers`](src/resource_monitor.go)), while a scan bounds itself by page
+(see [`collectPairEntries`](src/database.go)); the payload cache
+([`cache.go`](src/cache.go)) and managed-file sector cache ([`file_manager.go`](src/file_manager.go)) shed
 memory under pressure; prediction training discards low-magnitude context weights
-([`pruneEntryContextWeights`](prediction_table.go)). New heavy paths MUST cooperate with these back-off
+([`pruneEntryContextWeights`](src/prediction_table.go)). New heavy paths MUST cooperate with these back-off
 mechanisms rather than spawning unbounded goroutines or holding every payload in RAM.
 
 ### One text protocol, two front-ends
 
-CLI ([`main.go`](main.go)) and TCP ([`server.go`](server.go)) are thin loops that both delegate to the
-same [`Database.ExecuteCommand`](database.go). Protocol semantics belong in `ExecuteCommand` (or the
+CLI ([`main.go`](src/main.go)) and TCP ([`server.go`](src/server.go)) are thin loops that both delegate to the
+same [`Database.ExecuteCommand`](src/database.go). Protocol semantics belong in `ExecuteCommand` (or the
 handlers it calls), never in a front-end, so CLI and TCP never drift — **with the sole exception** of
 the connection-scoped `DATABASE` / `RESET_DB` / `EXIT` commands, which are handled in the front-ends
 because they mutate per-connection "current database" state.
@@ -117,32 +126,32 @@ because they mutate per-connection "current database" state.
 
 ## Critical implementation contracts
 
-- **On-disk constants are a wire format.** [`types.go`](types.go) fixes `PairEntrySize = 11`
+- **On-disk constants are a wire format.** [`types.go`](src/types.go) fixes `PairEntrySize = 11`
   (1 flag byte + 6 key bytes + 4 child bytes), `ValueLocationIndexSize = 5`,
   `EntriesPerValueTable = 65536`. Changing any of them breaks all existing databases; bump a format
   version and migrate instead.
 - **Pair-trie entry flags are independent bits.** `FlagIsTerminal`, `FlagHasChild`, `FlagHasJump`,
-  `FlagHidden` ([`types.go`](types.go)) coexist on one entry. A node can be *both* a terminal and a
+  `FlagHidden` ([`types.go`](src/types.go)) coexist on one entry. A node can be *both* a terminal and a
   parent — this is what lets `ctx:` and `ctx:BERLIN` both hold values. Never treat "has child" as
-  "not terminal" (regression risk in [`deletePairAt`](database.go) / [`insertPairAt`](database.go)),
+  "not terminal" (regression risk in [`deletePairAt`](src/database.go) / [`insertPairAt`](src/database.go)),
   and always answer "does the key end on this entry?" before following its jump.
 - **A node does not always start on a stride boundary.** Splitting a jump can leave a 1-byte branch
   with a continuation, so the child below it is offset by one byte. Every key walk must resolve its
-  branch through [`selectPairBranch`](database.go), which falls back from the stride-aligned branch
+  branch through [`selectPairBranch`](src/database.go), which falls back from the stride-aligned branch
   to the short one; hand-rolled `nextChunk` stepping loses keys on 2-byte databases.
 - **`pair_index_bytes` is 1 or 2 and pinned per database at creation.** It sets the branch codec
-  ([`pair_codec.go`](pair_codec.go)) stride, giving `∑ 256^i` logical branches per node. It is
-  persisted in `pairs/format.dat` ([`pair_format.go`](pair_format.go)) and that marker is
+  ([`pair_codec.go`](src/pair_codec.go)) stride, giving `∑ 256^i` logical branches per node. It is
+  persisted in `pairs/format.dat` ([`pair_format.go`](src/pair_format.go)) and that marker is
   **authoritative on reopen** — a later config change cannot silently reinterpret an existing trie.
-  Rebuild (`RESET_DB … pair_bytes=2`) to change it. Note [`Config.normalize`](config.go) coerces a
-  `≤0` value to **2**, while [`defaultConfig`](config.go) ships **1**; an explicitly zeroed
+  Rebuild (`RESET_DB … pair_bytes=2`) to change it. Note [`Config.normalize`](src/config.go) coerces a
+  `≤0` value to **2**, while [`defaultConfig`](src/config.go) ships **1**; an explicitly zeroed
   `pair_index_bytes` becomes 2, not 1.
 - **Pair-node files are self-describing and adaptive.** Each `pairs/<hexid>.table` begins with a
   `PairHeaderSize` (12-byte) header (`"CHPT"`, version, mode, keyWidth, entry count —
-  [`types.go`](types.go)) followed by either a sorted, binary-searched **LIST** body of
+  [`types.go`](src/types.go)) followed by either a sorted, binary-searched **LIST** body of
   `[branchKey|entry]` records (sparse nodes) or a direct-mapped **DENSE** array at
   `PairHeaderSize + branchIndex*PairEntrySize`. The 11-byte `PairEntry` layout is unchanged — only its
-  container adapts. All of this is encapsulated in [`tables.go`](tables.go); callers keep addressing
+  container adapts. All of this is encapsulated in [`tables.go`](src/tables.go); callers keep addressing
   entries by branch index.
 - **A node uses LIST only when its dense form exceeds `pair_list_max_bytes`.** `NewPairTable` computes
   `denseBytes = PairHeaderSize + branchCount*PairEntrySize` and sets `listEligible` only when that
@@ -154,38 +163,40 @@ because they mutate per-connection "current database" state.
   **0 = off**); at the default 4 KiB budget it can never bind, since 1% of 65,792 is 657 against a
   byte capacity of 292.
 - **A dense node file is sparse: never bulk-`ReadAt` the whole span in one call.**
-  [`ManagedFile.ReadAt`](file_manager.go) stops at the first sector entirely past EOF, so a single
+  [`ManagedFile.ReadAt`](src/file_manager.go) stops at the first sector entirely past EOF, so a single
   read across a hole silently truncates and hides every later entry. Use
-  [`readSpanTolerant`](tables.go), which reads one sector at a time and tolerates `io.EOF`.
+  [`readSpanTolerant`](src/tables.go), which reads one sector at a time and tolerates `io.EOF`.
 - **Payload cache must be invalidated on mutation.** `DELETE`/`EDIT` MUST call
-  [`invalidatePayload`](database.go); the cache copies bytes on `Get`/`Add`
-  ([`cloneBytes`](cache.go)) so callers may not mutate returned slices in place.
+  [`invalidatePayload`](src/database.go); the cache copies bytes on `Get`/`Add`
+  ([`cloneBytes`](src/cache.go)) so callers may not mutate returned slices in place.
 - **`EDIT` that changes payload length must relocate the value** to the correctly sized value table and
-  recycle the old slot ([`Database.Edit`](commands.go)). Regression covered by
-  [`TestEditResizesValues`](benchmark_test.go).
-- **All pair/value table IO goes through the managed file layer.** [`ManagedFile`](file_manager.go)
+  recycle the old slot ([`Database.Edit`](src/commands.go)). Regression covered by
+  [`TestEditResizesValues`](src/benchmark_test.go).
+- **All pair/value table IO goes through the managed file layer.** [`ManagedFile`](src/file_manager.go)
   owns sector caching, the shared flush queue, fd-limit eviction, and checkpoints. Do not open those
   `.table` files with raw `os` calls; you would bypass dirty-sector flushing and the fd cap. Shutdown
-  and [`FILE_CHECKPOINT`](database.go) drain this layer.
+  and [`FILE_CHECKPOINT`](src/database.go) drain this layer.
 - **Every command answers on exactly one line.** The protocol is newline-delimited, so a multi-line
   response shifts every later answer on that connection. `LOG_FLUSH` used to break this and now
   returns its entries as a base64 JSON array in `payload=` (`formatLogFlushResponse` in
-  [`database.go`](database.go), pinned by [`logger_test.go`](logger_test.go)); any new command with
+  [`database.go`](src/database.go), pinned by [`logger_test.go`](src/logger_test.go)); any new command with
   list-shaped output must do the same rather than emitting `\n`.
 - **Reducers are registered, not hard-coded.** Add new `PAIR_REDUCE` modes in
-  [`registerDefaultReducers`](reducers.go); the dispatcher resolves them by name. Do not extend the
+  [`registerDefaultReducers`](src/reducers.go); the dispatcher resolves them by name. Do not extend the
   `ExecuteCommand` switch per reducer.
 - **Graph keys use reserved control-byte prefixes.** `\x01gn:`, `\x02ge:`, `\x03go:`, `\x04gi:`, and
-  `graph/idx/` ([`graph.go`](graph.go)) share the trie with user data. Never emit user keys under these
+  `graph/idx/` ([`graph.go`](src/graph.go)) share the trie with user data. Never emit user keys under these
   prefixes. `GRAPH_QUERY` MUST anchor its left node by ID to stay index-backed
-  ([`executeGraphQuery*`](graph.go)).
+  ([`executeGraphQuery*`](src/graph.go)).
 - **Prediction tables persist as fixed-byte `CHPREDTB` files**, not JSON. JSON appears only on the
-  CLI/TCP wire ([`prediction_table.go`](prediction_table.go)); legacy `.json` tables are auto-migrated
+  CLI/TCP wire ([`prediction_table.go`](src/prediction_table.go)); legacy `.json` tables are auto-migrated
   on first open.
 
 ---
 
 ## Architecture and data/control flow
+
+All file names below are relative to [`src/`](src/).
 
 ```
                          ┌─────────────── main.go (CLI loop) ───────────────┐
@@ -209,7 +220,7 @@ client ── TCP ──►  server.go (per-conn loop)                          
 - **Process boundary:** one Go process, one TCP listener (`0.0.0.0:4455` default) plus an interactive
   CLI (disabled with `CHEETAH_HEADLESS=1`). Concurrency is per-connection goroutines; databases are
   shared and internally locked.
-- **Storage ownership:** each logical database is a directory under `cheetah_data/`. [`Engine`](engine.go)
+- **Storage ownership:** each logical database is a directory under `cheetah_data/`. [`Engine`](src/engine.go)
   multiplexes them and guarantees clean shutdown flush.
 - **External services:** none required. Optional peer TCP connections exist only when cluster gossip is
   configured (`CHEETAH_NODE_ID` + `CLUSTER_UPDATE`).
@@ -218,15 +229,17 @@ client ── TCP ──►  server.go (per-conn loop)                          
 
 ## Linked source tree and file reference
 
-Every meaningful tracked file has its own subsection. Generated/runtime paths (`cheetah-server`,
+Every meaningful tracked file has its own subsection. The server sources all live in [`src/`](src/);
+[`gold/`](gold/) and [`demo/graph-nell/`](demo/graph-nell/) are separate build targets covered at the
+end. Generated/runtime paths (`cheetah-server`,
 `cheetah_data/…`) are shown in code font without links because they are intentionally untracked.
 
 ### Entry points and orchestration
 
-#### [`main.go`](main.go)
+#### [`src/main.go`](src/main.go)
 
-Boots the process: loads config, starts the [`ResourceMonitor`](resource_monitor.go) and
-[`Engine`](engine.go), launches the TCP server goroutine, installs signal-based graceful shutdown, and
+Boots the process: loads config, starts the [`ResourceMonitor`](src/resource_monitor.go) and
+[`Engine`](src/engine.go), launches the TCP server goroutine, installs signal-based graceful shutdown, and
 runs the CLI (unless `CHEETAH_HEADLESS=1`). Change this file for startup wiring and CLI-level command
 handling.
 
@@ -236,9 +249,9 @@ handling.
     everything else to `currentDB.ExecuteCommand`.
   - `setupGracefulShutdown` — closes the engine + monitor on SIGINT/SIGTERM.
 - **Common mistakes:** A new connection-scoped command must be added to **both** `runCLI` here and
-  `handleConnection` in [`server.go`](server.go); adding it to only one silently diverges CLI and TCP.
+  `handleConnection` in [`server.go`](src/server.go); adding it to only one silently diverges CLI and TCP.
 
-#### [`server.go`](server.go)
+#### [`src/server.go`](src/server.go)
 
 The TCP front-end. Accepts connections, optionally enables OS keep-alives, reads newline-delimited
 commands, and routes them exactly like the CLI (`DATABASE`/`RESET_DB` locally, else `ExecuteCommand`).
@@ -248,9 +261,9 @@ commands, and routes them exactly like the CLI (`DATABASE`/`RESET_DB` locally, e
 - **Common mistakes:** No prompt is written over TCP; responses are single `\n`-terminated lines. Keep
   responses one line — multi-line payloads break line-oriented clients.
 
-#### [`engine.go`](engine.go)
+#### [`src/engine.go`](src/engine.go)
 
-Multi-tenant database registry. Lazily constructs and caches [`Database`](database.go) handles under
+Multi-tenant database registry. Lazily constructs and caches [`Database`](src/database.go) handles under
 `basePath/<name>`, applies per-name overrides, and closes all databases on shutdown.
 
 - **Key symbols:** `Engine`, `GetDatabase` (lazy create + cache), `ResetDatabase` (close + `RemoveAll`
@@ -264,7 +277,7 @@ Multi-tenant database registry. Lazily constructs and caches [`Database`](databa
 - **Common mistakes:** `ResetDatabase` deletes the directory on disk; callers must re-`GetDatabase`
   afterward (the front-ends do). It only resets one named database, never the whole data dir.
 
-#### [`config.go`](config.go)
+#### [`src/config.go`](src/config.go)
 
 Loads settings from `config.ini` (path overridable via `CHEETAH_CONFIG_PATH`), applies environment
 overrides, normalizes/clamps, and parses inline `key=value` database overrides for
@@ -280,7 +293,7 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
 - **Common mistakes:** `normalize` clamps `pair_index_bytes` into `[1,2]` but maps `≤0`→**2** (not the
   `defaultConfig` value of 1). All env keys are enumerated in [Configuration reference](#configuration-reference).
 
-#### [`types.go`](types.go)
+#### [`src/types.go`](src/types.go)
 
 The on-disk format constants and the 5-byte value pointer. This is the wire format — see
 [Critical contracts](#critical-implementation-contracts).
@@ -296,7 +309,7 @@ The on-disk format constants and the 5-byte value pointer. This is the wire form
 
 ### Core storage engine
 
-#### [`database.go`](database.go)
+#### [`src/database.go`](src/database.go)
 
 The heart of the engine (~4,000 lines). Owns the `Database` struct, the **central command router**
 `ExecuteCommand`, the pair-trie insert/lookup/delete/scan/summary machinery, reducer orchestration,
@@ -328,27 +341,27 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
   there deadlocked `PAIR_SUMMARY` forever.
 - **Handler glue:** `handlePredict*`, `handleCluster*`, `handleForkAssign`, `systemStatsResponse`,
   `buildForkTransferPayload`/`applyForkTransferPayload`, `parseFileCheckpointArgs`.
-- **Depends on:** every other core file. **Tests:** [`benchmark_test.go`](benchmark_test.go)
-  (edit/resize, throughput), [`graph_test.go`](graph_test.go) (via graph handlers).
+- **Depends on:** every other core file. **Tests:** [`benchmark_test.go`](src/benchmark_test.go)
+  (edit/resize, throughput), [`graph_test.go`](src/graph_test.go) (via graph handlers).
 - **Common mistakes:** `RECYCLE` and a standalone `CURSOR` command are **absent** from the switch
   despite [`README.md`](README.md) listing them — do not assume a command exists because a doc mentions
   it. Cursor continuation is positional: `PAIR_SCAN <prefix> <limit> <cursor>`.
 
-#### [`commands.go`](commands.go)
+#### [`src/commands.go`](src/commands.go)
 
 The primitive KV + pair-mapping operations invoked by `ExecuteCommand`.
 
 - **Key functions:** `Insert`/`persistPayload` (size-partitioned write + recycle reuse), `Read`, `Edit`
   (relocates on size change), `Delete` (tombstone + recycle + cache invalidate), `PairSet`,
   `PairSetHidden`, `PairGet`, `PairDel`, `PairPurge`/`purgePairEntries` (batched namespace wipe).
-- **Depends on:** [`tables.go`](tables.go), [`helpers.go`](helpers.go), [`cache.go`](cache.go).
+- **Depends on:** [`tables.go`](src/tables.go), [`helpers.go`](src/helpers.go), [`cache.go`](src/cache.go).
 - **Common mistakes:** `Insert` validates that a `INSERT:<n>` declared size matches the payload; the
   size partitions the value table, so a wrong size lands the payload in the wrong file.
 
-#### [`tables.go`](tables.go)
+#### [`src/tables.go`](src/tables.go)
 
 The four on-disk table abstractions. Each maps a logical structure onto files (via
-[`file_manager.go`](file_manager.go) for values/pairs).
+[`file_manager.go`](src/file_manager.go) for values/pairs).
 
 - **Key types:** `MainKeysTable` (per-key metadata, striped locks), `ValuesTable` (fixed-width blobs,
   async write loop), `RecycleTable` (LIFO tombstone stack per value size), `PairTable` (a single trie
@@ -361,15 +374,15 @@ The four on-disk table abstractions. Each maps a logical structure onto files (v
   clearing the old LIST region so unpopulated dense slots read zero), `listSearchLocked` (binary
   search), `PopulatedBranchIndices` (ordered iterator used by every enumeration path),
   `readSpanTolerant`, `branchKeyWidth`, `IsEmpty`, `Snapshot`.
-- **Depends on:** [`file_manager.go`](file_manager.go). **Tests:**
-  [`pair_adaptive_test.go`](pair_adaptive_test.go); also exercised indirectly by
-  [`benchmark_test.go`](benchmark_test.go).
+- **Depends on:** [`file_manager.go`](src/file_manager.go). **Tests:**
+  [`pair_adaptive_test.go`](src/pair_adaptive_test.go); also exercised indirectly by
+  [`benchmark_test.go`](src/benchmark_test.go).
 - **Common mistakes:** `PairTable` handles are reference-counted/idle-closed; call `ReleaseFile` paths
   through the cache rather than closing files directly. In-memory `mode`/`count` survive fd eviction
   (only the `*ManagedFile` is released), so the header is read once at open — never re-read it under
   a read lock. Do not bulk-read a dense span with one `ReadAt` (see the sparse-file contract above).
 
-#### [`helpers.go`](helpers.go)
+#### [`src/helpers.go`](src/helpers.go)
 
 Small value/key utilities used across the engine.
 
@@ -379,7 +392,7 @@ Small value/key utilities used across the engine.
 - **Common mistakes:** `parseValue` is where `x…` hex keys are interpreted; any new command taking a
   binary prefix should reuse it rather than re-implementing hex handling.
 
-#### [`cache.go`](cache.go)
+#### [`src/cache.go`](src/cache.go)
 
 Bounded LRU payload cache keyed by `<value_size, table_id, entry_id>`.
 
@@ -388,7 +401,7 @@ Bounded LRU payload cache keyed by `<value_size, table_id, entry_id>`.
 - **Common mistakes:** entries are copied in and out; do not retain or mutate the returned slice. Size
   budget is entries **and** bytes — both caps apply.
 
-#### [`pair_codec.go`](pair_codec.go)
+#### [`src/pair_codec.go`](src/pair_codec.go)
 
 Translates key bytes into trie branch indices for the configured stride.
 
@@ -397,7 +410,7 @@ Translates key bytes into trie branch indices for the configured stride.
 - **Common mistakes:** the codec encapsulates the `pair_index_bytes` stride; trie code should walk keys
   via `walkKey` instead of hand-rolling byte stepping, or 2-byte databases break.
 
-#### [`pair_format.go`](pair_format.go)
+#### [`src/pair_format.go`](src/pair_format.go)
 
 Pins and persists a database's pair-trie container format in `pairs/format.dat`, and guards against
 opening a legacy (headerless) directory.
@@ -414,7 +427,7 @@ opening a legacy (headerless) directory.
   behavior silently reinterpreted on-disk data). `RESET_DB <name> [pair_bytes=…] [adaptive_pair_index=…]`
   is the way to adopt new settings.
 
-#### [`jump_store.go`](jump_store.go)
+#### [`src/jump_store.go`](src/jump_store.go)
 
 Persists jump nodes (collapsed unique suffixes) in `pair_jumps/jumps.bin` + `index.bin`, with legacy
 `.jump` file back-fill.
@@ -425,7 +438,7 @@ Persists jump nodes (collapsed unique suffixes) in `pair_jumps/jumps.bin` + `ind
 - **Common mistakes:** the single-file store replaced a millions-of-inodes `.jump`-per-file scheme;
   don't reintroduce per-node files.
 
-#### [`file_manager.go`](file_manager.go)
+#### [`src/file_manager.go`](src/file_manager.go)
 
 The managed file layer: sector-cached, flush-queued IO shared by all value/pair tables, with global
 memory-pressure eviction, an fd cap, and a checkpoint controller.
@@ -451,14 +464,14 @@ memory-pressure eviction, an fd cap, and a checkpoint controller.
 - **Common mistakes:** this is the only correct path to the backing files; bypassing it drops dirty
   data and defeats the fd cap that prevents "too many open files".
 
-#### [`fd_limit_unix.go`](fd_limit_unix.go) / [`fd_limit_windows.go`](fd_limit_windows.go)
+#### [`src/fd_limit_unix.go`](src/fd_limit_unix.go) / [`src/fd_limit_windows.go`](src/fd_limit_windows.go)
 
 Build-tagged `fileDescriptorSoftLimit()` used to derive the default open-`PairTable` cap. Unix reads
 `RLIMIT_NOFILE`; Windows returns a safe constant. Edit the pair whose platform you target.
 
 ### Reducers and async jobs
 
-#### [`reducers.go`](reducers.go)
+#### [`src/reducers.go`](src/reducers.go)
 
 The reducer registry and the graph-specific reducers.
 
@@ -466,23 +479,23 @@ The reducer registry and the graph-specific reducers.
   `counts/count/probabilities/probs/backoffs/continuations` to the inline-payload reducer and
   `degree/triangle/pagerank_seed` to graph reducers), `reduceGraphDegree`, `reduceGraphTriangles`,
   `reduceGraphPageRankSeeds`, `decodeGraphAdjacencyEntry`.
-- **Tests:** [`TestGraphReducersDegreeTriangleAndPageRankSeed`](graph_test.go).
+- **Tests:** [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go).
 - **Common mistakes:** register new modes here; the count/prob/continuation reducers are payload
   pass-throughs (they stream the stored bytes) — the *meaning* of those bytes is a client contract.
 
-#### [`reduce_jobs.go`](reduce_jobs.go)
+#### [`src/reduce_jobs.go`](src/reduce_jobs.go)
 
 In-memory job manager backing `PAIR_REDUCE_ASYNC`/`_STATUS`/`_FETCH` (progress %, state, results,
 next cursor). Jobs are process-local and not persisted.
 
-#### [`predict_jobs.go`](predict_jobs.go)
+#### [`src/predict_jobs.go`](src/predict_jobs.go)
 
 In-memory job manager for `PREDICT_INHERIT_ASYNC`/`_STATUS`/`_FETCH` (merged/skipped/failed counters).
 Also process-local.
 
 ### Prediction tables
 
-#### [`prediction_table.go`](prediction_table.go)
+#### [`src/prediction_table.go`](src/prediction_table.go)
 
 The matrix-prediction engine (~1,800 lines): fixed-byte `CHPREDTB` table format, context-matrix
 evaluation/training, and the simulated GPU merge path.
@@ -497,7 +510,7 @@ evaluation/training, and the simulated GPU merge path.
 - **Common mistakes:** on-disk tables are binary; JSON only appears on the wire. Context matrices and
   window specs cross the protocol as base64-encoded JSON.
 
-#### [`prediction_manager.go`](prediction_manager.go)
+#### [`src/prediction_manager.go`](src/prediction_manager.go)
 
 Per-database registry of named prediction tables, sanitizing table names into
 `prediction_<name>.table` paths.
@@ -507,7 +520,7 @@ Per-database registry of named prediction tables, sanitizing table names into
 
 ### Graph store
 
-#### [`graph.go`](graph.go)
+#### [`src/graph.go`](src/graph.go)
 
 Property-graph storage and the `GRAPH_QUERY` engine (~2,800 lines) over four reserved trie namespaces
 plus a property index.
@@ -518,14 +531,14 @@ plus a property index.
   `handleGraphNeighborTypes`, `handleGraphQuery`; query engine `parseGraphQuery`, `graphQueryPlan`,
   `executeGraphQuerySingleHop`, `executeGraphQueryMultiHop` (bounded HOPS + BRANCH_LIMIT + COST_LIMIT),
   and the secondary-index path `graphIndexedEdgeCandidates`/`graphScanIndexedEdgeIDs`.
-- **Tests:** [`graph_test.go`](graph_test.go) — lifecycle, parser rules, batch upsert, multi-hop
+- **Tests:** [`graph_test.go`](src/graph_test.go) — lifecycle, parser rules, batch upsert, multi-hop
   bounds/cost, reverse single hop, property secondary index.
 - **Common mistakes:** the left node of a `MATCH` must be ID-anchored; wildcard-left queries are
   intentionally rejected to keep execution index-backed. Reverse queries keep that anchor on the left
   and flip the arrow (`(id='x')<-[:t]-(*)`), which means **every direction-dependent branch must
   mirror both endpoints** — see [direction mirroring](#pitfall-graph-direction).
 
-#### [`graph_uncertainty.go`](graph_uncertainty.go)
+#### [`src/graph_uncertainty.go`](src/graph_uncertainty.go)
 
 First-class uncertainty and ambiguity on edges: the modality scale (words ↔ numbers) and the
 `GRAPH_AMBIGUITY_*` commands.
@@ -538,8 +551,8 @@ First-class uncertainty and ambiguity on edges: the modality scale (words ↔ nu
   `graphParseAmbiguityOptions`, `graphParseAmbiguityShare`, `graphDistributeAmbiguity` (probability vs
   relative-share reading), `graphRoundConfidence`; handlers `handleGraphAmbiguitySet/Get/Resolve` and
   `graphCollectAmbiguityGroup`.
-- **Depends on:** [`graph.go`](graph.go) (record, upsert, adjacency scan). **Tests:**
-  [`graph_uncertainty_test.go`](graph_uncertainty_test.go).
+- **Depends on:** [`graph.go`](src/graph.go) (record, upsert, adjacency scan). **Tests:**
+  [`graph_uncertainty_test.go`](src/graph_uncertainty_test.go).
 - **Common mistakes:** `GraphEdgeRecord.Confidence` is a `*float64` because `0` means `ruled_out` and
   must stay distinct from "never declared". Inside a group, option shares may exceed 1 (they are
   relative and get normalized); a standalone `confidence=` may not. Groups are anchored to one node's
@@ -547,7 +560,7 @@ First-class uncertainty and ambiguity on edges: the modality scale (words ↔ nu
 
 ### Cluster coordination
 
-#### [`cluster_scheduler.go`](cluster_scheduler.go)
+#### [`src/cluster_scheduler.go`](src/cluster_scheduler.go)
 
 Consistent-hash fork scheduler. Derives a deterministic `fork_id` per prefix, maps forks to nodes over
 a hash ring, and persists topology to `cluster_topology.json`.
@@ -559,7 +572,7 @@ a hash ring, and persists topology to `cluster_topology.json`.
   `samples` maps are **not** persisted, so `CLUSTER_MOVE` reassignments are lost on restart (see
   [Known Gaps](#known-gaps)). Standalone fork tracking is off unless `CHEETAH_TRACK_STANDALONE_FORKS`.
 
-#### [`cluster_gossip.go`](cluster_gossip.go)
+#### [`src/cluster_gossip.go`](src/cluster_gossip.go)
 
 Peer messenger: heartbeats and `fork_move` broadcasts (including the built `forkTransferPayload`) to
 nodes registered via `CLUSTER_UPDATE`.
@@ -571,7 +584,7 @@ nodes registered via `CLUSTER_UPDATE`.
 
 ### Resource monitoring and logging
 
-#### [`resource_monitor.go`](resource_monitor.go)
+#### [`src/resource_monitor.go`](src/resource_monitor.go)
 
 Samples CPU/goroutines/IO/memory and advises worker counts.
 
@@ -579,12 +592,12 @@ Samples CPU/goroutines/IO/memory and advises worker counts.
   `buildWorkerHints`/`computeRecommendedWorkers` (queue-depth → worker-count hints in `SYSTEM_STATS`).
 - **Depends on:** platform samplers below.
 
-#### [`resource_samples_unix.go`](resource_samples_unix.go) / [`resource_samples_windows.go`](resource_samples_windows.go)
+#### [`src/resource_samples_unix.go`](src/resource_samples_unix.go) / [`src/resource_samples_windows.go`](src/resource_samples_windows.go)
 
 Build-tagged samplers for process CPU time, system CPU, `/proc/self/io`, and memory. Unix reads
 `/proc`; Windows returns "unsupported" for the Linux-only stats. Edit per platform.
 
-#### [`logger.go`](logger.go)
+#### [`src/logger.go`](src/logger.go)
 
 Leveled logging with an in-memory ring buffer feeding `LOG_FLUSH`.
 
@@ -592,18 +605,18 @@ Leveled logging with an in-memory ring buffer feeding `LOG_FLUSH`.
   `logErrorf`/`logInfof`/`logVerbosef`, package `logSink`.
 - **Common mistakes:** verbose (level 3) logging summarizes args/responses to avoid dumping payloads;
   keep new log calls at the right level so hot paths stay quiet by default. The `LOG_FLUSH` response
-  itself is formatted in [`database.go`](database.go) (`formatLogFlushResponse`), **not** here, and
+  itself is formatted in [`database.go`](src/database.go) (`formatLogFlushResponse`), **not** here, and
   must stay on one line — entries travel as a base64 JSON array.
 
 ### Tests
 
-#### [`graph_test.go`](graph_test.go)
+#### [`src/graph_test.go`](src/graph_test.go)
 
 Unit tests for the graph subsystem: edge lifecycle + query, parser rules, batch upsert (+
 continue-on-error), multi-hop bound/cost, property secondary index, and the three graph reducers.
 Includes the `assertCommandPrefix` / `decodePairReducePayloads` helpers reused for reducer assertions.
 
-#### [`pair_scan_test.go`](pair_scan_test.go)
+#### [`src/pair_scan_test.go`](src/pair_scan_test.go)
 
 Scan/summary contracts that are independent of the container format:
 `TestPairScanMidChunkPrefix` (prefixes that end inside a branch at stride 2 return the same sets as
@@ -617,20 +630,20 @@ larger than the key set), and `TestPairSetGetDeleteRoundTrip`
 lookup and delete disagree on which branch continues a key). Provides `mustInsertPair`, which writes
 a real payload because `PAIR_SUMMARY` reads value sizes, and `overlappingWords`.
 
-#### [`file_manager_test.go`](file_manager_test.go)
+#### [`src/file_manager_test.go`](src/file_manager_test.go)
 
 `TestManagedFileConcurrentHandleLifecycle` — reads, writes, `Flush`, `ForceCheckpoint(CloseHandles)`
 and `forceCloseHandle` in parallel on one `ManagedFile`, in a cache-disabled (`direct`) and a
 cache-enabled (`cached`) variant. Run it with `-race`: `direct` fails without the `handleMu`
 protection of `ManagedFile.file`, `cached` without the per-`sectorEntry` `dataMu`.
 
-#### [`lifecycle_test.go`](lifecycle_test.go)
+#### [`src/lifecycle_test.go`](src/lifecycle_test.go)
 
 Shutdown lifecycle: `TestDatabaseCloseIsIdempotent` (three consecutive `Close` calls) and
 `TestEngineCloseIsIdempotent` (double `Engine.Close`, then a `GetDatabase` that must reopen and still
 read its data). Both panicked with "close of closed channel" before the stop channels were guarded.
 
-#### [`benchmark_test.go`](benchmark_test.go)
+#### [`src/benchmark_test.go`](src/benchmark_test.go)
 
 `TestEditResizesValues` (correctness of size-changing edits) plus `TestCheetahDBBenchmark`, a
 throughput harness gated by `CHEETAHDB_BENCH=1` and tuned by `CHEETAHDB_BENCH_DURATION/_WORKERS/
@@ -659,7 +672,7 @@ benchmarks `GRAPH_NEIGHBOR_TYPES`, and scores probability/implicit-correlation p
 tests** for the evaluation/loader math (`rocAUC`/`averagePrecision`/`precisionAtK`, `buildModels`,
 `splitEdges`, `loadNELLEdges`, `rerankImplicitTopK`, token helpers) that run in the normal `go test`
 sweep, and (b) `TestGraphNELLEndToEnd` — a **real-execution** test gated behind `CHEETAH_NELL_E2E=1`
-that builds the root `cheetahdb` binary, boots it headless on an ephemeral port with an isolated data
+that builds the server binary (`go build … cheetahdb/src`), boots it headless on an ephemeral port with an isolated data
 dir, drives the full `run()` pipeline over TCP against a small synthetic NELL dataset, and asserts on
 the returned report plus a direct post-run `GRAPH_QUERY`. Perf note learned here: early NELL edges are
 node-diverse, so ingest is new-node/new-file bound (~30–40 edges/s) and only reaches ~600+ edges/s once
@@ -681,17 +694,17 @@ nodes are reused — keep automated runs to a few hundred edges.
 
 - **Behavior:** `INSERT`/`READ`/`EDIT`/`DELETE` over size-partitioned value tables with slot recycling
   and a payload LRU. Keys are numeric main-key offsets.
-- **Flow & owners:** `ExecuteCommand` → [`commands.go`](commands.go) → [`tables.go`](tables.go) →
-  [`file_manager.go`](file_manager.go); cache via [`cache.go`](cache.go).
-- **Tests:** [`TestEditResizesValues`](benchmark_test.go). **Gaps:** none known.
+- **Flow & owners:** `ExecuteCommand` → [`commands.go`](src/commands.go) → [`tables.go`](src/tables.go) →
+  [`file_manager.go`](src/file_manager.go); cache via [`cache.go`](src/cache.go).
+- **Tests:** [`TestEditResizesValues`](src/benchmark_test.go). **Gaps:** none known.
 
 ### Pair-trie namespaces + scan/summary — Shipped
 
 - **Behavior:** `PAIR_SET`/`PAIR_GET`/`PAIR_DEL`/`PAIR_SET_HIDDEN` bind byte prefixes to keys;
   `PAIR_SCAN` streams ordered slices with cursors; `PAIR_SUMMARY` aggregates fan-out/payload stats;
   `PAIR_PURGE` batch-wipes a namespace. Unique suffixes collapse into jump nodes.
-- **Flow & owners:** [`database.go`](database.go) (`insertPairAt`, `PairScanWithOptions`,
-  `PairSummaryWithOptions`) + [`pair_codec.go`](pair_codec.go) + [`jump_store.go`](jump_store.go).
+- **Flow & owners:** [`database.go`](src/database.go) (`insertPairAt`, `PairScanWithOptions`,
+  `PairSummaryWithOptions`) + [`pair_codec.go`](src/pair_codec.go) + [`jump_store.go`](src/jump_store.go).
 - **Constraints:** cursor continuation is positional (`PAIR_SCAN <prefix> <limit> <cursor>`);
   `include_hidden=1` surfaces hidden terminals. **Gaps:** rolling-hash/Top-K digests are roadmap
   ([`NEXT_STEPS.md`](NEXT_STEPS.md)).
@@ -705,9 +718,9 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Prefixes are byte-granular, node chunks are not.** A prefix does not have to land on a node
   boundary: at stride 2 an odd-length prefix ends *inside* a branch, and a jump split can leave a
   1-byte branch mid-key. `resolveScanPrefix`/`resolveSummaryPrefix` therefore return the unconsumed
-  bytes as a **partial**, which [`branchMatchesPartial`](database.go) applies as a filter on the seed
+  bytes as a **partial**, which [`branchMatchesPartial`](src/database.go) applies as a filter on the seed
   node's branches (1-byte branches must equal it, 2-byte branches must start with it), while
-  [`selectPairBranch`](database.go) handles the unaligned-node case for every walk. Any new prefix
+  [`selectPairBranch`](src/database.go) handles the unaligned-node case for every walk. Any new prefix
   walk must reuse those helpers instead of assuming `len(prefix) % stride == 0`.
 
 ### Adaptive pair-node indexing — Shipped
@@ -729,14 +742,14 @@ nodes are reused — keep automated runs to a few hundred edges.
   Narrow nodes are now excluded by the `denseBytes > pair_list_max_bytes` rule, so stride 1 keeps the
   original dense behaviour exactly — re-measured at 156ms vs 149ms, i.e. parity within noise.
   **Consequence:** `adaptive_pair_index` is a no-op for 1-byte databases, which is the
-  [`defaultConfig`](config.go) stride; the savings require `pair_index_bytes = 2`.
-- **Flow & owners:** [`pair_format.go`](pair_format.go) (pin/guard) → [`database.go`](database.go)
-  (`NewDatabase` resolves the format, `getPairTable` passes it) → [`tables.go`](tables.go)
+  [`defaultConfig`](src/config.go) stride; the savings require `pair_index_bytes = 2`.
+- **Flow & owners:** [`pair_format.go`](src/pair_format.go) (pin/guard) → [`database.go`](src/database.go)
+  (`NewDatabase` resolves the format, `getPairTable` passes it) → [`tables.go`](src/tables.go)
   (`PairTable` container + `PopulatedBranchIndices`). Enumeration callers
   (`walkPairTable`, `walkPairSummary`, `collectSingleBranchPath`) iterate populated branches only
   (the scan walk in key order, via `orderedBranches`).
-- **Tests:** [`pair_adaptive_test.go`](pair_adaptive_test.go), benchmark
-  [`pair_adaptive_bench_test.go`](pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`).
+- **Tests:** [`pair_adaptive_test.go`](src/pair_adaptive_test.go), benchmark
+  [`pair_adaptive_bench_test.go`](src/pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`).
 - **Constraints:** existing pre-format databases must be rebuilt (`RESET_DB`); there is no in-place
   migration.
 
@@ -745,16 +758,16 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Behavior:** `PAIR_REDUCE <mode> <prefix>` streams inline base64 payloads; async variants poll.
   Modes: `counts/probabilities/continuations` (payload pass-through) and graph
   `degree/triangle/pagerank_seed`.
-- **Owners:** [`reducers.go`](reducers.go), [`reduce_jobs.go`](reduce_jobs.go),
-  `handlePairReduce`/`reduceWithPayload` in [`database.go`](database.go).
-- **Tests:** [`TestGraphReducersDegreeTriangleAndPageRankSeed`](graph_test.go).
+- **Owners:** [`reducers.go`](src/reducers.go), [`reduce_jobs.go`](src/reduce_jobs.go),
+  `handlePairReduce`/`reduceWithPayload` in [`database.go`](src/database.go).
+- **Tests:** [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go).
 
 ### Graph store + `GRAPH_QUERY` — Shipped
 
 - **Behavior:** typed nodes/edges with adjacency indexes, degree/neighbor-type stats, batch edge
   upsert, and a bounded multi-hop pattern query with `WHERE`/`HOPS`/`BRANCH_LIMIT`/`COST_LIMIT`/
   `RETURN`/`LIMIT`/`CURSOR`, including an `edge.props.*` secondary index.
-- **Owners:** [`graph.go`](graph.go). **Tests:** [`graph_test.go`](graph_test.go).
+- **Owners:** [`graph.go`](src/graph.go). **Tests:** [`graph_test.go`](src/graph_test.go).
 - **Constraints:** left node ID-anchored; reserved `\x01..\x04` + `graph/idx/` prefixes; a reverse
   `<-[:t]-` pattern anchors on the left node and reads the `adj/in` index.
 
@@ -766,8 +779,8 @@ nodes are reused — keep automated runs to a few hundred edges.
   RESOLVE` write, read and collapse a whole alternative set; `WHERE` gained `edge.confidence`
   (number *or* word), `edge.modality` (word for `=`/`!=`, rank for the ordering operators) and
   `edge.ambiguity`.
-- **Owners:** [`graph_uncertainty.go`](graph_uncertainty.go) + the record/upsert/predicate paths in
-  [`graph.go`](graph.go). **Tests:** [`graph_uncertainty_test.go`](graph_uncertainty_test.go).
+- **Owners:** [`graph_uncertainty.go`](src/graph_uncertainty.go) + the record/upsert/predicate paths in
+  [`graph.go`](src/graph.go). **Tests:** [`graph_uncertainty_test.go`](src/graph_uncertainty_test.go).
 - **Constraints:** an edge that declares nothing reads as `certain`; belief fields **persist across a
   partial upsert** (unlike `weight`, which resets to 1.0) and are cleared with `confidence=-`; a group
   is normalized only when written through the `GRAPH_AMBIGUITY_*` commands and is anchored to one
@@ -777,8 +790,8 @@ nodes are reused — keep automated runs to a few hundred edges.
 
 - **Behavior:** `PREDICT_SET/QUERY/TRAIN/CTX/INHERIT(+batch/async)/BACKEND/BENCH` over fixed-byte
   tables with context-matrix weighting and multi-window merges.
-- **Owners:** [`prediction_table.go`](prediction_table.go), [`prediction_manager.go`](prediction_manager.go),
-  [`predict_jobs.go`](predict_jobs.go).
+- **Owners:** [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go),
+  [`predict_jobs.go`](src/predict_jobs.go).
 - **Constraints:** the "GPU" backend is `webgpu-simulated` (CPU fan-out), not a real WebGPU binding.
   **Gaps:** driving `PREDICT_TRAIN` from ingest is a *client-side* TODO, not a server gap.
 
@@ -787,8 +800,8 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Behavior:** `CLUSTER_UPDATE`/`CLUSTER_STATUS`/`FORK_ASSIGN`/`CLUSTER_MOVE`/`CLUSTER_GOSSIP` place
   forks on nodes; `CLUSTER_MOVE` builds a `forkTransferPayload` (trie + prediction entries) and gossips
   it to peers.
-- **Owners:** [`cluster_scheduler.go`](cluster_scheduler.go), [`cluster_gossip.go`](cluster_gossip.go),
-  cluster handlers in [`database.go`](database.go).
+- **Owners:** [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go),
+  cluster handlers in [`database.go`](src/database.go).
 - **Gaps:** forced-assignment **overrides are not persisted** across restarts; only topology survives.
 
 <a id="pitfall-vestigial-references"></a>
@@ -802,13 +815,16 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Safe pattern:** treat all Python/SQLite/`DBSLM_*`/`cheetah-db/`-subpath references as an external
   client. The server here is the whole product; there is no nested `cheetah-db/`, and a
   `cheetah-db/AGENTS.md` path in those notes means *this* file at the repository root.
+- **`src/` is a name collision, not a match.** This repo now keeps its **Go** server under
+  [`src/`](src/); the client project also has a `src/`, holding Python. A `src/train.py`, `src/db_slm/…`
+  or `src/helpers/…` path is always the external client — nothing under `src/` here is Python.
 
 <a id="pitfall-doc-command-drift"></a>
 ### Pitfall: documented commands that don't exist
 
 - **Symptom:** scripting `RECYCLE <value_size>` or a standalone TCP `CURSOR <token>` returns
   `ERROR,unknown_command`.
-- **Cause:** [`README.md`](README.md) lists both, but [`ExecuteCommand`](database.go) implements
+- **Cause:** [`README.md`](README.md) lists both, but [`ExecuteCommand`](src/database.go) implements
   neither. `CURSOR` exists only as a *clause inside* `GRAPH_QUERY`.
 - **Safe pattern:** the authoritative command list is the `ExecuteCommand` switch plus the front-end
   `DATABASE`/`RESET_DB`. Continue a scan with `PAIR_SCAN <prefix> <limit> <cursor>`.
@@ -818,8 +834,8 @@ nodes are reused — keep automated runs to a few hundred edges.
 
 - **Symptom:** a key that shares a prefix with another is stored but unreadable, or a delete takes
   siblings (or a whole subtree) with it. Four such defects existed and are now fixed and pinned by
-  [`TestJumpTerminalOverlaps`](pair_adaptive_test.go) +
-  [`TestPairSetGetDeleteRoundTrip`](pair_scan_test.go): a strict-prefix key being rejected, a
+  [`TestJumpTerminalOverlaps`](src/pair_adaptive_test.go) +
+  [`TestPairSetGetDeleteRoundTrip`](src/pair_scan_test.go): a strict-prefix key being rejected, a
   terminal beside a jump reading back as not-found, delete dropping a sibling, and — at stride 2
   only — `PAIR_GET` missing keys parked behind an unaligned branch.
 - **Causes, all one rule broken:** terminal, child and jump are *independent* flags, and a node's
@@ -830,7 +846,7 @@ nodes are reused — keep automated runs to a few hundred edges.
   - Splitting a jump re-inserts the old tail with `insertSuffixWithContinuation`, which for an
     odd-length tail parks a **1-byte branch with a continuation** — from there down the child node
     starts at an odd offset. Readers must fall back to that short branch when the stride-aligned one
-    is empty; [`selectPairBranch`](database.go) is the single place that decides, and lookup,
+    is empty; [`selectPairBranch`](src/database.go) is the single place that decides, and lookup,
     insert, delete and prefix resolution all go through it.
   - The second return value of `deletePairAt`/`deleteWithinJump` means "**this node** is now empty"
     (`PairTable.IsEmpty`), never "this entry is now empty" — the caller deletes the child table on
@@ -839,7 +855,7 @@ nodes are reused — keep automated runs to a few hundred edges.
     continues: a jump carries exactly one terminal, the one at its end.
 - **Safe pattern:** never infer one flag from another; route every key walk through
   `selectPairBranch`; exercise prefix-sharing insert+get+delete cycles on **both** strides when
-  touching [`database.go`](database.go) trie mutation or [`jump_store.go`](jump_store.go).
+  touching [`database.go`](src/database.go) trie mutation or [`jump_store.go`](src/jump_store.go).
   **Status:** working, with randomized cross-stride coverage; regression risk stays high.
 
 <a id="pitfall-graph-direction"></a>
@@ -856,15 +872,15 @@ nodes are reused — keep automated runs to a few hundred edges.
   predicates are **edge-oriented** (`from.id`/`to.id` are the record's own fields). Any branch that
   reads an endpoint must derive both from `plan.Direction` in one place:
   `leftNodeID, rightNodeID := edge.From, edge.To` then swap when `direction == "in"`. Pinned by
-  [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](graph_test.go), which asserts the reverse
+  [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](src/graph_test.go), which asserts the reverse
   single hop equals the `GRAPH_NEIGHBORS direction=in` result.
 
 <a id="pitfall-cli-tcp-parity"></a>
 ### Pitfall: CLI/TCP command divergence
 
 - **Symptom:** a connection-scoped command works over TCP but not the CLI (or vice-versa).
-- **Cause:** `DATABASE`/`RESET_DB` are duplicated in [`main.go`](main.go) `runCLI` and
-  [`server.go`](server.go) `handleConnection`; everything else routes through `ExecuteCommand`.
+- **Cause:** `DATABASE`/`RESET_DB` are duplicated in [`main.go`](src/main.go) `runCLI` and
+  [`server.go`](src/server.go) `handleConnection`; everything else routes through `ExecuteCommand`.
 - **Safe pattern:** put new logic in `ExecuteCommand` whenever possible; if it must be
   connection-scoped, edit both front-ends together.
 
@@ -872,21 +888,21 @@ nodes are reused — keep automated runs to a few hundred edges.
 
 ## Interface ownership map
 
-The protocol surface is the `ExecuteCommand` switch in [`database.go`](database.go) (authoritative)
+The protocol surface is the `ExecuteCommand` switch in [`database.go`](src/database.go) (authoritative)
 plus the two front-end handlers. There is no generated API manifest.
 
 | Command(s) | Owner |
 | --- | --- |
-| `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](main.go) `runCLI`, [`server.go`](server.go) `handleConnection`, [`engine.go`](engine.go) |
-| `INSERT`, `READ`, `EDIT`, `DELETE` | [`commands.go`](commands.go) |
-| `PAIR_SET(_HIDDEN)`, `PAIR_GET`, `PAIR_DEL`, `PAIR_PURGE` | [`commands.go`](commands.go) |
-| `PAIR_SCAN`, `PAIR_SUMMARY` | [`database.go`](database.go) (`PairScanWithOptions`, `PairSummaryWithOptions`) |
-| `PAIR_REDUCE(_ASYNC/_STATUS/_FETCH)` | [`database.go`](database.go) + [`reducers.go`](reducers.go) + [`reduce_jobs.go`](reduce_jobs.go) |
-| `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](graph.go) |
-| `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](graph_uncertainty.go) |
-| `PREDICT_*` | [`prediction_table.go`](prediction_table.go), [`prediction_manager.go`](prediction_manager.go), [`predict_jobs.go`](predict_jobs.go) |
-| `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](cluster_scheduler.go), [`cluster_gossip.go`](cluster_gossip.go) |
-| `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](database.go), [`resource_monitor.go`](resource_monitor.go), [`logger.go`](logger.go), [`file_manager.go`](file_manager.go) |
+| `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](src/main.go) `runCLI`, [`server.go`](src/server.go) `handleConnection`, [`engine.go`](src/engine.go) |
+| `INSERT`, `READ`, `EDIT`, `DELETE` | [`commands.go`](src/commands.go) |
+| `PAIR_SET(_HIDDEN)`, `PAIR_GET`, `PAIR_DEL`, `PAIR_PURGE` | [`commands.go`](src/commands.go) |
+| `PAIR_SCAN`, `PAIR_SUMMARY` | [`database.go`](src/database.go) (`PairScanWithOptions`, `PairSummaryWithOptions`) |
+| `PAIR_REDUCE(_ASYNC/_STATUS/_FETCH)` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go) + [`reduce_jobs.go`](src/reduce_jobs.go) |
+| `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
+| `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
+| `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`predict_jobs.go`](src/predict_jobs.go) |
+| `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
+| `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](src/database.go), [`resource_monitor.go`](src/resource_monitor.go), [`logger.go`](src/logger.go), [`file_manager.go`](src/file_manager.go) |
 
 Full argument syntax and response grammar live in [`README.md`](README.md#command-reference); verify
 any command against the switch before relying on the README.
@@ -904,7 +920,7 @@ Build the server (produces the untracked `cheetah-server`):
 bash build.sh            # release build (-s -w, -trimpath); --clean/--debug/--verbose available
 ```
 ```bash
-go build -o cheetah-server .    # equivalent plain build
+go build -o cheetah-server ./src    # equivalent plain build
 ```
 
 Build everything including the demo/gold targets:
@@ -925,10 +941,10 @@ CHEETAH_HEADLESS=1 ./cheetah-server   # TCP only, no CLI (use under screen/tmux)
 Test, vet, format:
 
 ```bash
-go test .                        # unit tests (fast; benchmark stays gated off)
+go test ./src                    # unit tests (fast; benchmark stays gated off)
 ```
 ```bash
-go test -race .                  # required for the ManagedFile handle-lifecycle test
+go test -race ./src              # required for the ManagedFile handle-lifecycle test
 ```
 ```bash
 go vet ./... && gofmt -l .       # both silent on a clean tree
@@ -937,20 +953,20 @@ go vet ./... && gofmt -l .       # both silent on a clean tree
 Throughput benchmark (writes a client-rotated log; long-running):
 
 ```bash
-CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v .
+CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v ./src
 ```
 
 Adaptive pair-index comparison (storage + throughput, adaptive vs always-dense, both strides;
 ~4 min at the default 20k keys, tune with `CHEETAHDB_ADAPTIVE_BENCH_KEYS`):
 
 ```bash
-CHEETAHDB_ADAPTIVE_BENCH=1 go test -run TestAdaptivePairIndexBenchmark -count=1 -v -timeout 1800s .
+CHEETAHDB_ADAPTIVE_BENCH=1 go test -run TestAdaptivePairIndexBenchmark -count=1 -v -timeout 1800s ./src
 ```
 
 Cross-compile (Windows builds cleanly):
 
 ```bash
-GOOS=windows go build -o cheetah-server.exe .
+GOOS=windows go build -o cheetah-server.exe ./src
 ```
 
 Run the NELL graph demo against a **running** server:
@@ -986,10 +1002,10 @@ Environment variables read by the server (all verified in-tree):
 - **Adaptive pair index:** `CHEETAH_ADAPTIVE_PAIR_INDEX` (default on; accepts `1/0`, `true/false`,
   `yes/no`, `on/off`), `CHEETAH_PAIR_LIST_MAX_BYTES` (default 4096),
   `CHEETAH_PAIR_LIST_MAX_FILL_PERCENT` (default 0 = off). All only apply when a database is
-  **created** — thereafter `pairs/format.dat` wins ([`pair_format.go`](pair_format.go)).
+  **created** — thereafter `pairs/format.dat` wins ([`pair_format.go`](src/pair_format.go)).
 - **Payload cache:** `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`,
   `CHEETAH_PAYLOAD_CACHE_BYTES` (any `=0` disables caching).
-- **Managed-file cache** ([`file_manager.go`](file_manager.go)): `CHEETAH_FLUSH_WORKERS`,
+- **Managed-file cache** ([`file_manager.go`](src/file_manager.go)): `CHEETAH_FLUSH_WORKERS`,
   `CHEETAH_CACHE_IDLE_SECONDS`, `CHEETAH_CACHE_FORCE_SECONDS`, `CHEETAH_CACHE_SWEEP_SECONDS`,
   `CHEETAH_CACHE_STATS_SECONDS`, `CHEETAH_CACHE_PRESSURE_HIGH`, `CHEETAH_CACHE_PRESSURE_LOW`,
   `CHEETAH_CACHE_WRITE_WEIGHT`, `CHEETAH_CACHE_READ_WEIGHT`.
@@ -1011,38 +1027,38 @@ seen in old docs are **client-side**; the server does not read them.
 
 | Subsystem / contract | Focused test |
 | --- | --- |
-| Size-changing `EDIT` relocates + recycles | [`TestEditResizesValues`](benchmark_test.go) |
-| Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](pair_adaptive_test.go) |
-| LIST→DENSE densify + ordered `PopulatedBranchIndices` over a sparse body | [`TestPairTableListToDense`](pair_adaptive_test.go) |
-| LIST insert/replace/delete ordering + count | [`TestPairTableListDelete`](pair_adaptive_test.go), [`TestAdaptivePairListLifecycle`](pair_adaptive_test.go) |
-| Legacy-directory guard + format marker pinned across reopen | [`TestPairFormatGuardRejectsLegacy`](pair_adaptive_test.go), [`TestPairFormatPinnedAcrossReopen`](pair_adaptive_test.go) |
-| Adaptive vs fixed storage/throughput comparison | [`TestAdaptivePairIndexBenchmark`](pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`) |
-| Prefix overlaps: terminal beside a jump, sibling-safe delete, strict-prefix keys | [`TestJumpTerminalOverlaps`](pair_adaptive_test.go) |
-| Set/get/delete/scan round trip over overlapping keys, both strides | [`TestPairSetGetDeleteRoundTrip`](pair_scan_test.go) |
-| Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](pair_scan_test.go) |
-| `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](pair_scan_test.go) |
-| Cursor pagination returns every key once, any page size | [`TestPairScanCursorPagination`](pair_scan_test.go) |
-| `ManagedFile` handle + sector-cache lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](file_manager_test.go) |
-| Repeated shutdown: `Database.Close` / `Engine.Close` are idempotent | [`TestDatabaseCloseIsIdempotent`](lifecycle_test.go), [`TestEngineCloseIsIdempotent`](lifecycle_test.go) |
-| Throughput / concurrency under load | [`TestCheetahDBBenchmark`](benchmark_test.go) (gated by `CHEETAHDB_BENCH=1`) |
-| Graph edge lifecycle + query | [`TestGraphEdgeLifecycleAndQuery`](graph_test.go) |
-| `GRAPH_QUERY` parser rules | [`TestParseGraphQueryRules`](graph_test.go) |
-| Batch edge upsert (+ continue-on-error) | [`TestGraphEdgeSetBatchAndDegree`](graph_test.go), [`TestGraphEdgeSetBatchContinueOnError`](graph_test.go) |
-| Multi-hop bounds + cost limits | [`TestGraphQueryMultiHopBoundsAndCost`](graph_test.go) |
-| Reverse (`<-[:t]-`) single hop matches `direction=in` adjacency | [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](graph_test.go) |
-| Confidence/modality round trip, default `certain`, persistence across partial upserts | [`TestGraphConfidence*`](graph_uncertainty_test.go) |
-| Modality predicates compare by rank; ambiguity groups set/get/resolve/drop and share distribution | [`TestGraphModalityPredicateOrdering`/`TestGraphAmbiguity*`](graph_uncertainty_test.go) |
-| Batch edge upsert carries confidence (number or word) and group tags | [`TestGraphEdgeBatchCarriesUncertainty`](graph_uncertainty_test.go) |
-| `LOG_FLUSH` answers on one line and leaves the next response aligned | [`TestLogFlush*`](logger_test.go) |
-| Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](graph_test.go) |
-| Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](graph_test.go) |
+| Size-changing `EDIT` relocates + recycles | [`TestEditResizesValues`](src/benchmark_test.go) |
+| Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](src/pair_adaptive_test.go) |
+| LIST→DENSE densify + ordered `PopulatedBranchIndices` over a sparse body | [`TestPairTableListToDense`](src/pair_adaptive_test.go) |
+| LIST insert/replace/delete ordering + count | [`TestPairTableListDelete`](src/pair_adaptive_test.go), [`TestAdaptivePairListLifecycle`](src/pair_adaptive_test.go) |
+| Legacy-directory guard + format marker pinned across reopen | [`TestPairFormatGuardRejectsLegacy`](src/pair_adaptive_test.go), [`TestPairFormatPinnedAcrossReopen`](src/pair_adaptive_test.go) |
+| Adaptive vs fixed storage/throughput comparison | [`TestAdaptivePairIndexBenchmark`](src/pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`) |
+| Prefix overlaps: terminal beside a jump, sibling-safe delete, strict-prefix keys | [`TestJumpTerminalOverlaps`](src/pair_adaptive_test.go) |
+| Set/get/delete/scan round trip over overlapping keys, both strides | [`TestPairSetGetDeleteRoundTrip`](src/pair_scan_test.go) |
+| Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](src/pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](src/pair_scan_test.go) |
+| `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](src/pair_scan_test.go) |
+| Cursor pagination returns every key once, any page size | [`TestPairScanCursorPagination`](src/pair_scan_test.go) |
+| `ManagedFile` handle + sector-cache lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](src/file_manager_test.go) |
+| Repeated shutdown: `Database.Close` / `Engine.Close` are idempotent | [`TestDatabaseCloseIsIdempotent`](src/lifecycle_test.go), [`TestEngineCloseIsIdempotent`](src/lifecycle_test.go) |
+| Throughput / concurrency under load | [`TestCheetahDBBenchmark`](src/benchmark_test.go) (gated by `CHEETAHDB_BENCH=1`) |
+| Graph edge lifecycle + query | [`TestGraphEdgeLifecycleAndQuery`](src/graph_test.go) |
+| `GRAPH_QUERY` parser rules | [`TestParseGraphQueryRules`](src/graph_test.go) |
+| Batch edge upsert (+ continue-on-error) | [`TestGraphEdgeSetBatchAndDegree`](src/graph_test.go), [`TestGraphEdgeSetBatchContinueOnError`](src/graph_test.go) |
+| Multi-hop bounds + cost limits | [`TestGraphQueryMultiHopBoundsAndCost`](src/graph_test.go) |
+| Reverse (`<-[:t]-`) single hop matches `direction=in` adjacency | [`TestGraphQueryReverseSingleHopMatchesInAdjacency`](src/graph_test.go) |
+| Confidence/modality round trip, default `certain`, persistence across partial upserts | [`TestGraphConfidence*`](src/graph_uncertainty_test.go) |
+| Modality predicates compare by rank; ambiguity groups set/get/resolve/drop and share distribution | [`TestGraphModalityPredicateOrdering`/`TestGraphAmbiguity*`](src/graph_uncertainty_test.go) |
+| Batch edge upsert carries confidence (number or word) and group tags | [`TestGraphEdgeBatchCarriesUncertainty`](src/graph_uncertainty_test.go) |
+| `LOG_FLUSH` answers on one line and leaves the next response aligned | [`TestLogFlush*`](src/logger_test.go) |
+| Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](src/graph_test.go) |
+| Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go) |
 | Graph-NELL demo eval/loader math (AUC/AP/P@K, models, split, loader) | [`TestRankingMetrics`/`TestBuildModels`/`TestLoadNELLEdges`/…](demo/graph-nell/main_test.go) |
 | End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
 
 **Known test gaps:** no focused coverage for prediction-table train/inherit, cluster
 scheduling/gossip, the payload cache, or cursor pagination edge cases. Jump split/promote cycles are
 now exercised indirectly by the randomized overlap tests, not by a targeted unit test. Add tests alongside changes in those areas. The graph subsystem now has both in-process unit
-coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over TCP
+coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path over TCP
 ([`demo/graph-nell/main_test.go`](demo/graph-nell/main_test.go)).
 
 ---
@@ -1052,11 +1068,11 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 - **Canonical vs. derived:** everything under `cheetah_data/<db>/` is canonical database state written
   by the engine; the `cheetah-server` binary, benchmark logs, and demo `reports/` are derived. Only
   `cheetah_data/*` and the binary are `.gitignore`d.
-- **On-disk compatibility:** the byte formats in [`types.go`](types.go) and the `CHPREDTB` prediction
+- **On-disk compatibility:** the byte formats in [`types.go`](src/types.go) and the `CHPREDTB` prediction
   format are unversioned wire contracts. The pair-node container **is** versioned (`"CHPT"` header +
   `PairFormatVersion`) and pinned per database by `pairs/format.dat` (`"CHPF"`). Legacy migrations
-  that *do* exist: per-file `.jump` → `pair_jumps/*.bin` ([`jump_store.go`](jump_store.go)), and
-  prediction `.json` → binary ([`prediction_table.go`](prediction_table.go)). The pre-header pair
+  that *do* exist: per-file `.jump` → `pair_jumps/*.bin` ([`jump_store.go`](src/jump_store.go)), and
+  prediction `.json` → binary ([`prediction_table.go`](src/prediction_table.go)). The pre-header pair
   format has **no** migration: such a directory is refused at open and must be rebuilt with
   `RESET_DB`. New format changes need an explicit version byte and a read-old/write-new path.
 - **Trust / validation:** the protocol is unauthenticated plaintext over TCP on `0.0.0.0:4455` by
@@ -1087,17 +1103,17 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 ### Experimental / scaffold
 
 - **`webgpu-simulated` prediction backend** — CPU fan-out standing in for real WebGPU
-  ([`prediction_table.go`](prediction_table.go)).
+  ([`prediction_table.go`](src/prediction_table.go)).
 - **[`gold/basic.go`](gold/basic.go)** — reference prototype with stubbed `Read`/`Edit`; not wired to
   the server.
-- **Async job managers** ([`reduce_jobs.go`](reduce_jobs.go), [`predict_jobs.go`](predict_jobs.go)) are
+- **Async job managers** ([`reduce_jobs.go`](src/reduce_jobs.go), [`predict_jobs.go`](src/predict_jobs.go)) are
   in-memory only; jobs vanish on restart.
 
 <a id="known-gaps"></a>
 ### Known gaps
 
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
-  ([`cluster_scheduler.go`](cluster_scheduler.go) `load`). First open item in
+  ([`cluster_scheduler.go`](src/cluster_scheduler.go) `load`). First open item in
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
 - **Doc/command drift** — [`README.md`](README.md) documents `RECYCLE` and standalone `CURSOR` that the
   server does not implement (see [pitfall](#pitfall-doc-command-drift)).
@@ -1117,16 +1133,16 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 
 1. Read the file's subsection above and the [critical contracts](#critical-implementation-contracts)
    it touches; check `git status` and preserve unrelated changes.
-2. If touching the protocol, read [`ExecuteCommand`](database.go) — it is the command source of truth,
+2. If touching the protocol, read [`ExecuteCommand`](src/database.go) — it is the command source of truth,
    not [`README.md`](README.md).
 3. If touching on-disk formats/`types.go`, plan a format version + migration; do not edit constants in
    place.
-4. For trie/jump changes, walk [`database.go`](database.go) mutation paths and
-   [`jump_store.go`](jump_store.go); for graph changes, read [`graph.go`](graph.go) and its tests.
+4. For trie/jump changes, walk [`database.go`](src/database.go) mutation paths and
+   [`jump_store.go`](src/jump_store.go); for graph changes, read [`graph.go`](src/graph.go) and its tests.
 
 **Before committing:**
 
-1. `go build ./...`, `go vet ./...`, `go test .` pass; run `CHEETAHDB_BENCH=1 go test -run
+1. `go build ./...`, `go vet ./...`, `go test ./src` pass; run `CHEETAHDB_BENCH=1 go test -run
    TestCheetahDBBenchmark` if you touched hot paths.
 2. `gofmt -w` the files you changed.
 3. Update this handbook's affected sections (source tree, interface map, features, status, config) in
@@ -1140,9 +1156,9 @@ coverage ([`graph_test.go`](graph_test.go)) and a gated real-execution path over
 | --- | --- |
 | Add/move/rename/delete a `.go` file | Add/rewrite/remove its subsection in [source tree](#linked-source-tree-and-file-reference); fix the [interface map](#interface-ownership-map). |
 | Add/change a command | Update `ExecuteCommand` note, [interface map](#interface-ownership-map), and (if connection-scoped) both front-ends. |
-| Add/change a reducer | Update [`reducers.go`](reducers.go) subsection + reducer feature entry. |
+| Add/change a reducer | Update [`reducers.go`](src/reducers.go) subsection + reducer feature entry. |
 | Add/change a feature | Update [Features](#features-and-recurring-development-pitfalls) with status/owners/tests/gaps. |
-| Add a config key / env var | Update [`config.go`](config.go) subsection + [Configuration reference](#configuration-reference). |
+| Add a config key / env var | Update [`config.go`](src/config.go) subsection + [Configuration reference](#configuration-reference). |
 | Change an on-disk format | Update [contracts](#critical-implementation-contracts) + [data boundaries](#data-security-privacy-and-compatibility-boundaries) + migration note. |
 | Add/move a test | Update [test ownership map](#test-ownership-map) and known gaps. |
 | Fix/discover a recurring bug | Add or consolidate a pitfall entry; keep active defects under [Known Gaps](#known-gaps). |

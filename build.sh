@@ -5,7 +5,7 @@
 #   bash build.sh --clean      (remove previous binary first)
 # The script keeps everything self-contained inside cheetah-db/.
 
-# Or just execute "go run ."
+# Or just execute "go run ./src"
 
 set -euo pipefail
 
@@ -86,7 +86,7 @@ BUILD_CMD=(env GOOS="$GO_OS" GOARCH="$GO_ARCH" go build)
 if [[ -n "$LD_FLAGS" ]]; then
   BUILD_CMD+=(-ldflags "$LD_FLAGS")
 fi
-BUILD_CMD+=(-trimpath -o "$OUTPUT_NAME" .)
+BUILD_CMD+=(-trimpath -o "$OUTPUT_NAME" ./src)
 
 if [[ $VERBOSE -eq 1 ]]; then
   printf '>> %q ' "${BUILD_CMD[@]}"

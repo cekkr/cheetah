@@ -404,13 +404,14 @@ func TestGraphNELLEndToEnd(t *testing.T) {
 // e2e helpers
 // ---------------------------------------------------------------------------
 
-// startCheetahServer builds the root cheetahdb binary and launches it headless
+// startCheetahServer builds the cheetahdb server binary (package cheetahdb/src)
+// and launches it headless
 // against an isolated data dir + port, registering cleanup that kills the
 // process (and surfaces its log on failure).
 func startCheetahServer(t *testing.T, dataDir string, port int) {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "cheetah-server-e2e")
-	if out, err := exec.Command("go", "build", "-o", bin, "cheetahdb").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-o", bin, "cheetahdb/src").CombinedOutput(); err != nil {
 		t.Fatalf("failed to build cheetah-server: %v\n%s", err, out)
 	}
 

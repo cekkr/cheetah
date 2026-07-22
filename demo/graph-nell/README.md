@@ -80,7 +80,7 @@ go run ./demo/graph-nell --max-rows 50000 --max-ingest-edges 30000 --query-bench
   go test ./demo/graph-nell
   ```
 
-- **End-to-end real-execution test** that builds the root `cheetahdb` server, boots it headless on an
+- **End-to-end real-execution test** that builds the `cheetahdb/src` server binary, boots it headless on an
   ephemeral port with an isolated data dir, drives the full ingest → query → predict pipeline over TCP
   against a small synthetic NELL dataset, and asserts on the returned report plus a post-run
   `GRAPH_QUERY`. It is gated so the default sweep stays fast and needs no running server or real dataset:
