@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	//"sync/atomic"
 )
@@ -151,20 +150,18 @@ func (db *Database) getAvailableLocation(valueSize uint32) (ValueLocationIndex, 
 		}
 	}
 
-	// Nessun indice riciclato, ne creiamo uno nuovo
+	// Nessun indice riciclato: prenotiamo dal contatore in memoria della
+	// tabella. Derivare EntryID da os.Stat qui era scorretto perché WriteAt
+	// accoda il contenuto e ritorna prima che il file cresca; insert ravvicinati
+	// della stessa dimensione finivano quindi tutti sullo stesso slot.
 	tableID := uint32(0)
 	for {
-		vTablePath := filepath.Join(db.path, fmt.Sprintf("values_%d_%d.table", valueSize, tableID))
-		info, err := os.Stat(vTablePath)
-		if os.IsNotExist(err) {
-			return ValueLocationIndex{TableID: tableID, EntryID: 0}, nil
-		}
+		vTable, err := db.getValuesTable(valueSize, tableID)
 		if err != nil {
 			return ValueLocationIndex{}, err
 		}
-		numEntries := info.Size() / int64(valueSize)
-		if numEntries < EntriesPerValueTable {
-			return ValueLocationIndex{TableID: tableID, EntryID: uint16(numEntries)}, nil
+		if entryID, ok := vTable.ReserveEntry(); ok {
+			return ValueLocationIndex{TableID: tableID, EntryID: entryID}, nil
 		}
 		if tableID >= MaxValueTableID {
 			// Oltre questo l'ID non entra nei 3 byte del puntatore e verrebbe

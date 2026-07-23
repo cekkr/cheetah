@@ -141,6 +141,52 @@ func TestValueLocationRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEqualSizeInsertsReserveDistinctValueSlots copre il caso più comune del
+// client DB-SLM: molte serializzazioni fixed-size vengono inserite una dietro
+// l'altra mentre ValuesTable le scrive in background. L'allocatore precedente
+// rileggeva la dimensione del file prima che la coda l'avesse fatta crescere,
+// consegnando EntryID 0 a tutti e lasciando ogni chiave puntata all'ultimo
+// payload.
+func TestEqualSizeInsertsReserveDistinctValueSlots(t *testing.T) {
+	dir := t.TempDir()
+	db := openAdaptiveTestDB(t, dir, 1, true, 4096)
+	payloads := []string{"first!", "second", "third!"}
+	keys := make([]uint64, 0, len(payloads))
+	locations := make(map[ValueLocationIndex]bool, len(payloads))
+
+	for _, payload := range payloads {
+		key := mustInsertPayload(t, db, payload)
+		keys = append(keys, key)
+		entry, err := db.mainKeys.ReadEntry(key)
+		if err != nil {
+			t.Fatalf("read main key %d: %v", key, err)
+		}
+		location := DecodeValueLocationIndex(entry[ValueSizeBytes:])
+		if locations[location] {
+			t.Fatalf("payload %q reused live location %+v", payload, location)
+		}
+		locations[location] = true
+	}
+	for i, key := range keys {
+		response, err := db.Read(key)
+		if err != nil || !strings.HasSuffix(response, "value="+payloads[i]) {
+			t.Fatalf("Read(%d) before reopen = %q, %v; want %q", key, response, err, payloads[i])
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db = openAdaptiveTestDB(t, dir, 1, true, 4096)
+	t.Cleanup(func() { db.Close() })
+	for i, key := range keys {
+		response, err := db.Read(key)
+		if err != nil || !strings.HasSuffix(response, "value="+payloads[i]) {
+			t.Fatalf("Read(%d) after reopen = %q, %v; want %q", key, response, err, payloads[i])
+		}
+	}
+}
+
 // TestDeletedKeysAreReused pretende che una chiave cancellata in mezzo al file
 // torni disponibile. Prima solo la chiave *più alta* veniva recuperata
 // (findNewHighestKey faceva scendere il contatore): ogni DELETE su una chiave

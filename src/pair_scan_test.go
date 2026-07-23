@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -313,6 +314,50 @@ func TestPairScanCursorPagination(t *testing.T) {
 				if fmt.Sprint(got) != fmt.Sprint(expected) {
 					t.Errorf("prefix %q: paginated %d keys, want %d", prefix, len(got), len(expected))
 				}
+			}
+		})
+	}
+}
+
+// TestConcurrentPairSetSharedAncestors pins the multi-connection ingest shape
+// used by DB-SLM: many writers register keys under one namespace at once.
+// insertPairAt mutates shared jump/table ancestors, so acknowledging every
+// write without serializing the whole mutation used to retain only a small
+// fraction of the mappings.
+func TestConcurrentPairSetSharedAncestors(t *testing.T) {
+	const entries = 256
+	for _, stride := range []int{1, 2} {
+		t.Run(fmt.Sprintf("stride%d", stride), func(t *testing.T) {
+			db := newAdaptiveTestDB(t, stride, true, 4096)
+			start := make(chan struct{})
+			errors := make(chan error, entries)
+			var wg sync.WaitGroup
+			for i := 0; i < entries; i++ {
+				i := i
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					value := []byte(fmt.Sprintf("cnt:1:%08x", i))
+					if err := db.setPairValue(value, uint64(i+1), false); err != nil {
+						errors <- fmt.Errorf("set %q: %w", value, err)
+					}
+				}()
+			}
+			close(start)
+			wg.Wait()
+			close(errors)
+			for err := range errors {
+				t.Error(err)
+			}
+			for i := 0; i < entries; i++ {
+				value := fmt.Sprintf("cnt:1:%08x", i)
+				if got := mustGetPair(t, db, value); got != uint64(i+1) {
+					t.Fatalf("get %q = %d, want %d", value, got, i+1)
+				}
+			}
+			if got := len(scanAll(t, db, "cnt:1:")); got != entries {
+				t.Fatalf("scan returned %d entries, want %d", got, entries)
 			}
 		})
 	}

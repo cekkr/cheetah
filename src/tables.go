@@ -88,10 +88,28 @@ type ValuesTable struct {
 	writeWG    sync.WaitGroup
 	pendingMu  sync.RWMutex
 	pending    map[int64][]byte
+	nextEntry  atomic.Uint32
 	once       sync.Once
 }
 
-func NewValuesTable(manager *FileManager, path string) (*ValuesTable, error) {
+func NewValuesTable(manager *FileManager, path string, valueSize uint32) (*ValuesTable, error) {
+	if valueSize == 0 {
+		return nil, fmt.Errorf("invalid value size 0 for %q", path)
+	}
+	var nextEntry uint64
+	info, statErr := os.Stat(path)
+	switch {
+	case statErr == nil:
+		// Round a partial trailing slot up instead of ever allocating over it.
+		// A clean table is always exactly divisible by valueSize; the rounding
+		// merely turns a crash-truncated tail into an intentionally leaked slot.
+		nextEntry = uint64(info.Size()+int64(valueSize)-1) / uint64(valueSize)
+	case !os.IsNotExist(statErr):
+		return nil, statErr
+	}
+	if nextEntry > EntriesPerValueTable {
+		return nil, fmt.Errorf("value table %q has %d entries, maximum is %d", path, nextEntry, EntriesPerValueTable)
+	}
 	opts := ManagedFileOptions{
 		CacheEnabled:     false,
 		SectorSize:       defaultSectorSize,
@@ -106,9 +124,26 @@ func NewValuesTable(manager *FileManager, path string) (*ValuesTable, error) {
 		writeQueue: make(chan writeTask, 1024),
 		pending:    make(map[int64][]byte),
 	}
+	table.nextEntry.Store(uint32(nextEntry))
 	table.writeWG.Add(1)
 	go table.writeLoop()
 	return table, nil
+}
+
+// ReserveEntry hands out one never-before-used slot from this value table.
+// The high-water mark is seeded from disk once when the table opens and then
+// advances in memory, so asynchronous writes cannot make two inserts observe
+// the same stale file size.
+func (t *ValuesTable) ReserveEntry() (uint16, bool) {
+	for {
+		next := t.nextEntry.Load()
+		if next >= EntriesPerValueTable {
+			return 0, false
+		}
+		if t.nextEntry.CompareAndSwap(next, next+1) {
+			return uint16(next), true
+		}
+	}
 }
 
 func (t *ValuesTable) writeLoop() {

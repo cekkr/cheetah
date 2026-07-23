@@ -174,6 +174,14 @@ because they mutate per-connection "current database" state.
 - **`EDIT` that changes payload length must relocate the value** to the correctly sized value table and
   recycle the old slot ([`Database.Edit`](src/commands.go)). Regression covered by
   [`TestEditResizesValues`](src/benchmark_test.go).
+- **Fresh value slots come from `ValuesTable.ReserveEntry`, never a live `os.Stat`.** Value writes are
+  queued asynchronously, so the file size can lag acknowledged inserts. Each table seeds one atomic
+  high-water mark from disk when opened and reserves from it before queuing bytes; deriving
+  `EntryID` from the file on every insert makes equal-size payloads overwrite one another.
+- **Pair-trie mutations are serialized end to end.** `setPairValue` and `deletePairValue` share
+  `pairMutationMu` because jump splitting, promotion, child creation and deletion all rewrite common
+  ancestors. Point reads/scans remain concurrent; do not move the lock down into only one mutation
+  branch or acknowledged multi-connection `PAIR_SET`s can disappear.
 - **All pair/value table IO goes through the managed file layer.** [`ManagedFile`](src/file_manager.go)
   owns sector caching, the shared flush queue, fd-limit eviction, and checkpoints. Do not open those
   `.table` files with raw `os` calls; you would bypass dirty-sector flushing and the fd cap. Shutdown
@@ -400,6 +408,9 @@ The four on-disk table abstractions. Each maps a logical structure onto files (v
   async write loop), `RecycleTable` (LIFO tombstone stack per value size), `PairTable` (a single trie
   node in the adaptive LIST/DENSE container), plus the `pairTableTracker` interface the fd-cache
   implements.
+- **`ValuesTable` allocation:** `NewValuesTable` seeds `nextEntry` from the existing file (rounding a
+  crash-truncated tail up so it is never overwritten); `ReserveEntry` advances that high-water mark
+  atomically before `WriteAt` queues the payload.
 - **`PairTable` key symbols:** `NewPairTable` (takes `adaptive`/`listMaxBytes`/`listMaxFillPercent`,
   derives `listEligible`, and preallocates the array for every node that starts dense), `loadHeader`/`writeHeaderLocked`, `ReadEntry`/`WriteEntry`
   (mode-dispatched; a missing branch reads back as a zero entry, never `io.EOF`),
@@ -420,8 +431,8 @@ The four on-disk table abstractions. Each maps a logical structure onto files (v
 Small value/key utilities used across the engine.
 
 - **Key functions:** `parseValue` (plaintext or `x<hex>` prefix decoding — the shared input decoder for
-  pair keys), `readValueSize`/`writeValueSize`, `loadHighestKey`/`findNewHighestKey` (main-keys
-  bookkeeping), `getAvailableLocation` (recycle-first slot allocation).
+  pair keys), `readValueSize`/`writeValueSize`, `loadHighestKey`/`nextKey`/`releaseKey` (main-keys
+  bookkeeping), `getAvailableLocation` (recycle first, then `ValuesTable.ReserveEntry`).
 - **Common mistakes:** `parseValue` is where `x…` hex keys are interpreted; any new command taking a
   binary prefix should reuse it rather than re-implementing hex handling.
 
@@ -864,6 +875,8 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Constraints:** cursor continuation is positional (`PAIR_SCAN <prefix> <limit> <cursor>`);
   `include_hidden=1` surfaces hidden terminals. **Gaps:** rolling-hash/Top-K digests are roadmap
   ([`NEXT_STEPS.md`](NEXT_STEPS.md)).
+- **Mutations share one lock.** `PAIR_SET`/`PAIR_SET_HIDDEN` and delete/purge paths take
+  `pairMutationMu` around the complete trie mutation. Reads and scans do not take it.
 - **A page is a page: complete, ordered, and resumable.** `PAIR_SCAN` keeps the smallest `limit+1`
   keys above the cursor in a bounded heap and prunes any branch whose path already exceeds the
   largest kept — a subtree can only contain keys ≥ its path, so the cut is sound whatever the visit
@@ -1218,6 +1231,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Subsystem / contract | Focused test |
 | --- | --- |
 | Size-changing `EDIT` relocates + recycles | [`TestEditResizesValues`](src/benchmark_test.go) |
+| Equal-size payload inserts reserve distinct slots across reopen | [`TestEqualSizeInsertsReserveDistinctValueSlots`](src/key_recycle_test.go) |
 | Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](src/pair_adaptive_test.go) |
 | LIST→DENSE densify + ordered `PopulatedBranchIndices` over a sparse body | [`TestPairTableListToDense`](src/pair_adaptive_test.go) |
 | LIST insert/replace/delete ordering + count | [`TestPairTableListDelete`](src/pair_adaptive_test.go), [`TestAdaptivePairListLifecycle`](src/pair_adaptive_test.go) |
@@ -1225,6 +1239,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Adaptive vs fixed storage/throughput comparison | [`TestAdaptivePairIndexBenchmark`](src/pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`) |
 | Prefix overlaps: terminal beside a jump, sibling-safe delete, strict-prefix keys | [`TestJumpTerminalOverlaps`](src/pair_adaptive_test.go) |
 | Set/get/delete/scan round trip over overlapping keys, both strides | [`TestPairSetGetDeleteRoundTrip`](src/pair_scan_test.go) |
+| Concurrent shared-prefix `PAIR_SET` retains every acknowledged mapping | [`TestConcurrentPairSetSharedAncestors`](src/pair_scan_test.go) |
 | Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](src/pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](src/pair_scan_test.go) |
 | `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](src/pair_scan_test.go) |
 | Cursor pagination returns every key once, any page size | [`TestPairScanCursorPagination`](src/pair_scan_test.go) |
@@ -1289,6 +1304,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 
 - KV store, pair-trie namespaces with jump-node compression, cursored `PAIR_SCAN`/`PAIR_SUMMARY`/
   `PAIR_PURGE`.
+- Atomic per-value-table slot reservation and serialized pair-trie mutations for concurrent ingest.
 - Reducers: `counts`/`probabilities`/`continuations` + graph `degree`/`triangle`/`pagerank_seed`,
   sync and async.
 - Graph store with batch upsert and bounded multi-hop `GRAPH_QUERY` incl. edge-property secondary
@@ -1310,23 +1326,9 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 <a id="known-gaps"></a>
 ### Known gaps
 
-- **`INSERT` overwrites payloads of the same size** — `getAvailableLocation`
-  ([`helpers.go`](src/helpers.go)) derives the next `EntryID` from the values file's size on disk,
-  but `ValuesTable.WriteAt` ([`tables.go`](src/tables.go)) queues the write and returns, so
-  consecutive inserts of one payload size all land on `EntryID 0`. Three 6-byte inserts leave a
-  6-byte file; a restart then reads the last payload back for every one of those keys. **The most
-  severe open defect** — full repro in [`NEXT_STEPS.md`](NEXT_STEPS.md). Note this is slot
-  allocation, not key allocation: `main_keys` rows are handed out correctly.
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](src/cluster_scheduler.go) `load`). First open item in
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
-- **Concurrent `PAIR_SET` on a shared ancestor is unguarded** — `insertPairAt`
-  ([`database.go`](src/database.go)) splits nodes, creates tables and promotes jumps with no lock, so
-  two connections inserting keys under the same prefix mutate the same nodes. This is the insert-side
-  twin of the `PAIR_PURGE` race fixed by `pairDeleteMu` (see [`NEXT_STEPS.md`](NEXT_STEPS.md) *Done*);
-  unlike that one it has not been observed in the wild, because nothing in the server fans a single
-  command out into parallel inserts. The fix is symmetric — serialize the trie mutation — but it
-  serializes every writer, so measure `pair_adaptive_bench_test.go` before taking it.
 - **Command-surface redundancy, partly factored out.** `JOB` now backs both async trios and `DEL`
   backs the five erasures, each historical name kept as an alias
   ([`command_alias.go`](src/command_alias.go)). Still redundant: the `_BATCH` forms, the four

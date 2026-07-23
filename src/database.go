@@ -36,7 +36,7 @@ type Database struct {
 	pairTableCache     *pairTableCache
 	payloadCache       *payloadCache
 	mu                 sync.Mutex
-	pairDeleteMu       sync.Mutex // Serializza le cancellazioni sul trie dei pair, vedi deletePairValue
+	pairMutationMu     sync.Mutex // Serializza insert/delete sul trie dei pair, vedi setPairValue/deletePairValue
 	pairDir            string     // Path alla cartella /pairs
 	nextPairIDPath     string     // Path al file che memorizza il contatore
 	jumpDataPath       string
@@ -510,7 +510,7 @@ func (db *Database) getValuesTable(size uint32, tableID uint32) (*ValuesTable, e
 		return table.(*ValuesTable), nil
 	}
 	path := filepath.Join(db.path, fmt.Sprintf("values_%s.table", key))
-	newTable, err := NewValuesTable(db.fileManager, path)
+	newTable, err := NewValuesTable(db.fileManager, path, size)
 	if err != nil {
 		return nil, err
 	}
@@ -621,6 +621,8 @@ func (db *Database) setPairValue(value []byte, absKey uint64, hidden bool) error
 	if len(value) == 0 {
 		return fmt.Errorf("pair value cannot be empty")
 	}
+	db.pairMutationMu.Lock()
+	defer db.pairMutationMu.Unlock()
 	return db.insertPairAt(0, value, 0, absKey, hidden)
 }
 
@@ -1124,20 +1126,18 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 	return tableID, path, nil, nil
 }
 
-// deletePairValue è l'unico ingresso alla cancellazione sul trie, e prende
-// pairDeleteMu perché deletePairAt non è rientrante fra goroutine: collassa i
-// nodi svuotati, promuove i rami singoli a jump e rimuove i file tabella, tutte
-// mutazioni che due cancellazioni di chiavi con antenati in comune eseguono
-// sugli stessi nodi. PAIR_PURGE parallelizza le cancellazioni proprio così, e
-// senza questo lock perdeva chiavi o falliva rimuovendo due volte lo stesso
-// file. Il costo è nullo: nella purge il lavoro caro è la Delete del payload,
-// che resta fuori dal lock.
+// deletePairValue condivide pairMutationMu con setPairValue perché insert e
+// delete non sono rientranti fra goroutine: entrambi dividono jump, riscrivono
+// nodi e creano/rimuovono file tabella lungo gli stessi antenati. PAIR_PURGE e
+// i client multi-connessione possono altrimenti perdere chiavi pur restituendo
+// SUCCESS. Nella purge il lavoro caro è la Delete del payload, che resta fuori
+// dal lock.
 func (db *Database) deletePairValue(value []byte) (bool, error) {
 	if len(value) == 0 {
 		return false, fmt.Errorf("pair value cannot be empty")
 	}
-	db.pairDeleteMu.Lock()
-	defer db.pairDeleteMu.Unlock()
+	db.pairMutationMu.Lock()
+	defer db.pairMutationMu.Unlock()
 	deleted, _, err := db.deletePairAt(0, value, 0)
 	return deleted, err
 }

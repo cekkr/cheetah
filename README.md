@@ -52,7 +52,9 @@ holds documentation, `config.example.ini`, `build.sh`, and the two standalone bu
 - `src/database.go` orchestrates CRUD operations:
   - `MainKeysTable` stores compact metadata describing payload size + pointer offsets.
   - `ValuesTable` files hold fixed-width blobs grouped by byte length and table ID so offsets remain
-    arithmetic instead of scan-based.
+    arithmetic instead of scan-based. Each table reserves new slots from an atomic in-memory
+    high-water mark seeded at open, so queued asynchronous writes never hand two inserts the same
+    offset.
   - `RecycleTable` files keep tombstoned slots per value size so inserts can reuse space without
     compaction pauses.
   - `PairTable` nodes store child pointers and terminal flags independently, unlocking
@@ -82,6 +84,9 @@ continuation metadata, and concept caches:
 - Inserts seed the cache and deletes invalidate their slots, so chaining ingest → reduction → decoder
   stages benefits from a single long-lived process. Avoid restarting the server between stages unless
   you want to profile cold starts.
+- Pair-trie writers are serialized for the duration of one mutation. Multiple TCP connections can
+  issue `PAIR_SET` concurrently without losing acknowledged shared-prefix mappings; reads and scans
+  remain concurrent.
 - To prime the cache after restarts, issue low-limit `PAIR_SCAN ctx:` passes (following cursors) or
   scripted `READ` loops over the namespaces you are about to benchmark. This shifts the I/O churn
   into RAM, keeping SSD wear predictable.
@@ -350,7 +355,7 @@ SUCCESS,database_changed_to_notes
 
 | Command | What it means |
 | --- | --- |
-| `INSERT:<size> <payload>` | Store `<payload>` in the value table for that byte length and return its **absolute key** (a `main_keys` offset). The declared `<size>` is validated against the payload — it decides which file the bytes land in, so a wrong number is an error, not a hint. |
+| `INSERT:<size> <payload>` | Store `<payload>` in the value table for that byte length and return its **absolute key** (a `main_keys` offset). The declared `<size>` is validated against the payload — it decides which file the bytes land in, so a wrong number is an error, not a hint. Back-to-back equal-size inserts reserve distinct slots before their asynchronous writes are queued. |
 | `INSERT <payload>` | The same write with the size inferred from the payload. |
 | `READ <abs_key>` | Hydrate the bytes behind a key: one arithmetic `ReadAt` (or a payload-cache hit). Answers `SUCCESS,size=<n>,value=<bytes>`. |
 | `EDIT <abs_key> <payload>` | Overwrite the value under an existing key. A length change **relocates** it into the correctly sized value table and recycles the old slot, so the key stays valid. There is no `EDIT:<size>` form — the size always comes from the payload. |
@@ -381,7 +386,7 @@ ERROR,key_not_found (deleted)
 
 | Command | What it means |
 | --- | --- |
-| `PAIR_SET <prefix> <abs_key>` | Bind a byte prefix to a value key. Upserts; the prefix may be any byte string (`x<HEX>` for binary), and a prefix of another prefix is legal — a trie node is terminal and a parent at the same time. |
+| `PAIR_SET <prefix> <abs_key>` | Bind a byte prefix to a value key. Upserts; the prefix may be any byte string (`x<HEX>` for binary), and a prefix of another prefix is legal — a trie node is terminal and a parent at the same time. Complete mutations are serialized, so concurrent writers sharing ancestors retain every acknowledged binding. |
 | `PAIR_SET_HIDDEN <prefix> <abs_key>` | The same binding with the hidden flag set: `PAIR_SCAN`/`PAIR_SUMMARY`/`PAIR_REDUCE` skip it unless they pass `include_hidden=1`. A **visibility bit on one entry**, not a separate namespace. |
 | `PAIR_GET <prefix>` | Resolve exactly one name to its key. A point lookup, never a scan — a prefix with no terminal of its own answers `ERROR`, even when keys exist beneath it. |
 | `PAIR_DEL <prefix>` | Unbind one name. The value it pointed at survives; pair `DELETE` with it to reclaim the bytes. |
