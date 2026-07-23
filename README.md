@@ -6,6 +6,8 @@ keeps them partitioned by value size, and exposes TCP + CLI commands that stream
 bounded memory use. The engine targets workloads where millions of probabilities, counters, or
 other dense analytical slices must be served with predictable latency.
 
+<img src="https://github.com/cekkr/cheetah/blob/main/assets/cheetah-logo.png?raw=true" width="480"/>
+
 ## Highlights
 
 - **Byte-faithful layout.** Every entry is cataloged by byte length, table ID, and entry index, so
