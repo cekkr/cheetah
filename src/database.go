@@ -54,8 +54,7 @@ type Database struct {
 	forkScheduler      *ForkScheduler
 	predictStore       *PredictionManager
 	clusterMessenger   *ClusterMessenger
-	reduceJobs         *reduceJobManager
-	predictJobs        *predictInheritJobManager
+	jobs               *microJobManager
 	reducers           *ReducerRegistry
 	// closeOnce rende Close idempotente: spegnimento per segnale, EXIT dalla
 	// CLI e Engine.Close possono arrivare tutti sullo stesso database.
@@ -405,8 +404,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		jumpIndexPath:      filepath.Join(jumpDir, "index.bin"),
 		nextJumpIDPath:     filepath.Join(jumpDir, "next_id.dat"),
 		forkScheduler:      newForkScheduler(path),
-		reduceJobs:         newReduceJobManager(),
-		predictJobs:        newPredictInheritJobManager(),
+		jobs:               newMicroJobManager(),
 		reducers:           newReducerRegistry(),
 	}
 	db.predictStore = newPredictionManager(path)
@@ -1422,6 +1420,13 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 	var err error
 
 	switch {
+	// I micro comandi e gli alias vengono prima dello switch storico: un nome
+	// che sta nelle due tabelle non deve avere anche un ramo qui, o le due
+	// implementazioni divergono in silenzio (micro_command.go, command_alias.go).
+	case resolveMicroCommand(command) != nil:
+		response, err = db.executeMicroCommand(command, args)
+	case resolveCommandAlias(command) != nil:
+		response, err = db.executeCommandAlias(resolveCommandAlias(command), args)
 	case strings.HasPrefix(command, "INSERT"):
 		if args == "" {
 			response = "ERROR,missing_value"
@@ -1470,19 +1475,6 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response, err = db.Edit(key, []byte(editArgs[1]))
-	case command == "DELETE":
-		if args == "" {
-			response = "ERROR,missing_key"
-			break
-		}
-		var key uint64
-		key, err = strconv.ParseUint(args, 10, 64)
-		if err != nil {
-			response = "ERROR,invalid_key_format"
-			err = nil
-			break
-		}
-		response, err = db.Delete(key)
 	case command == "PAIR_SET":
 		setArgs := strings.SplitN(args, " ", 2)
 		if len(setArgs) < 2 {
@@ -1534,15 +1526,6 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response, err = db.PairGet(value)
-	case command == "PAIR_DEL":
-		var value []byte
-		value, err = parseValue(args)
-		if err != nil {
-			response = err.Error()
-			err = nil
-			break
-		}
-		response, err = db.PairDel(value)
 	case command == "PAIR_SCAN":
 		if args == "" {
 			response = "ERROR,pair_scan_requires_prefix"
@@ -1576,41 +1559,6 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response = formatPairScanResponse(results, nextCursor)
-	case command == "PAIR_PURGE":
-		if args == "" {
-			response = "ERROR,pair_purge_requires_prefix"
-			break
-		}
-		fields := strings.Fields(args)
-		if len(fields) == 0 {
-			response = "ERROR,pair_purge_requires_prefix"
-			break
-		}
-		var prefix []byte
-		if fields[0] != "*" {
-			prefix, err = parseValue(fields[0])
-			if err != nil {
-				response = err.Error()
-				err = nil
-				break
-			}
-		}
-		limit := 0
-		if len(fields) > 1 {
-			limit, err = strconv.Atoi(fields[1])
-			if err != nil {
-				response = "ERROR,invalid_limit"
-				err = nil
-				break
-			}
-		}
-		var removed int
-		removed, err = db.PairPurge(prefix, limit)
-		if err != nil {
-			response = ""
-			break
-		}
-		response = fmt.Sprintf("SUCCESS,purged=%d", removed)
 	case command == "PAIR_REDUCE":
 		if args == "" {
 			response = "ERROR,pair_reduce_requires_args"
@@ -1627,36 +1575,6 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response, err = db.handlePairReduce(mode, prefix, limit, cursor, includeHidden)
-	case command == "PAIR_REDUCE_ASYNC":
-		if args == "" {
-			response = "ERROR,pair_reduce_requires_args"
-			break
-		}
-		fields := strings.Fields(args)
-		mode, prefix, limit, cursor, includeHidden, errResp, parseErr := parsePairReduceArgs(fields)
-		if errResp != "" {
-			response = errResp
-			break
-		}
-		if parseErr != nil {
-			err = parseErr
-			break
-		}
-		response, err = db.handleAsyncReduce(mode, prefix, limit, cursor, includeHidden)
-	case command == "PAIR_REDUCE_FETCH":
-		jobID := strings.TrimSpace(args)
-		if jobID == "" {
-			response = "ERROR,missing_job_id"
-			break
-		}
-		response = db.handleReduceJobFetch(jobID)
-	case command == "PAIR_REDUCE_STATUS":
-		jobID := strings.TrimSpace(args)
-		if jobID == "" {
-			response = "ERROR,missing_job_id"
-			break
-		}
-		response = db.handleReduceJobStatus(jobID)
 	case command == "PAIR_SUMMARY":
 		if args == "" {
 			response = "ERROR,pair_summary_requires_prefix"
@@ -1693,16 +1611,12 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response, err = db.handleGraphNodeSet(args)
 	case command == "GRAPH_NODE_GET":
 		response, err = db.handleGraphNodeGet(args)
-	case command == "GRAPH_NODE_DEL":
-		response, err = db.handleGraphNodeDel(args)
 	case command == "GRAPH_EDGE_SET":
 		response, err = db.handleGraphEdgeSet(args)
 	case command == "GRAPH_EDGE_SET_BATCH":
 		response, err = db.handleGraphEdgeSetBatch(args)
 	case command == "GRAPH_EDGE_GET":
 		response, err = db.handleGraphEdgeGet(args)
-	case command == "GRAPH_EDGE_DEL":
-		response, err = db.handleGraphEdgeDel(args)
 	case command == "GRAPH_NEIGHBORS":
 		response, err = db.handleGraphNeighbors(args)
 	case command == "GRAPH_DEGREE":
@@ -1739,12 +1653,6 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response, err = db.handlePredictInherit(args)
 	case command == "PREDICT_INHERIT_BATCH":
 		response, err = db.handlePredictInheritBatch(args)
-	case command == "PREDICT_INHERIT_ASYNC":
-		response, err = db.handlePredictInheritAsync(args)
-	case command == "PREDICT_INHERIT_FETCH":
-		response = db.handlePredictInheritFetch(args)
-	case command == "PREDICT_INHERIT_STATUS":
-		response = db.handlePredictInheritStatus(args)
 	case command == "PREDICT_BACKEND":
 		response = db.handlePredictBackend(args)
 	case command == "PREDICT_BENCH":
@@ -1789,12 +1697,32 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response = "ERROR,unknown_command"
 	}
 
+	response = normalizeCommandResponse(response)
 	if err != nil {
 		logErrorf("Command %s failed: %v", command, err)
 	} else {
 		logVerbosef("Command %s completed -> %s", command, summarizeResponse(response))
 	}
 	return response, err
+}
+
+// normalizeCommandResponse garantisce il prefisso di classificazione. I client
+// distinguono esito e fallimento leggendo la prima parola, e i gestori
+// handlePredict* restituivano err.Error() nudo: un inherit fallito rispondeva
+// "inherit_sources_missing" invece di "ERROR,inherit_sources_missing", cioè né
+// successo né errore per chi classifica sul prefisso. Il rattoppo sta al bordo
+// del dispatcher perché vale per ogni gestore, presente e futuro.
+func normalizeCommandResponse(response string) string {
+	if response == "" {
+		return response
+	}
+	switch {
+	case strings.HasPrefix(response, "SUCCESS"),
+		strings.HasPrefix(response, "ERROR"),
+		strings.HasPrefix(response, "PENDING"):
+		return response
+	}
+	return "ERROR," + response
 }
 
 func (db *Database) deletePairTable(tableID uint32) error {
@@ -2811,97 +2739,6 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, i
 	return reduced, nextCursor, nil
 }
 
-func (db *Database) submitAsyncReduceJob(
-	mode string,
-	prefix []byte,
-	limit int,
-	cursor []byte,
-	includeHidden bool,
-	reducer PairReducerFunc,
-) (*reduceJob, error) {
-	if db.reduceJobs == nil {
-		return nil, fmt.Errorf("async reducer unavailable")
-	}
-	if reducer == nil {
-		return nil, fmt.Errorf("unknown reducer")
-	}
-	job := db.reduceJobs.newJob(mode)
-	go func(j *reduceJob) {
-		j.markRunning()
-		results, nextCursor, err := reducer(db, prefix, limit, cursor, includeHidden, func(done int, total int) {
-			j.updateProgress(done, total)
-		})
-		if err != nil {
-			j.markFailed(err)
-			return
-		}
-		j.markCompleted(results, nextCursor)
-	}(job)
-	return job, nil
-}
-
-func (db *Database) handleAsyncReduce(mode string, prefix []byte, limit int, cursor []byte, includeHidden bool) (string, error) {
-	if db.reducers == nil {
-		db.registerDefaultReducers()
-	}
-	reducer := db.reducers.Resolve(mode)
-	if reducer == nil {
-		return "ERROR,unknown_reducer_mode", nil
-	}
-	job, err := db.submitAsyncReduceJob(mode, prefix, limit, cursor, includeHidden, reducer)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("SUCCESS,reducer=%s,job=%s,state=queued", mode, job.id), nil
-}
-
-func (db *Database) handleReduceJobStatus(jobID string) string {
-	if db.reduceJobs == nil {
-		return "ERROR,async_reducer_unavailable"
-	}
-	job := db.reduceJobs.getJob(jobID)
-	if job == nil {
-		return "ERROR,reduce_job_not_found"
-	}
-	progress := job.progressPercent()
-	return fmt.Sprintf("SUCCESS,job=%s,state=%s,progress=%.2f", jobID, job.stateString(), progress)
-}
-
-func (db *Database) handleReduceJobFetch(jobID string) string {
-	if db.reduceJobs == nil {
-		return "ERROR,async_reducer_unavailable"
-	}
-	job := db.reduceJobs.getJob(jobID)
-	if job == nil {
-		return "ERROR,reduce_job_not_found"
-	}
-	state, results, nextCursor, err := job.resultSnapshot()
-	switch state {
-	case reduceJobCompleted:
-		response := formatPairReduceResponse(results, job.mode, nextCursor)
-		db.reduceJobs.deleteJob(jobID)
-		return response
-	case reduceJobFailed:
-		db.reduceJobs.deleteJob(jobID)
-		if err != nil {
-			return fmt.Sprintf("ERROR,job_failed:%v", err)
-		}
-		return "ERROR,job_failed"
-	default:
-		_, completed, total, _ := job.progressSnapshot()
-		progress := job.progressPercent()
-		return fmt.Sprintf(
-			"PENDING,job=%s,reducer=%s,state=%s,progress=%.2f,completed=%d,total=%d",
-			jobID,
-			job.mode,
-			job.stateString(),
-			progress,
-			completed,
-			total,
-		)
-	}
-}
-
 func (db *Database) readValuePayload(key uint64) ([]byte, error) {
 	entry, err := db.mainKeys.ReadEntry(key)
 	if err != nil {
@@ -3025,24 +2862,41 @@ func formatPairScanResponse(results []PairScanResult, nextCursor []byte) string 
 	return b.String()
 }
 
-func formatPairReduceResponse(results []PairReduceResult, mode string, nextCursor []byte) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("SUCCESS,reducer=%s,count=%d", mode, len(results)))
+// pairReduceResponseFields è la forma strutturata della risposta di PAIR_REDUCE.
+// Passa di qui sia la via sincrona sia il risultato del job asincrono, così le
+// due non possono divergere di un campo.
+func pairReduceResponseFields(results []PairReduceResult, mode string, nextCursor []byte) []microField {
+	fields := []microField{mf("reducer", mode), mfi("count", len(results))}
 	if len(nextCursor) > 0 {
-		b.WriteString(fmt.Sprintf(",next_cursor=x%x", nextCursor))
+		fields = append(fields, mf("next_cursor", fmt.Sprintf("x%x", nextCursor)))
 	}
 	if len(results) == 0 {
-		return b.String()
+		return fields
 	}
-	b.WriteString(",items=")
+	var items strings.Builder
 	for idx, res := range results {
 		if idx > 0 {
-			b.WriteString(";")
+			items.WriteString(";")
 		}
 		encoded := base64.StdEncoding.EncodeToString(res.Payload)
-		b.WriteString(fmt.Sprintf("%x:%d:%s", res.Value, res.Key, encoded))
+		items.WriteString(fmt.Sprintf("%x:%d:%s", res.Value, res.Key, encoded))
 	}
-	return b.String()
+	return append(fields, mf("items", items.String()))
+}
+
+func formatPairReduceResponse(results []PairReduceResult, mode string, nextCursor []byte) string {
+	return microOK(pairReduceResponseFields(results, mode, nextCursor)...).Render()
+}
+
+// predictInheritResponseFields è la stessa cosa per PREDICT_INHERIT_BATCH.
+func predictInheritResponseFields(table string, merged int, skipped int, failed int, total int) []microField {
+	return []microField{
+		mf("table", table),
+		mfi("merged", merged),
+		mfi("skipped", skipped),
+		mfi("failed", failed),
+		mfi("total", total),
+	}
 }
 
 func formatPairSummaryResponse(res *PairSummaryResult) string {
@@ -3460,110 +3314,7 @@ func (db *Database) handlePredictInheritBatch(args string) (string, error) {
 		return "ERROR,predict_inherit_batch_empty", nil
 	}
 	merged, skipped, failed := db.runPredictInheritBatch(table, requests, defaultMerge, nil)
-	return fmt.Sprintf(
-		"SUCCESS,table=%s,merged=%d,skipped=%d,failed=%d,total=%d",
-		tableName,
-		merged,
-		skipped,
-		failed,
-		len(requests),
-	), nil
-}
-
-func (db *Database) handlePredictInheritAsync(args string) (string, error) {
-	params := parseKeyValueArgs(args)
-	table, tableName, err := db.getPredictionTableFromParams(params)
-	if err != nil {
-		return "", err
-	}
-	requests, defaultMerge, err := parsePredictInheritBatchPayload(params)
-	if err != nil {
-		return fmt.Sprintf("ERROR,invalid_predict_inherit_batch:%v", err), nil
-	}
-	if len(requests) == 0 {
-		return "ERROR,predict_inherit_batch_empty", nil
-	}
-	job, err := db.submitPredictInheritJob(table, tableName, requests, defaultMerge)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("SUCCESS,table=%s,job=%s,state=queued,total=%d", tableName, job.id, len(requests)), nil
-}
-
-func (db *Database) handlePredictInheritStatus(args string) string {
-	jobID := strings.TrimSpace(args)
-	if jobID == "" {
-		return "ERROR,missing_job_id"
-	}
-	if db.predictJobs == nil {
-		return "ERROR,async_inherit_unavailable"
-	}
-	job := db.predictJobs.getJob(jobID)
-	if job == nil {
-		return "ERROR,predict_inherit_job_not_found"
-	}
-	state, total, completed, merged, skipped, failed, err := job.statusSnapshot()
-	progress := job.progressPercent()
-	if state == predictJobFailed && err != nil {
-		return fmt.Sprintf("ERROR,job_failed:%v", err)
-	}
-	return fmt.Sprintf(
-		"SUCCESS,job=%s,state=%s,progress=%.2f,completed=%d,total=%d,merged=%d,skipped=%d,failed=%d",
-		jobID,
-		job.stateString(),
-		progress,
-		completed,
-		total,
-		merged,
-		skipped,
-		failed,
-	)
-}
-
-func (db *Database) handlePredictInheritFetch(args string) string {
-	jobID := strings.TrimSpace(args)
-	if jobID == "" {
-		return "ERROR,missing_job_id"
-	}
-	if db.predictJobs == nil {
-		return "ERROR,async_inherit_unavailable"
-	}
-	job := db.predictJobs.getJob(jobID)
-	if job == nil {
-		return "ERROR,predict_inherit_job_not_found"
-	}
-	state, total, completed, merged, skipped, failed, err := job.statusSnapshot()
-	switch state {
-	case predictJobCompleted:
-		db.predictJobs.deleteJob(jobID)
-		return fmt.Sprintf(
-			"SUCCESS,job=%s,merged=%d,skipped=%d,failed=%d,total=%d",
-			jobID,
-			merged,
-			skipped,
-			failed,
-			total,
-		)
-	case predictJobFailed:
-		db.predictJobs.deleteJob(jobID)
-		if err != nil {
-			return fmt.Sprintf("ERROR,job_failed:%v", err)
-		}
-		return "ERROR,job_failed"
-	default:
-		progress := job.progressPercent()
-		return fmt.Sprintf(
-			"PENDING,job=%s,state=%s,progress=%.2f,completed=%d,total=%d,merged=%d,skipped=%d,failed=%d",
-			jobID,
-			job.stateString(),
-			progress,
-			completed,
-			total,
-			merged,
-			skipped,
-			failed,
-		)
-	}
+	return microOK(predictInheritResponseFields(tableName, merged, skipped, failed, len(requests))...).Render(), nil
 }
 
 func parsePredictInheritBatchPayload(params map[string]string) ([]predictInheritRequest, string, error) {
@@ -3644,26 +3395,6 @@ func parsePredictInheritBatchPayload(params map[string]string) ([]predictInherit
 		})
 	}
 	return requests, defaultMerge, nil
-}
-
-func (db *Database) submitPredictInheritJob(
-	table *PredictionTable,
-	tableName string,
-	requests []predictInheritRequest,
-	defaultMerge string,
-) (*predictInheritJob, error) {
-	if db.predictJobs == nil {
-		return nil, fmt.Errorf("async_inherit_unavailable")
-	}
-	job := db.predictJobs.newJob(tableName, len(requests))
-	go func(j *predictInheritJob) {
-		j.markRunning()
-		db.runPredictInheritBatch(table, requests, defaultMerge, func(res inheritResult) {
-			j.recordResult(res.merged, res.skipped, res.failed)
-		})
-		j.markCompleted()
-	}(job)
-	return job, nil
 }
 
 func (db *Database) runPredictInheritBatch(

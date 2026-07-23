@@ -148,9 +148,156 @@ Three argument dialects coexist, which is why a command's family is easier to gu
 the text is used raw — write `x<HEX>` for binary, and `*` for "the whole trie / no prefix".
 
 The authoritative inventory is the `ExecuteCommand` switch in [`src/database.go`](src/database.go)
-plus the two front-ends; this section documents that switch. The overlaps between the families below
-are real and deliberate for now — [`NEXT_STEPS.md`](NEXT_STEPS.md) records the plan to factor them
-into composable micro-commands with the current names kept as aliases.
+plus the two front-ends and the two tables it consults first — the micro-command registry
+([`src/micro_command.go`](src/micro_command.go)) and the alias table
+([`src/command_alias.go`](src/command_alias.go)). The overlaps between the families below are being
+factored out into composable **micro-commands**, with every current name kept as an alias that
+reproduces its old response byte for byte; `JOB` and `DEL` have landed (see
+[Micro-commands](#micro-commands--the-canonical-form)), `SCAN`/`GET`/`SET` are still planned in
+[`NEXT_STEPS.md`](NEXT_STEPS.md).
+
+### Micro-commands — the canonical form
+
+A micro-command is a verb, a target and `key=value` modifiers; the historical names are aliases over
+them, so nothing below replaces anything you already use.
+
+| Micro-command | Absorbs | Notes |
+| --- | --- | --- |
+| `DEL values key=<n>` | `DELETE` | one value |
+| `DEL pairs key=<v>` | `PAIR_DEL` | one name |
+| `DEL pairs prefix=<p> [limit=<n>] [payloads=0\|1]` | `PAIR_PURGE` | a namespace; `payloads=0` unlinks the names and leaves the values readable by key — the one thing `PAIR_PURGE` could not say. `prefix=*` is the whole trie |
+| `DEL graph node=<id> [cascade=1]` | `GRAPH_NODE_DEL` | a node, optionally with its edges |
+| `DEL graph from=<a> to=<b> [type=] [directed=]` | `GRAPH_EDGE_DEL` | one edge |
+| `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`), anything else is `ERROR,command_not_submittable` |
+| `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS` | `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters |
+| `JOB fetch id=<job>` | `PAIR_REDUCE_FETCH`, `PREDICT_INHERIT_FETCH` | the submitted command's own response under `job=<id>` while completed, `PENDING,…` while running, and it consumes the job |
+
+Micro-commands take `key=value` only. A binary value is written `x<hex>` exactly as elsewhere, and
+must be when it contains spaces — the positional forms survive inside the alias rewriters, which
+re-encode for you. `RESET_DB` is deliberately **not** a `DEL` target: it lives in the front-ends
+because it changes what the connection is pointing at, not what a database contains.
+
+```text
+[cheetah_data/notes]> DEL pairs prefix=ctx: payloads=0
+SUCCESS,deleted=2
+# the names are gone from the trie; READ on their keys still answers
+
+[cheetah_data/notes]> JOB submit PAIR_REDUCE counts ctx:
+SUCCESS,job=reduce_1,kind=reduce,command=PAIR_REDUCE,state=queued,total=0,reducer=counts
+[cheetah_data/notes]> JOB status id=reduce_1
+SUCCESS,job=reduce_1,kind=reduce,state=completed,progress=100.00,completed=2,total=2,reducer=counts
+[cheetah_data/notes]> JOB fetch id=reduce_1
+SUCCESS,job=reduce_1,reducer=counts,count=2,items=…
+# the same line PAIR_REDUCE would have answered, under the job id
+```
+
+#### What each alias runs
+
+An alias is three things: a **rewriter** that translates the historical argument dialect into a micro
+call, the **micro-command** itself, and a **formatter** that rebuilds the historical response line
+from the micro response's named fields. Below, `r ← MICRO …` is the micro call, `r.field` reads a
+field out of its response, and `→` is the line the client receives.
+
+Two rules apply to every alias and are not repeated in each block:
+
+- **an `ERROR` from the micro-command passes through untouched**, because micro error tokens are
+  deliberately the same words the old commands used (`not_found`, `already_deleted`,
+  `node_not_found`, `edge_not_found`). The only exception is the `job_not_found` /
+  `job_manager_unavailable` remap noted in the `JOB` blocks.
+- **the old dialect's own validation happens in the rewriter**, before the micro-command runs. That
+  is why the wordings below (`missing_key`, `pair_purge_requires_prefix`, …) never reach `DEL` or
+  `JOB`. The async submits are the exception: they hand the whole argument list to the submitted
+  command, so its errors surface from inside `JOB submit` — still synchronously, still before a job
+  id exists.
+
+```text
+DELETE <key>
+    if <key> is absent          → "ERROR,missing_key"
+    if <key> is not a uint64    → "ERROR,invalid_key_format"
+    r ← DEL values key=<key>
+    → "SUCCESS,key=" + r.key + "_deleted"
+
+PAIR_DEL <name>                          # <name> is the whole rest of the line, spaces included
+    v = parse_bytes(<name>)              # plaintext, or x<hex>
+    if v is malformed hex       → "ERROR,invalid_hex_value:…"
+    if v is empty               → "ERROR,pair_value_cannot_be_empty"
+    r ← DEL pairs key=x<hex of v>        # re-encoded: the micro dialect splits on whitespace
+    → "SUCCESS,pair_deleted"
+
+PAIR_PURGE <prefix> [<limit>]
+    if <prefix> is absent        → "ERROR,pair_purge_requires_prefix"
+    if <prefix> is malformed hex → "ERROR,invalid_hex_value:…"
+    if <limit> is not an int     → "ERROR,invalid_limit"
+    p = (<prefix> == "*") ? "*" : x<hex of parse_bytes(<prefix>)>
+    r ← DEL pairs prefix=<p> [limit=<limit>]      # payloads= is left at its default of 1
+    → "SUCCESS,purged=" + r.deleted
+
+GRAPH_NODE_DEL id=<id> [cascade=<b>]
+    if <id> is empty            → "ERROR,graph_node_del_requires_id"
+    r ← DEL graph node=<id> [cascade=<b>]
+    → "SUCCESS,node_deleted,id=" + r.node
+
+GRAPH_EDGE_DEL from=<a> to=<b> [type=<t>] [directed=<d>]
+    if <a> or <b> is empty      → "ERROR,graph_edge_del_requires_from_and_to"
+    r ← DEL graph from=<a> to=<b> [type=<t>] [directed=<d>]
+    → "SUCCESS,edge_deleted,id=" + r.edge
+```
+
+The two async trios are the same shape over `JOB`. They differ only in which command they submit and
+which fields their formatter picks — which is exactly the redundancy the envelope removed:
+
+```text
+PAIR_REDUCE_ASYNC <mode> <prefix> [<limit>] [<cursor>]
+    if the argument list is empty  → "ERROR,pair_reduce_requires_args"
+    r ← JOB submit command=base64("PAIR_REDUCE " + <arguments verbatim>)
+      # the rest of the validation happens inside JOB submit, synchronously and before an
+      # id exists: ERROR,unknown_reducer_mode, ERROR,invalid_limit, ERROR,invalid_hex_value:…
+    → "SUCCESS,reducer=" + r.reducer + ",job=" + r.job + ",state=queued"
+
+PAIR_REDUCE_STATUS <job>
+    if <job> is absent             → "ERROR,missing_job_id"
+    r ← JOB status id=<job>
+    on ERROR: job_not_found        → "ERROR,reduce_job_not_found"
+    → "SUCCESS,job=" + r.job + ",state=" + r.state + ",progress=" + r.progress
+      # a failed job still answers SUCCESS here, with state=failed — as it always did
+
+PAIR_REDUCE_FETCH <job>
+    if <job> is absent             → "ERROR,missing_job_id"
+    r ← JOB fetch id=<job>                        # consumes the job, done or failed
+    on ERROR: job_not_found        → "ERROR,reduce_job_not_found"
+              job_failed:<err>     → passes through
+    if r is PENDING → "PENDING,job=,reducer=,state=,progress=,completed=,total="   (values from r)
+    → "SUCCESS," + r without its job= field       # byte-identical to the PAIR_REDUCE line
+
+PREDICT_INHERIT_ASYNC table=<t> items=<base64 json[]> [merge=<mode>]
+    r ← JOB submit command=base64("PREDICT_INHERIT_BATCH " + <arguments verbatim>)
+    → "SUCCESS,table=" + r.table + ",job=" + r.job + ",state=queued,total=" + r.total
+
+PREDICT_INHERIT_STATUS <job>
+    if <job> is absent             → "ERROR,missing_job_id"
+    r ← JOB status id=<job>
+    on ERROR: job_not_found        → "ERROR,predict_inherit_job_not_found"
+    if r.state == "failed" and r.error → "ERROR,job_failed:" + r.error
+    → "SUCCESS,job=,state=,progress=,completed=,total=,merged=,skipped=,failed="  (values from r)
+
+PREDICT_INHERIT_FETCH <job>
+    if <job> is absent             → "ERROR,missing_job_id"
+    r ← JOB fetch id=<job>
+    on ERROR: job_not_found        → "ERROR,predict_inherit_job_not_found"
+    if r is PENDING → "PENDING,job=,state=,progress=,completed=,total=,merged=,skipped=,failed="
+    → "SUCCESS,job=,merged=,skipped=,failed=,total="                              (values from r)
+```
+
+Note what the last two blocks say about `JOB status` on a **failed** job: it answers `SUCCESS` with
+`state=failed` plus an `error=` field, and each alias decides what that means in its own dialect —
+`PAIR_REDUCE_STATUS` kept reporting it as a status, `PREDICT_INHERIT_STATUS` kept turning it into
+`ERROR,job_failed:`. `JOB fetch` is the one that errors outright, which is what both old fetches did.
+
+Every alias today resolves to **exactly one** micro call; the rewriter/formatter pair is where the
+sequence would grow if a future alias needed several. The pairs live in
+[`src/command_alias.go`](src/command_alias.go), and
+[`src/command_alias_test.go`](src/command_alias_test.go) pins each rendered line against what the
+command answered before the decomposition.
 
 ### The layer a command belongs to
 
@@ -448,8 +595,10 @@ keys: plaintext, or `x<hex>` for binary — a bare hex string is taken literally
 adds a value spelled `646f67` rather than `dog`. Context matrices and window specs cross the wire as
 base64-encoded JSON. Values come back **hex-encoded** in `items=<hex>:<prob>`.
 
-One wart to code around: several failure paths in this family return the bare reason
-(`inherit_sources_missing`) with **no `ERROR,` prefix**, unlike every other command.
+Failures in this family used to answer the bare reason (`inherit_sources_missing`) with no `ERROR,`
+prefix. They no longer do: `ExecuteCommand` normalizes any response that opens with neither
+`SUCCESS`, `ERROR` nor `PENDING` into `ERROR,<reason>`, so classifying on the prefix is safe here as
+everywhere else.
 
 | Command | What it means |
 | --- | --- |
@@ -492,8 +641,8 @@ SUCCESS,count=4,backend=cpu,table=,items=636174:0.3191;66656c696e65:0.2655;6b697
 # "feline" was never trained: it arrived with the averaged context weights of cat and kitten
 
 [cheetah_data/notes]> PREDICT_INHERIT key=ctx:the target=x sources=nosuchvalue
-inherit_sources_missing
-# ← no `ERROR,` prefix; a client keying on the prefix must treat "no SUCCESS" as failure
+ERROR,inherit_sources_missing
+# the prefix is added at the dispatcher boundary, so this family classifies like the others
 
 [cheetah_data/notes]> PREDICT_BACKEND mode=gpu
 SUCCESS,table=,backend=webgpu-simulated
@@ -579,7 +728,9 @@ price. The distinctions that actually matter:
 
 - **`DELETE` vs `PAIR_DEL` vs `PAIR_PURGE` vs `RESET_DB`** — four erasures at four scopes: one
   value, one name, a whole namespace (names *and* values), the whole database (including its pinned
-  trie geometry). Deleting a value never removes the names pointing at it, and vice versa.
+  trie geometry). Deleting a value never removes the names pointing at it, and vice versa. The first
+  three are now one verb with the scope written out — `DEL values key=` / `DEL pairs key=` /
+  `DEL pairs prefix=` — which is the form to reach for when the distinction is what keeps biting.
 - **`PAIR_GET` vs `READ`** — resolution vs hydration. `PAIR_GET` turns a name into a key;
   `READ` turns a key into bytes. Two calls, deliberately: a name can be re-pointed without touching
   the payload.
@@ -588,9 +739,10 @@ price. The distinctions that actually matter:
   magnitude, not correctness.
 - **`PAIR_SET` vs `PAIR_SET_HIDDEN`** — one flag bit on one entry, not a second namespace. Every
   reader can opt back in with `include_hidden=1`.
-- **synchronous vs `_ASYNC` + `_STATUS`/`_FETCH`** — identical work, different envelope. Two
-  families implement that envelope separately (`PAIR_REDUCE_*`, `PREDICT_INHERIT_*`) with slightly
-  different response fields.
+- **synchronous vs `_ASYNC` + `_STATUS`/`_FETCH`** — identical work, different envelope. Both
+  families (`PAIR_REDUCE_*`, `PREDICT_INHERIT_*`) now run on the single `JOB` envelope and keep their
+  own response fields only in their alias formatters, so a job id, a progress percentage and a
+  fetch-consumes-the-job contract mean the same thing in both.
 - **`GRAPH_NEIGHBORS` vs `GRAPH_DEGREE` vs `GRAPH_NEIGHBOR_TYPES` vs `GRAPH_QUERY … RETURN`** — one
   adjacency scan at four hydration levels: edge records, a count, a per-type histogram, and records
   filtered by predicates over several hops. `GRAPH_QUERY … RETURN count` and `GRAPH_DEGREE` answer

@@ -185,7 +185,19 @@ because they mutate per-connection "current database" state.
   list-shaped output must do the same rather than emitting `\n`.
 - **Reducers are registered, not hard-coded.** Add new `PAIR_REDUCE` modes in
   [`registerDefaultReducers`](src/reducers.go); the dispatcher resolves them by name. Do not extend the
-  `ExecuteCommand` switch per reducer.
+  `ExecuteCommand` switch per reducer. The same shape now holds for three more tables, all built once
+  by [`ensureCommandRegistries`](src/micro_command.go): micro-commands
+  ([`registerDefaultMicroCommands`](src/micro_command.go)), legacy aliases
+  ([`registerDefaultCommandAliases`](src/command_alias.go)) and the commands runnable inside `JOB`
+  ([`registerDefaultJobCommands`](src/jobs.go)).
+- **An alias reproduces its legacy response byte for byte.** Response field names (`purged=`,
+  `matches=`, `degree=`, `count=`, `next_cursor=`, `job=`) are a wire contract — the Python adapter in
+  the parent monorepo reads some of them positionally. A command decomposed into a micro-command
+  keeps its old name in [`command_alias.go`](src/command_alias.go) with a formatter that rebuilds the
+  exact old line, and a golden test pins it
+  ([`command_alias_test.go`](src/command_alias_test.go)). A name that lives in the micro or alias
+  table must **not** also have a `switch` branch: two implementations of one command diverge in
+  silence.
 - **Graph keys use reserved control-byte prefixes.** `\x01gn:`, `\x02ge:`, `\x03go:`, `\x04gi:`,
   `\x05gt:` (the lexical term index, [`graph_recall.go`](src/graph_recall.go)) and `graph/idx/`
   ([`graph.go`](src/graph.go)) share the trie with user data. Never emit user keys under these
@@ -214,6 +226,9 @@ client ── TCP ──►  server.go (per-conn loop)                          
                   engine.go  ── GetDatabase(name) ──►  cheetah_data/<name>/  (lazy, cached)
                          ▼
               database.go : ExecuteCommand(line)   ← single command router
+                 │  resolves in order: micro_command.go (DEL, JOB) → command_alias.go
+                 │  (every historical name) → its own switch (everything not yet decomposed)
+                 │    └─ jobs.go        one job manager for every async family
                  ├─ commands.go        Insert/Read/Edit/Delete, PairSet/Get/Del/Purge
                  ├─ tables.go          MainKeys / Values / Recycle / PairTable  ──► file_manager.go ──► disk
                  │                        └─ cache.go (payload LRU),  jump_store.go (suffix collapse)
@@ -324,8 +339,12 @@ The heart of the engine (~4,000 lines). Owns the `Database` struct, the **centra
 `ExecuteCommand`, the pair-trie insert/lookup/delete/scan/summary machinery, reducer orchestration,
 and the glue handlers for prediction, cluster, and graph commands. Most feature work touches this file.
 
-- **Router:** `ExecuteCommand` — the single `switch` mapping every command (except front-end
-  `DATABASE`/`RESET_DB`) to a handler. This is the canonical command inventory.
+- **Router:** `ExecuteCommand` — resolves, in order, the micro-command registry
+  ([`micro_command.go`](src/micro_command.go)), the alias table
+  ([`command_alias.go`](src/command_alias.go)), then its own `switch` for everything not yet
+  decomposed. The three together are the canonical command inventory; front-end
+  `DATABASE`/`RESET_DB`/`EXIT` are outside all of them. `normalizeCommandResponse` runs on the way
+  out and prefixes any response that opens with neither `SUCCESS`, `ERROR` nor `PENDING`.
 - **Lifecycle / tables:** `NewDatabase` (creates `pairs/` + `pair_jumps/`, wires cache, file manager,
   scheduler, reducers, prediction store), `Close`, `getValuesTable`, `getRecycleTable`, `getPairTable`,
   `pairTableCache` (fd-bounded LRU of open `PairTable`s via `resolvePairTableLimit`).
@@ -358,13 +377,16 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
 
 #### [`src/commands.go`](src/commands.go)
 
-The primitive KV + pair-mapping operations invoked by `ExecuteCommand`.
+The primitive KV + pair-mapping operations. `ExecuteCommand` reaches the erasures through the `DEL`
+micro-command ([`micro_del.go`](src/micro_del.go)); the rest it calls directly.
 
 - **Key functions:** `Insert`/`persistPayload` (size-partitioned write + recycle reuse), `Read`, `Edit`
   (relocates on size change), `Delete` (tombstone, then recycle the value slot *and* the key row,
   then invalidate the cache — the tombstone goes first so a half-failure leaks instead of
   double-allocating), `PairSet`,
-  `PairSetHidden`, `PairGet`, `PairDel`, `PairPurge`/`purgePairEntries` (batched namespace wipe).
+  `PairSetHidden`, `PairGet`, `PairDel`, `PairPurge`/`PairPurgeWithOptions`/`purgePairEntries`
+  (batched namespace wipe; the `WithOptions` form carries `DEL pairs … payloads=0`, which unlinks the
+  names and leaves the values addressable by absolute key).
 - **Depends on:** [`tables.go`](src/tables.go), [`helpers.go`](src/helpers.go), [`cache.go`](src/cache.go).
 - **Common mistakes:** `Insert` validates that a `INSERT:<n>` declared size matches the payload; the
   size partitions the value table, so a wrong size lands the payload in the wrong file.
@@ -494,15 +516,77 @@ The reducer registry and the graph-specific reducers.
 - **Common mistakes:** register new modes here; the count/prob/continuation reducers are payload
   pass-throughs (they stream the stored bytes) — the *meaning* of those bytes is a client contract.
 
-#### [`src/reduce_jobs.go`](src/reduce_jobs.go)
+#### [`src/jobs.go`](src/jobs.go)
 
-In-memory job manager backing `PAIR_REDUCE_ASYNC`/`_STATUS`/`_FETCH` (progress %, state, results,
-next cursor). Jobs are process-local and not persisted.
+The **single** in-memory job manager, replacing `reduce_jobs.go` and `predict_jobs.go` (both deleted).
+A `microJob` carries state, `completed`/`total`, named counters, submit-time metadata and a
+*structured* result (`[]microField`), so one manager serves every async family. Jobs are
+process-local and not persisted.
 
-#### [`src/predict_jobs.go`](src/predict_jobs.go)
+- **Key symbols:** `microJobState`, `microJob` (`markRunning`/`markFailed`/`markCompleted`/
+  `setProgress`/`advance`/`snapshot`), `microJobSnapshot` (`progressPercent`, `counterFields`),
+  `microJobManager` (`newJob`/`getJob`/`deleteJob`), `jobTask`, `jobCommand`, `jobCommandRegistry`,
+  `registerDefaultJobCommands`, `Database.submitJob`.
+- **Common mistakes:** job ids stay `<kind>_<n>` with the sequence kept **per kind**
+  (`reduce_1`, `predict_inherit_1`) — a shared counter would renumber ids a client may have stored.
+  `jobTask.Counters` must list every counter an alias renders, or a poll arriving before the first
+  progress callback prints an empty field where the legacy line printed `0`.
 
-In-memory job manager for `PREDICT_INHERIT_ASYNC`/`_STATUS`/`_FETCH` (merged/skipped/failed counters).
-Also process-local.
+#### [`src/micro_command.go`](src/micro_command.go)
+
+The micro-command core: `microResponse` (a status plus ordered `key=value` fields, kept structured
+until the dispatcher boundary so an alias formatter can read it by name), `microArgs`
+(`Target`/`Rest`/`Params`), the handler registry, and the byte-value codec of the micro dialect.
+
+- **Key symbols:** `microField`/`mf`/`mfi`/`mfu`, `microResponse` (`Render`/`Get`/`Has`/`IsError`),
+  `microOK`/`microFail`/`microFailf`/`microPending`/`microSilent`, `microHandler`, `microCall`,
+  `microCommandRegistry`, `ensureCommandRegistries` (the one-time `sync.Once` that builds all three
+  package-level tables), `registerDefaultMicroCommands`, `splitMicroArgs`, `microParseBytes`/
+  `microEncodeBytes`, `Database.executeMicroCommand`.
+- **Common mistakes:** `microSilent()` (empty `Status`) is the "only an error to propagate" case and
+  renders as the empty string — do not confuse it with `microFail`. `microEncodeBytes` always emits
+  `x<hex>`: the micro dialect splits tokens on whitespace, so a pair key containing a space or
+  starting with `x` survives only in hex.
+
+#### [`src/micro_del.go`](src/micro_del.go)
+
+The `DEL` micro-command — one erasure verb with the scope in the arguments (`DEL values key=`,
+`DEL pairs key=`/`prefix=`, `DEL graph node=`/`from=`+`to=`).
+
+- **Key symbols:** `microDel`, `microDelValues`, `microDelPairs`, `microDelGraph`,
+  `microDelGraphNode`, `microDelGraphEdge`, `microRawResponse`.
+- **Common mistakes:** its error tokens are deliberately the *same words* the legacy commands used
+  (`not_found`, `already_deleted`, `node_not_found`), which is what lets the aliases pass errors
+  through unformatted. `RESET_DB` is not a `DEL` target — it is front-end scoped.
+
+#### [`src/micro_job.go`](src/micro_job.go)
+
+The `JOB` micro-command (`submit`/`status`/`fetch`) plus the two commands currently registered as
+runnable inside it.
+
+- **Key symbols:** `microJobCommand`, `microJobSubmit`/`microJobStatus`/`microJobFetch`,
+  `jobCommandLine`, `jobProgressFields`, `preparePairReduceJob`, `preparePredictInheritJob`,
+  `sanitizeJobError`, `microRawError`.
+- **Common mistakes:** `JOB status` must **not** fail on a failed job (it reports `state=failed` plus
+  `error=`), because `PAIR_REDUCE_STATUS` answered `SUCCESS` there while `PREDICT_INHERIT_STATUS`
+  answered `ERROR,job_failed:`; `JOB fetch` is the one that errors, which is what both legacy fetches
+  did. `Prepare` runs synchronously so a bad argument answers with an error instead of a job that
+  fails on its own.
+
+#### [`src/command_alias.go`](src/command_alias.go)
+
+The compatibility half: every historical name re-expressed as an argument rewriter plus a response
+formatter, registered at startup in one table.
+
+- **Key symbols:** `commandAlias` (`Rewrite`/`Format`/`ErrorTokens`), `commandAliasRegistry`,
+  `Database.executeCommandAlias`, `registerDefaultCommandAliases`, `registerDeleteAliases`,
+  `registerJobAliases`, `jobSubmitCall`, `jobLookupCall`, `dropField`.
+- **Common mistakes:** the formatter must reproduce the legacy line **byte for byte** — response
+  field names are a wire contract read positionally by some clients. Legacy-dialect validation
+  belongs in `Rewrite` (that is where the old error wordings and the positional forms live), not in
+  the micro-command. Errors pass through unformatted except for the `ErrorTokens` remapping, which
+  exists because `JOB` says `job_not_found` where the two trios said `reduce_job_not_found` /
+  `predict_inherit_job_not_found`.
 
 ### Prediction tables
 
@@ -664,6 +748,28 @@ vs shared words, the term-index lifecycle (auto-maintained, label removal, node 
 `CHEETAH_GRAPH_TERM_INDEX=0` + rebuild + drop), and budget exhaustion answering `truncated=1` on one
 line. Provides `newRecallTestDB`, `seedRecallGraph`, `recallPayload`, `findAssociation`.
 
+#### [`src/command_alias_test.go`](src/command_alias_test.go)
+
+The golden-response suite for the decomposition: every legacy name that now runs through a
+micro-command must answer exactly what it answered before.
+`TestLegacyDeleteAliasesAreByteIdentical` (the five erasures, success and every error path, including
+`DELETE` on an unwritten row which answers `ERROR,key_not_found` *and* propagates `io.EOF`),
+`TestLegacyReduceJobAliasesAreByteIdentical` and `TestLegacyPredictJobAliasesAreByteIdentical` (the
+two async trios, with the async fetch asserted equal to the synchronous line),
+`TestJobIDSequencesStayPerFamily` (unifying the managers must not renumber `predict_inherit_1`),
+`TestPredictFailuresCarryTheErrorPrefix` and `TestNormalizeCommandResponse` (the `ERROR,` prefix fix).
+Provides `runCommand`, `mustCommand`, `assertResponse`, `waitForJobState`.
+
+#### [`src/micro_command_test.go`](src/micro_command_test.go)
+
+The micro surface itself: `TestMicroDelSelectors` and `TestMicroDelGraphSelectors` (one verb, the
+scope in the arguments), `TestMicroDelPairsKeepsPayloads` (`payloads=0`, the modifier `PAIR_PURGE`
+could not express), `TestMicroDelBinaryKeyRoundTrip` + `TestMicroParseBytesRoundTrip` (a pair key with
+a space, one starting with `x`, and raw control bytes survive the `x<hex>` dialect),
+`TestMicroJobEnvelope` (submit in both forms, status, fetch-consumes-the-job, and the
+not-submittable/unknown-action refusals), `TestMicroJobCountersSeededAtSubmit` (a poll before the
+first progress callback must read `merged=0`, not an empty field).
+
 #### [`src/pair_scan_test.go`](src/pair_scan_test.go)
 
 Scan/summary contracts that are independent of the container format:
@@ -808,8 +914,10 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Behavior:** `PAIR_REDUCE <mode> <prefix>` streams inline base64 payloads; async variants poll.
   Modes: `counts/probabilities/continuations` (payload pass-through) and graph
   `degree/triangle/pagerank_seed`.
-- **Owners:** [`reducers.go`](src/reducers.go), [`reduce_jobs.go`](src/reduce_jobs.go),
-  `handlePairReduce`/`reduceWithPayload` in [`database.go`](src/database.go).
+- **Owners:** [`reducers.go`](src/reducers.go), [`jobs.go`](src/jobs.go) +
+  [`micro_job.go`](src/micro_job.go) (the async half, now the shared `JOB` envelope),
+  `handlePairReduce`/`reduceWithPayload`/`pairReduceResponseFields` in
+  [`database.go`](src/database.go).
 - **Tests:** [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go).
 
 ### Graph store + `GRAPH_QUERY` — Shipped
@@ -833,7 +941,8 @@ nodes are reused — keep automated runs to a few hundred edges.
   (distributional) and shared id words (lexical). `GRAPH_TERM_INDEX action=stats|rebuild|drop`
   maintains the index.
 - **Owners:** [`graph_recall.go`](src/graph_recall.go); node-write hooks in
-  [`graph.go`](src/graph.go) (`handleGraphNodeSet`, `handleGraphNodeDel`, `graphEnsureNode`).
+  [`graph.go`](src/graph.go) (`handleGraphNodeSet`, `graphEnsureNode`) and in
+  [`micro_del.go`](src/micro_del.go) (`microDelGraphNode`, which took over `handleGraphNodeDel`).
   **Tests:** [`graph_recall_test.go`](src/graph_recall_test.go).
 - **Constraints:** every walk is bounded by `branch_limit` (per node/direction) and `budget`
   (hydrated edges); exhausting either answers `truncated=1` rather than stalling. `hops` caps at 6.
@@ -863,7 +972,7 @@ nodes are reused — keep automated runs to a few hundred edges.
 - **Behavior:** `PREDICT_SET/QUERY/TRAIN/CTX/INHERIT(+batch/async)/BACKEND/BENCH` over fixed-byte
   tables with context-matrix weighting and multi-window merges.
 - **Owners:** [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go),
-  [`predict_jobs.go`](src/predict_jobs.go).
+  [`jobs.go`](src/jobs.go) + [`micro_job.go`](src/micro_job.go) for the async inherit.
 - **Constraints:** the "GPU" backend is `webgpu-simulated` (CPU fan-out), not a real WebGPU binding.
   **Gaps:** driving `PREDICT_TRAIN` from ingest is a *client-side* TODO, not a server gap.
 
@@ -969,14 +1078,16 @@ plus the two front-end handlers. There is no generated API manifest.
 | Command(s) | Owner |
 | --- | --- |
 | `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](src/main.go) `runCLI`, [`server.go`](src/server.go) `handleConnection`, [`engine.go`](src/engine.go) |
-| `INSERT`, `READ`, `EDIT`, `DELETE` | [`commands.go`](src/commands.go) |
-| `PAIR_SET(_HIDDEN)`, `PAIR_GET`, `PAIR_DEL`, `PAIR_PURGE` | [`commands.go`](src/commands.go) |
+| `DEL`, `JOB` (micro-commands) | [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go) |
+| `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL`, `GRAPH_EDGE_DEL`, `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH` (aliases over the above) | [`command_alias.go`](src/command_alias.go) |
+| `INSERT`, `READ`, `EDIT` | [`commands.go`](src/commands.go) |
+| `PAIR_SET(_HIDDEN)`, `PAIR_GET` | [`commands.go`](src/commands.go) |
 | `PAIR_SCAN`, `PAIR_SUMMARY` | [`database.go`](src/database.go) (`PairScanWithOptions`, `PairSummaryWithOptions`) |
-| `PAIR_REDUCE(_ASYNC/_STATUS/_FETCH)` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go) + [`reduce_jobs.go`](src/reduce_jobs.go) |
+| `PAIR_REDUCE` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go); its async forms go through [`jobs.go`](src/jobs.go) |
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
 | `GRAPH_RECALL`, `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go) |
-| `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`predict_jobs.go`](src/predict_jobs.go) |
+| `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`jobs.go`](src/jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
 | `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](src/database.go), [`resource_monitor.go`](src/resource_monitor.go), [`logger.go`](src/logger.go), [`file_manager.go`](src/file_manager.go) |
 
@@ -1194,8 +1305,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   ([`prediction_table.go`](src/prediction_table.go)).
 - **[`gold/basic.go`](gold/basic.go)** — reference prototype with stubbed `Read`/`Edit`; not wired to
   the server.
-- **Async job managers** ([`reduce_jobs.go`](src/reduce_jobs.go), [`predict_jobs.go`](src/predict_jobs.go)) are
-  in-memory only; jobs vanish on restart.
+- **The job manager** ([`jobs.go`](src/jobs.go)) is in-memory only; jobs vanish on restart.
 
 <a id="known-gaps"></a>
 ### Known gaps
@@ -1217,12 +1327,12 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   unlike that one it has not been observed in the wild, because nothing in the server fans a single
   command out into parallel inserts. The fix is symmetric — serialize the trie mutation — but it
   serializes every writer, so measure `pair_adaptive_bench_test.go` before taking it.
-- **`PREDICT_*` error responses omit the `ERROR,` prefix** — the handlers return `err.Error()` raw
-  (`inherit_sources_missing`), breaking the otherwise universal `SUCCESS`/`ERROR,` classification.
-- **Command-surface redundancy** — 51 dispatcher commands, of which the async trios, the `_BATCH`
-  forms, the four hydration levels of one adjacency/trie walk, and the five erasure verbs are the
-  same operation in different envelopes. Documented per command in
-  [`README.md`](README.md#telling-the-look-alikes-apart); the micro-command + alias plan is in
+- **Command-surface redundancy, partly factored out.** `JOB` now backs both async trios and `DEL`
+  backs the five erasures, each historical name kept as an alias
+  ([`command_alias.go`](src/command_alias.go)). Still redundant: the `_BATCH` forms, the four
+  hydration levels of one adjacency/trie walk (`SCAN` + `view=`), and the point read/write pairs
+  (`GET`/`SET`). Documented per command in
+  [`README.md`](README.md#telling-the-look-alikes-apart); the remaining plan is in
   [`NEXT_STEPS.md`](NEXT_STEPS.md).
 - **Thin tests** for prediction, cluster, and the payload cache (see test gaps above).
 

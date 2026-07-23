@@ -279,6 +279,13 @@ func (db *Database) PairDel(value []byte) (string, error) {
 // PairPurge removes every pair entry beneath the provided prefix and deletes the
 // associated payload keys in bulk. It returns the number of entries cleared.
 func (db *Database) PairPurge(prefix []byte, limit int) (int, error) {
+	return db.PairPurgeWithOptions(prefix, limit, true)
+}
+
+// PairPurgeWithOptions is PairPurge with the payload half made explicit
+// (`DEL pairs prefix=… payloads=0`): with deletePayloads false the entries leave
+// the trie but their values stay addressable by absolute key.
+func (db *Database) PairPurgeWithOptions(prefix []byte, limit int, deletePayloads bool) (int, error) {
 	if limit <= 0 {
 		limit = pairScanMaxLimit
 	} else {
@@ -294,7 +301,7 @@ func (db *Database) PairPurge(prefix []byte, limit int) (int, error) {
 		if len(results) == 0 {
 			break
 		}
-		removed, err := db.purgePairEntries(results)
+		removed, err := db.purgePairEntries(results, deletePayloads)
 		totalRemoved += removed
 		if err != nil {
 			return totalRemoved, err
@@ -307,7 +314,7 @@ func (db *Database) PairPurge(prefix []byte, limit int) (int, error) {
 	return totalRemoved, nil
 }
 
-func (db *Database) purgePairEntries(results []PairScanResult) (int, error) {
+func (db *Database) purgePairEntries(results []PairScanResult, deletePayloads bool) (int, error) {
 	if len(results) == 0 {
 		return 0, nil
 	}
@@ -335,7 +342,7 @@ func (db *Database) purgePairEntries(results []PairScanResult) (int, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if err := db.purgePairEntry(val, absKey); err != nil {
+			if err := db.purgePairEntry(val, absKey, deletePayloads); err != nil {
 				errOnce.Do(func() { firstErr = err })
 				return
 			}
@@ -350,17 +357,19 @@ func (db *Database) purgePairEntries(results []PairScanResult) (int, error) {
 	return int(removed.Load()), nil
 }
 
-func (db *Database) purgePairEntry(value []byte, key uint64) error {
-	resp, err := db.Delete(key)
-	if err != nil {
-		if !isDeleteResponseIgnorable(resp) {
-			return fmt.Errorf("delete key %d failed: %w", key, err)
+func (db *Database) purgePairEntry(value []byte, key uint64, deletePayload bool) error {
+	if deletePayload {
+		resp, err := db.Delete(key)
+		if err != nil {
+			if !isDeleteResponseIgnorable(resp) {
+				return fmt.Errorf("delete key %d failed: %w", key, err)
+			}
+		} else if !isDeleteResponseIgnorable(resp) {
+			return fmt.Errorf("delete key %d failed: %s", key, resp)
 		}
-	} else if !isDeleteResponseIgnorable(resp) {
-		return fmt.Errorf("delete key %d failed: %s", key, resp)
 	}
 
-	resp, err = db.PairDel(value)
+	resp, err := db.PairDel(value)
 	if err != nil {
 		return fmt.Errorf("pair delete %x failed: %w", value, err)
 	}

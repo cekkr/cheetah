@@ -236,40 +236,6 @@ func (db *Database) handleGraphNodeGet(args string) (string, error) {
 	return fmt.Sprintf("SUCCESS,id=%s,payload=%s", id, payload), nil
 }
 
-func (db *Database) handleGraphNodeDel(args string) (string, error) {
-	params := parseKeyValueArgs(args)
-	id := graphNormalizeID(params["id"])
-	if id == "" {
-		return "ERROR,graph_node_del_requires_id", nil
-	}
-	cascade := parseBoolFlag(params["cascade"])
-	if cascade {
-		if err := db.graphDeleteNodeEdges(id); err != nil {
-			return "", err
-		}
-	}
-	// Le voci dell'indice lessicale si ricavano dal record, quindi vanno tolte
-	// prima che il record sparisca.
-	existing, found, err := db.graphGetNode(id)
-	if err != nil {
-		return "", err
-	}
-	nodeKey := graphNodePairKey(id)
-	deleted, err := db.graphDeletePairAndPayload(nodeKey)
-	if err != nil {
-		return "", err
-	}
-	if !deleted {
-		return "ERROR,node_not_found", nil
-	}
-	if found {
-		if err := db.graphDropNodeTerms(&existing); err != nil {
-			return "", err
-		}
-	}
-	return fmt.Sprintf("SUCCESS,node_deleted,id=%s", id), nil
-}
-
 func (db *Database) handleGraphEdgeSet(args string) (string, error) {
 	params := parseKeyValueArgs(args)
 	request, errResp, err := graphBuildEdgeSetRequestFromParams(params)
@@ -633,31 +599,6 @@ func (db *Database) handleGraphEdgeGet(args string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("SUCCESS,id=%s,payload=%s", record.ID, payload), nil
-}
-
-func (db *Database) handleGraphEdgeDel(args string) (string, error) {
-	params := parseKeyValueArgs(args)
-	fromID := graphNormalizeID(params["from"])
-	toID := graphNormalizeID(params["to"])
-	if fromID == "" || toID == "" {
-		return "ERROR,graph_edge_del_requires_from_and_to", nil
-	}
-	edgeType := graphNormalizeEdgeType(params["type"])
-	directed := true
-	if raw := strings.TrimSpace(params["directed"]); raw != "" {
-		directed = parseBoolFlag(raw)
-	}
-	record, found, err := db.graphGetEdge(fromID, toID, edgeType, directed)
-	if err != nil {
-		return "", err
-	}
-	if !found {
-		return "ERROR,edge_not_found", nil
-	}
-	if err := db.graphDeleteEdge(record); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("SUCCESS,edge_deleted,id=%s", record.ID), nil
 }
 
 func (db *Database) handleGraphNeighbors(args string) (string, error) {
