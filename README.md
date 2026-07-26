@@ -459,7 +459,7 @@ Full grammar in [Graph Command Language](#graph-command-language).
 
 | Command | What it means |
 | --- | --- |
-| `GRAPH_NODE_SET id=<id> [labels=…] [props=…]` | Upsert an **entity**. `labels` are the kinds it belongs to (filterable, valueless); `props` are descriptive attributes you will not query on their own. Omitting either keeps the stored one; `created_at` survives. |
+| `GRAPH_NODE_SET id=<id> [labels=…] [props=…] [references=<base64-json[]>]` | Upsert an **entity**. `labels` are the kinds it belongs to (filterable, valueless); `props` are descriptive attributes you will not query on their own; `references` are bounded complete sentences with `id`, `text`, optional `source`, and `ordinal`. Omitting a field keeps the stored one; `references=-` clears the sentence list; `created_at` survives. |
 | `GRAPH_NODE_DEL id=<id> [cascade=1]` | Forget the entity. Without `cascade=1` its incident edges are left dangling — pass it whenever you mean "and everything that was said about it". |
 | `GRAPH_EDGE_SET from= to= [type=] [weight=] [directed=] [confidence=] [modality=] [ambiguity=] [props=] [autocreate=0]` | Upsert a **relation**, identified by the tuple `(from, to, type, directed)`. `weight` is traversal strength (cost `1/weight`); `confidence`/`modality` are how sure the claim is; `ambiguity` names the group of mutually exclusive readings it belongs to. Missing endpoint nodes are stubbed out unless `autocreate=0`. |
 | `GRAPH_EDGE_SET_BATCH items=<base64 json[]> [continue_on_error=1] [type=] [directed=] [weight=] [props=]` | The same upsert for many edges in one round-trip, with the top-level tokens acting as per-item defaults. Reports `requested/applied/created/updated/failed`. |
@@ -549,7 +549,7 @@ ERROR,graph_query_parse_failed:left_node_must_be_anchored_by_id
 
 | Command | What it means |
 | --- | --- |
-| `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [limit=] [branch_limit=] [budget=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. |
+| `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [references=0\|1] [reference_limit=] [limit=] [branch_limit=] [budget=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. `references=1` also hydrates complete node sentences and episodic payloads cited by `edge.props.src`, under a separate bound. |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=] [precision=]` | **"What else behaves like this?"** — nodes with the same neighbours (distributional) or the same words in their id (lexical). No edge between them is required. |
 | `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=] [cursor=]` | Maintenance of the derived `\x05gt:` lexical index that free-text seeds resolve through. It is never authoritative: exact ids and synonym edges keep working without it, and `rebuild` is resumable through `next_cursor`. |
 
@@ -558,7 +558,7 @@ yet. Recall answers what a query cannot be written for:
 
 ```text
 [cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=28,count=4,bridges=4,truncated=0,precision=0.100,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=28,references=0,count=4,bridges=4,truncated=0,precision=0.100,payload=<base64>
 # payload decodes to {"seeds":[{"term":"cat:luna","matches":[{"id":"cat:luna","score":1,"match":"exact"},
 #                                                            {"id":"cat:mia","score":0.33,"match":"lexical"}]}, …],
 #  "associations":[
@@ -572,11 +572,11 @@ SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=2
 # cat:mia lexically.
 
 [cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=34,count=4,bridges=4,truncated=0,precision=0.050,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=34,references=0,count=4,bridges=4,truncated=0,precision=0.050,payload=<base64>
 # the "what do these two have to do with each other?" view: only nodes both seeds reach
 
 [cheetah_data/notes]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,count=3,bridges=0,truncated=0,precision=0.100,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,references=0,count=3,bridges=0,truncated=0,precision=0.100,payload=<base64>
 # "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"}]}]
 # a bare word, not an id — resolved through the term index, and it says so
 
@@ -937,7 +937,7 @@ are always prefix scans.
 
 | Command | Purpose |
 | --- | --- |
-| `GRAPH_NODE_SET id=<id> [labels=a,b] [props=<json\|base64>]` | Upsert a node (preserves `created_at`; keeps existing labels/props when omitted). |
+| `GRAPH_NODE_SET id=<id> [labels=a,b] [props=<json\|base64>] [references=<base64-json[]>]` | Upsert a node (preserves `created_at`; keeps existing labels/props/references when omitted). References are complete sentence objects `{id,text,source?,ordinal?}`; missing ids are SHA-256-derived, and `references=-` clears them. |
 | `GRAPH_EDGE_SET from=<id> to=<id> [type=<t>] [weight=<f>] [directed=0\|1] [props=<json\|base64>] [autocreate=0\|1]` | Upsert one edge plus its adjacency/index entries. Missing endpoint nodes are auto-created unless `autocreate=0`. |
 | `GRAPH_EDGE_SET_BATCH items=<base64 json[]> [continue_on_error=0\|1] [type=…] [directed=…] [weight=…] [props=…]` | Bulk upsert in one round-trip; top-level `type/directed/weight/props` act as per-item defaults. |
 | `GRAPH_NODE_DEL id=<id> [cascade=1]` | Delete a node; `cascade=1` also removes its incident edges. |
@@ -969,7 +969,7 @@ node that does not exist yet (disable with `autocreate=0`).
 | `GRAPH_DEGREE id=<id> [direction=out\|in\|both] [type=<t\|*>] [weighted=0\|1]` | `degree` (plus `weighted_degree` when `weighted=1`). |
 | `GRAPH_NEIGHBOR_TYPES id=<id> [direction=out\|in\|both] [limit=<n>] [cursor=<tok>] [weighted=0\|1]` | `payload=` a compact relation histogram `[{type,count,weighted}]`. |
 | `GRAPH_AMBIGUITY_GET from=<id> group=<g> [direction=out\|in] [limit=<n>]` | `count`, `confidence_sum`, `top`, `top_modality`, and `payload=` the alternatives, strongest first. |
-| `GRAPH_RECALL seeds=<t>[,…] [precision=…] [hops=…] [min_sources=…] […]` | `resolved`, `visited`, `expanded`, `count`, `bridges`, `truncated`, and `payload=` the resolved seeds plus the ranked associations. See [associative recall](#associative-recall--graph_recall-graph_similar). |
+| `GRAPH_RECALL seeds=<t>[,…] [precision=…] [hops=…] [min_sources=…] [references=0\|1] [reference_limit=…] […]` | `resolved`, `visited`, `expanded`, `references`, `count`, `bridges`, `truncated`, and `payload=` the resolved seeds plus the ranked associations. With `references=1`, each association may include complete stored sentences and episodic source payloads. See [associative recall](#associative-recall--graph_recall-graph_similar). |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=<n>]` | `count`, `truncated`, and `payload=` `[{id,score,context,lexical,shared_count,shared,labels}]`. |
 | `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=<n>] [cursor=<tok>]` | `entries`/`enabled` (stats), `nodes`+`terms`+`next_cursor` (rebuild), `removed` (drop). |
 
@@ -1059,6 +1059,8 @@ GRAPH_RECALL seeds=<term>[,<term>…]     # free text or node ids; base64:<list>
   [decay=<0..1>]            # activation kept per hop, default 0.55
   [expand=exact|lexical|synonyms|all]   # how seeds resolve, default all
   [synonym_types=<t>[,…]|-] # default synonym,alias,same_as,aka,abbreviation,acronym
+  [references=0|1]           # hydrate complete sentence evidence, default 0
+  [reference_limit=<n>]      # global sentence cap for this recall, default 32, max 256
   [limit=<n>] [branch_limit=<n>] [budget=<n>] [include_seeds=0|1] [seed_limit=<n>]
 ```
 
@@ -1077,7 +1079,7 @@ Scoring, in one line each:
 
 ```text
 [cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=8
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,count=6,bridges=3,truncated=0,precision=0.100,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,references=0,count=6,bridges=3,truncated=0,precision=0.100,payload=<base64>
 # payload decodes to {"seeds":[…],"associations":[
 #   {"id":"city:berlin","score":0.7975,"novelty":0.39875,"distance":1,"source_count":2,"bridge":true,
 #    "sources":[{"seed":"cat:luna","activation":0.55,"hops":1},{"seed":"person:marco","activation":0.55,"hops":1}],
@@ -1086,8 +1088,22 @@ SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15
 #   {"id":"breed:siamese","score":0.55,"novelty":0.1375,"distance":1,"source_count":1,…}, …]}
 
 [cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=13,hydrated=24,count=5,bridges=5,truncated=0,precision=0.050,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=13,hydrated=24,references=0,count=5,bridges=5,truncated=0,precision=0.050,payload=<base64>
 # only what more than one seed reaches — the "what do these two have to do with each other?" question
+```
+
+References keep recall grounded in complete language instead of returning only token matches. Store
+them directly on a node (base64 is mandatory because sentences contain spaces), or attach an
+episodic payload key to an edge as `props.src`; recall can return both in one bounded payload:
+
+```text
+[cheetah_data/default]> GRAPH_NODE_SET id=module:parser labels=module references=<base64 of [{"id":"parser-contract","text":"The parser rejects non-finite values before applying configuration.","source":"design-contract","ordinal":1}]>
+SUCCESS,node_set,id=module:parser
+[cheetah_data/default]> GRAPH_RECALL seeds=task:validation hops=1 references=1 reference_limit=8
+SUCCESS,command=GRAPH_RECALL,…,references=2,…,payload=<base64>
+# the module:parser association may contain the stored design-contract sentence plus the verbatim
+# episode named by the evidence edge's props.src. Reference text also feeds the derived term index,
+# so free-text seeds can resolve through whole remembered sentences.
 ```
 
 A seed does not have to be an id. Free text resolves through the lexical index (`berlin` →
@@ -1096,7 +1112,7 @@ which route it took:
 
 ```text
 [cheetah_data/default]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1
-SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=2,visited=5,expanded=2,hydrated=5,count=3,…,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=2,visited=5,expanded=2,hydrated=5,references=0,count=3,…,payload=<base64>
 # "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"},
 #                                      {"id":"city:berlino","score":0.47025,"match":"synonym"}]}]
 ```

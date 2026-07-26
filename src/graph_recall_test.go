@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -56,6 +59,149 @@ func findAssociation(payload graphRecallPayload, id string) (graphRecallAssociat
 		}
 	}
 	return graphRecallAssociation{}, false
+}
+
+func encodeGraphReferences(t *testing.T, references []GraphReferenceSentence) string {
+	t.Helper()
+	payload, err := json.Marshal(references)
+	if err != nil {
+		t.Fatalf("failed to encode references: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(payload)
+}
+
+func TestGraphNodeReferencesRoundTripAndFeedTheTermIndex(t *testing.T) {
+	db := newRecallTestDB(t)
+	references := encodeGraphReferences(t, []GraphReferenceSentence{
+		{
+			Text:    "The numeric parser rejects non-finite values before applying configuration.",
+			Source:  "unit-test",
+			Ordinal: 1,
+		},
+		{
+			ID:      "parser_fallback",
+			Text:    "The parser falls back deterministically when an input is absent.",
+			Source:  "unit-test",
+			Ordinal: 2,
+		},
+	})
+	assertCommandPrefix(
+		t,
+		db,
+		"GRAPH_NODE_SET id=module:parser labels=module references="+references,
+		"SUCCESS",
+	)
+
+	resp := assertCommandPrefix(t, db, "GRAPH_NODE_GET id=module:parser", "SUCCESS")
+	var record GraphNodeRecord
+	decodePayloadField(t, resp, &record)
+	if len(record.References) != 2 {
+		t.Fatalf("expected two complete references, got %+v", record.References)
+	}
+	if !strings.HasPrefix(record.References[0].ID, "ref_") {
+		t.Fatalf("a missing reference id must be derived deterministically, got %+v", record.References[0])
+	}
+	if record.References[1].ID != "parser_fallback" {
+		t.Fatalf("an explicit reference id must survive, got %+v", record.References[1])
+	}
+
+	candidates, err := db.graphTermCandidates("finite", 0)
+	if err != nil {
+		t.Fatalf("reference term lookup failed: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0] != "module:parser" {
+		t.Fatalf("complete reference text must feed lexical recall, got %+v", candidates)
+	}
+
+	// Omettere references le conserva; `references=-` le cancella e riallinea
+	// l'indice derivato.
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=module:parser props={\"status\":\"stable\"}", "SUCCESS")
+	resp = assertCommandPrefix(t, db, "GRAPH_NODE_GET id=module:parser", "SUCCESS")
+	record = GraphNodeRecord{}
+	decodePayloadField(t, resp, &record)
+	if len(record.References) != 2 {
+		t.Fatalf("omitting references must preserve them, got %+v", record.References)
+	}
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=module:parser references=-", "SUCCESS")
+	if stale, err := db.graphTermCandidates("finite", 0); err != nil {
+		t.Fatalf("reference term lookup failed: %v", err)
+	} else if len(stale) != 0 {
+		t.Fatalf("clearing references must clear their index entries, got %+v", stale)
+	}
+}
+
+func TestGraphRecallHydratesCompleteNodeAndEpisodeReferences(t *testing.T) {
+	db := newRecallTestDB(t)
+	references := encodeGraphReferences(t, []GraphReferenceSentence{
+		{
+			ID:     "parser_contract",
+			Text:   "The parser must reject infinity instead of silently accepting it.",
+			Source: "design-contract",
+		},
+	})
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=task:validation labels=task", "SUCCESS")
+	assertCommandPrefix(
+		t,
+		db,
+		"GRAPH_NODE_SET id=module:parser labels=module references="+references,
+		"SUCCESS",
+	)
+	episodeText := "A live regression showed that Infinity previously reached the runtime."
+	inserted := assertCommandPrefix(
+		t,
+		db,
+		"INSERT:"+strconv.Itoa(len(episodeText))+" "+episodeText,
+		"SUCCESS",
+	)
+	episodeKey := responseField(inserted, "key")
+	assertCommandPrefix(
+		t,
+		db,
+		"GRAPH_EDGE_SET from=task:validation to=module:parser type=uses props={\"src\":\""+episodeKey+"\"}",
+		"SUCCESS",
+	)
+
+	resp := assertCommandPrefix(
+		t,
+		db,
+		"GRAPH_RECALL seeds=task:validation hops=1 precision=0.1 references=1 reference_limit=8",
+		"SUCCESS",
+	)
+	payload := recallPayload(t, resp)
+	parser, ok := findAssociation(payload, "module:parser")
+	if !ok {
+		t.Fatalf("expected module:parser in recall, got %+v", payload.Associations)
+	}
+	if len(parser.References) != 2 {
+		t.Fatalf("expected node and episodic references, got %+v", parser.References)
+	}
+	texts := map[string]string{}
+	for _, reference := range parser.References {
+		texts[reference.Source] = reference.Text
+	}
+	if texts["design-contract"] != "The parser must reject infinity instead of silently accepting it." {
+		t.Fatalf("missing the direct complete sentence, got %+v", parser.References)
+	}
+	if texts["episode:"+episodeKey] != episodeText {
+		t.Fatalf("missing the episodic source sentence, got %+v", parser.References)
+	}
+	if responseField(resp, "references") != "2" {
+		t.Fatalf("response must report hydrated references, got %s", resp)
+	}
+
+	withoutReferences := recallPayload(
+		t,
+		assertCommandPrefix(
+			t,
+			db,
+			"GRAPH_RECALL seeds=task:validation hops=1 precision=0.1",
+			"SUCCESS",
+		),
+	)
+	parser, ok = findAssociation(withoutReferences, "module:parser")
+	if !ok || len(parser.References) != 0 {
+		t.Fatalf("reference hydration must stay opt-in, got %+v", parser)
+	}
 }
 
 // Un nodo raggiunto da due semi vale più di quanto valga per ciascuno: è il

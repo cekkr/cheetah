@@ -58,9 +58,12 @@ const (
 	graphRecallMaxTypeScans = 8
 
 	graphRecallMaxIndexTokens    = 12
+	graphRecallMaxReferenceTerms = 20
 	graphTermCandidateLimit      = 512
 	graphTermRebuildPageSize     = 256
 	graphTermRebuildDefaultLimit = 4096
+	graphRecallDefaultReferences = 32
+	graphRecallMaxReferences     = 256
 
 	graphSimilarDefaultLimit     = 32
 	graphSimilarDefaultPrecision = 0.05
@@ -184,30 +187,42 @@ func graphTermScanPrefix(token string) []byte {
 }
 
 // graphNodeIndexTokens raccoglie le parole sotto cui un nodo è ritrovabile:
-// quelle del suo id e quelle delle sue label. Il tetto evita che un id
-// chilometrico paghi decine di scritture.
+// quelle del suo id, delle label e delle frasi di riferimento. Il secondo
+// tetto lascia alle frasi un budget proprio: altrimenti un id lungo più le
+// label consumano tutti gli slot e la memoria testuale torna invisibile.
 func graphNodeIndexTokens(record *GraphNodeRecord) []string {
 	if record == nil || record.ID == "" {
 		return nil
 	}
-	seen := make(map[string]struct{}, graphRecallMaxIndexTokens)
-	out := make([]string, 0, graphRecallMaxIndexTokens)
-	appendToken := func(token string) bool {
+	limit := graphRecallMaxIndexTokens + graphRecallMaxReferenceTerms
+	seen := make(map[string]struct{}, limit)
+	out := make([]string, 0, limit)
+	appendToken := func(token string, cap int) bool {
 		if _, ok := seen[token]; ok {
 			return true
 		}
+		if len(out) >= cap {
+			return false
+		}
 		seen[token] = struct{}{}
 		out = append(out, token)
-		return len(out) < graphRecallMaxIndexTokens
+		return len(out) < cap
 	}
 	for _, token := range graphRecallTokens(record.ID) {
-		if !appendToken(token) {
-			return out
+		if !appendToken(token, graphRecallMaxIndexTokens) {
+			break
 		}
 	}
 	for _, label := range record.Labels {
 		for _, token := range graphRecallTokens(label) {
-			if !appendToken(token) {
+			if !appendToken(token, graphRecallMaxIndexTokens) {
+				break
+			}
+		}
+	}
+	for _, reference := range record.References {
+		for _, token := range graphRecallTokens(reference.Text) {
+			if !appendToken(token, limit) {
 				return out
 			}
 		}
@@ -371,15 +386,17 @@ type graphRecallOptions struct {
 	// ScanTypes elenca i tipi da leggere con prefisso tipizzato (indice-servito);
 	// TypeFilter è la variante a valle quando i tipi sono troppi per farne una
 	// scansione ciascuno.
-	ScanTypes    []string
-	TypeFilter   map[string]struct{}
-	Decay        float64
-	MinSources   int
-	BranchLimit  int
-	Budget       int
-	SeedLimit    int
-	IncludeSeeds bool
-	Expand       graphRecallExpansion
+	ScanTypes      []string
+	TypeFilter     map[string]struct{}
+	Decay          float64
+	MinSources     int
+	BranchLimit    int
+	Budget         int
+	SeedLimit      int
+	IncludeSeeds   bool
+	References     bool
+	ReferenceLimit int
+	Expand         graphRecallExpansion
 }
 
 // graphParseRecallSeeds legge `seeds=a,b,c`. Gli argomenti del protocollo si
@@ -463,15 +480,16 @@ func graphParseTypeList(raw string) map[string]struct{} {
 
 func graphParseRecallOptions(params map[string]string) (graphRecallOptions, string, error) {
 	opts := graphRecallOptions{
-		Precision:   graphRecallDefaultPrecision,
-		Hops:        graphRecallDefaultHops,
-		Limit:       graphDefaultLimit,
-		Direction:   "both",
-		Decay:       graphRecallDefaultDecay,
-		MinSources:  1,
-		BranchLimit: graphRecallDefaultBranch,
-		Budget:      graphRecallDefaultBudget,
-		SeedLimit:   graphRecallDefaultSeedLimit,
+		Precision:      graphRecallDefaultPrecision,
+		Hops:           graphRecallDefaultHops,
+		Limit:          graphDefaultLimit,
+		Direction:      "both",
+		Decay:          graphRecallDefaultDecay,
+		MinSources:     1,
+		BranchLimit:    graphRecallDefaultBranch,
+		Budget:         graphRecallDefaultBudget,
+		SeedLimit:      graphRecallDefaultSeedLimit,
+		ReferenceLimit: graphRecallDefaultReferences,
 	}
 
 	rawSeeds := params["seeds"]
@@ -567,6 +585,17 @@ func graphParseRecallOptions(params map[string]string) (graphRecallOptions, stri
 		opts.SeedLimit = parsed
 	}
 	opts.IncludeSeeds = parseBoolFlag(params["include_seeds"])
+	opts.References = parseBoolFlag(params["references"])
+	if raw := strings.TrimSpace(params["reference_limit"]); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			return opts, "ERROR,invalid_reference_limit", nil
+		}
+		if parsed > graphRecallMaxReferences {
+			parsed = graphRecallMaxReferences
+		}
+		opts.ReferenceLimit = parsed
+	}
 
 	expansion, err := graphParseRecallExpansion(params["expand"])
 	if err != nil {
@@ -880,6 +909,31 @@ type graphRecallEdgeView struct {
 	Weight     float64 `json:"weight"`
 	Confidence float64 `json:"confidence"`
 	Modality   string  `json:"modality,omitempty"`
+	Source     string  `json:"source,omitempty"`
+}
+
+func graphRecallSourceOf(props map[string]interface{}) string {
+	if props == nil {
+		return ""
+	}
+	raw, ok := props["src"]
+	if !ok {
+		raw, ok = props["source_key"]
+	}
+	if !ok {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case json.Number:
+		return value.String()
+	case float64:
+		if value >= 0 && math.Trunc(value) == value {
+			return strconv.FormatUint(uint64(value), 10)
+		}
+	}
+	return ""
 }
 
 func graphRecallEdgeViewOf(edge *GraphEdgeRecord) graphRecallEdgeView {
@@ -890,6 +944,7 @@ func graphRecallEdgeViewOf(edge *GraphEdgeRecord) graphRecallEdgeView {
 		Weight:     edge.Weight,
 		Confidence: graphRoundConfidence(graphEffectiveConfidence(edge)),
 		Modality:   graphEffectiveModality(edge),
+		Source:     graphRecallSourceOf(edge.Props),
 	}
 }
 
@@ -1081,12 +1136,13 @@ type graphRecallAssociation struct {
 	Novelty float64 `json:"novelty"`
 	// Distance è la distanza concettuale minima da un seme: i passi fra sinonimi
 	// non contano, perché non cambiano argomento.
-	Distance    int                     `json:"distance"`
-	SourceCount int                     `json:"source_count"`
-	Bridge      bool                    `json:"bridge,omitempty"`
-	Labels      []string                `json:"labels,omitempty"`
-	Sources     []graphRecallSourceView `json:"sources"`
-	Via         []graphRecallEdgeView   `json:"via,omitempty"`
+	Distance    int                      `json:"distance"`
+	SourceCount int                      `json:"source_count"`
+	Bridge      bool                     `json:"bridge,omitempty"`
+	Labels      []string                 `json:"labels,omitempty"`
+	References  []GraphReferenceSentence `json:"references,omitempty"`
+	Sources     []graphRecallSourceView  `json:"sources"`
+	Via         []graphRecallEdgeView    `json:"via,omitempty"`
 }
 
 type graphRecallPayload struct {
@@ -1180,16 +1236,101 @@ func (run *graphRecallRun) associations(opts *graphRecallOptions) []graphRecallA
 	return out
 }
 
-// hydrateLabels legge i record solo dei nodi che escono davvero: la diffusione
-// non tocca i payload dei nodi, e non deve.
-func (db *Database) graphHydrateAssociationLabels(associations []graphRecallAssociation) {
+// graphBoundEpisodeReference conserva solo frasi intere entro il tetto di una
+// reference. Un episodio enorme non può trasformare una recall bounded in una
+// lettura arbitrariamente grande.
+func graphBoundEpisodeReference(raw []byte) string {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return ""
+	}
+	if len(text) <= graphMaxReferenceLen {
+		return text
+	}
+	prefix := text[:graphMaxReferenceLen]
+	for index := len(prefix) - 1; index >= graphMaxReferenceLen/2; index-- {
+		switch prefix[index] {
+		case '.', '!', '?':
+			return strings.TrimSpace(prefix[:index+1])
+		}
+	}
+	return ""
+}
+
+// hydrateAssociationEvidence legge i record solo dei nodi che escono davvero:
+// la diffusione non tocca i payload dei nodi. Con `references=1` aggiunge sia
+// le frasi registrate sul nodo sia gli episodi citati da `edge.props.src`.
+func (db *Database) graphHydrateAssociationEvidence(
+	associations []graphRecallAssociation,
+	opts *graphRecallOptions,
+) int {
+	remaining := 0
+	if opts != nil && opts.References {
+		remaining = opts.ReferenceLimit
+	}
+	hydrated := 0
 	for i := range associations {
 		record, found, err := db.graphGetNode(associations[i].ID)
 		if err != nil || !found {
 			continue
 		}
 		associations[i].Labels = record.Labels
+		if remaining <= 0 {
+			continue
+		}
+		seen := make(map[string]struct{}, len(record.References)+len(associations[i].Via))
+		for _, reference := range record.References {
+			if remaining <= 0 {
+				break
+			}
+			if _, ok := seen[reference.ID]; ok {
+				continue
+			}
+			if reference.Source == "" {
+				reference.Source = "node:" + record.ID
+			}
+			seen[reference.ID] = struct{}{}
+			associations[i].References = append(associations[i].References, reference)
+			remaining--
+			hydrated++
+		}
+		for _, edge := range associations[i].Via {
+			if remaining <= 0 {
+				break
+			}
+			if edge.Source == "" {
+				continue
+			}
+			key, err := strconv.ParseUint(edge.Source, 10, 64)
+			if err != nil {
+				continue
+			}
+			referenceID := "episode_" + edge.Source
+			if _, ok := seen[referenceID]; ok {
+				continue
+			}
+			payload, err := db.readValuePayload(key)
+			if err != nil {
+				continue
+			}
+			text := graphBoundEpisodeReference(payload)
+			if text == "" {
+				continue
+			}
+			seen[referenceID] = struct{}{}
+			associations[i].References = append(
+				associations[i].References,
+				GraphReferenceSentence{
+					ID:     referenceID,
+					Text:   text,
+					Source: "episode:" + edge.Source,
+				},
+			)
+			remaining--
+			hydrated++
+		}
 	}
+	return hydrated
 }
 
 // --- handler -----------------------------------------------------------------
@@ -1218,7 +1359,7 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 		return "", err
 	}
 	associations := run.associations(&opts)
-	db.graphHydrateAssociationLabels(associations)
+	references := db.graphHydrateAssociationEvidence(associations, &opts)
 
 	bridges := 0
 	for _, association := range associations {
@@ -1235,12 +1376,13 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf(
-		"SUCCESS,command=GRAPH_RECALL,seeds=%d,resolved=%d,visited=%d,expanded=%d,hydrated=%d,count=%d,bridges=%d,truncated=%d,precision=%.3f,payload=%s",
+		"SUCCESS,command=GRAPH_RECALL,seeds=%d,resolved=%d,visited=%d,expanded=%d,hydrated=%d,references=%d,count=%d,bridges=%d,truncated=%d,precision=%.3f,payload=%s",
 		len(opts.Seeds),
 		resolved,
 		len(run.Nodes),
 		run.Expanded,
 		run.Hydrated,
+		references,
 		len(associations),
 		bridges,
 		boolToInt(run.Truncated),

@@ -216,6 +216,12 @@ because they mutate per-connection "current database" state.
   seeds when they are missing. Node upsert/delete keep them in sync
   ([`graphSyncNodeTerms`](src/graph_recall.go)/[`graphDropNodeTerms`](src/graph_recall.go)); a new node
   write path must call them or its nodes become unreachable by free-text seed.
+- **Reference sentences are bounded graph evidence, not a new fact store.** `GraphNodeRecord.References`
+  holds at most 64 complete `{id,text,source?,ordinal?}` entries (4 KiB each, 64 KiB total);
+  `GRAPH_NODE_SET references=` preserves them when omitted and clears them only with `-`. Their words
+  feed the derived term index. `GRAPH_RECALL references=1` may additionally hydrate episodic payloads
+  named by `edge.props.src`, but a global `reference_limit` (32 by default, 256 max) bounds those
+  reads. Edges remain authoritative for meaning/confidence; references are readable provenance.
 - **Prediction tables persist as fixed-byte `CHPREDTB` files**, not JSON. JSON appears only on the
   CLI/TCP wire ([`prediction_table.go`](src/prediction_table.go)); legacy `.json` tables are auto-migrated
   on first open.
@@ -632,7 +638,7 @@ Property-graph storage and the `GRAPH_QUERY` engine (~2,800 lines) over four res
 plus a property index.
 
 - **Key symbols:** namespace prefix constants (`graphNodePrefix … graphEdgeIndexPrefix`), records
-  `GraphNodeRecord`/`GraphEdgeRecord`; command handlers `handleGraphNodeSet/Get/Del`,
+  `GraphNodeRecord`/`GraphReferenceSentence`/`GraphEdgeRecord`; command handlers `handleGraphNodeSet/Get/Del`,
   `handleGraphEdgeSet`, `handleGraphEdgeSetBatch`, `handleGraphNeighbors`, `handleGraphDegree`,
   `handleGraphNeighborTypes`, `handleGraphQuery`; query engine `parseGraphQuery`, `graphQueryPlan`,
   `executeGraphQuerySingleHop`, `executeGraphQueryMultiHop` (bounded HOPS + BRANCH_LIMIT + COST_LIMIT),
@@ -658,7 +664,8 @@ next query.
   parsing `graphParseRecallOptions`/`graphParseRecallExpansion`/`graphRecallResolveSynonymTypes`/
   `(*graphRecallOptions).applyTypeFilter`; seed resolution `graphResolveRecallSeeds`/
   `graphResolveRecallTerm`/`graphSynonymsOf`; traversal `graphRecallLinks`, `graphRecallSpread`,
-  `(*graphRecallRun).touch`/`path`/`associations`; handlers `handleGraphRecall`, `handleGraphSimilar`
+  `(*graphRecallRun).touch`/`path`/`associations`; bounded sentence hydration
+  `graphHydrateAssociationEvidence` (node references + episodic `edge.props.src`); handlers `handleGraphRecall`, `handleGraphSimilar`
   (with `graphSimilarMatches`), `handleGraphTermIndex`.
 - **Depends on:** [`graph.go`](src/graph.go) (adjacency scan, node/edge records, pair-payload helpers)
   and [`graph_uncertainty.go`](src/graph_uncertainty.go) (`graphEffectiveConfidence`/`Modality`, and the
@@ -756,8 +763,10 @@ two-seed node beats a one-seed node at the same distance), free-text seeds resol
 through alias edges (and `expand=exact` turning both off), the precision gate against declared edge
 confidence (`precision=probable` = 0.75, like `edge.confidence`), `GRAPH_SIMILAR` on shared neighbours
 vs shared words, the term-index lifecycle (auto-maintained, label removal, node delete,
-`CHEETAH_GRAPH_TERM_INDEX=0` + rebuild + drop), and budget exhaustion answering `truncated=1` on one
-line. Provides `newRecallTestDB`, `seedRecallGraph`, `recallPayload`, `findAssociation`.
+`CHEETAH_GRAPH_TERM_INDEX=0` + rebuild + drop), complete node-reference preserve/clear/index behavior,
+bounded recall hydration of node references plus episodic `edge.props.src` payloads, and budget
+exhaustion answering `truncated=1` on one line. Provides `newRecallTestDB`, `seedRecallGraph`,
+`recallPayload`, `findAssociation`.
 
 #### [`src/command_alias_test.go`](src/command_alias_test.go)
 
@@ -950,9 +959,10 @@ nodes are reused — keep automated runs to a few hundred edges.
   across seeds in **noisy-OR**, so a node two seeds reach outranks either seed's own neighbours —
   `min_sources=2` returns only those convergences, which is the "unexpected correlation" view.
   Seeds resolve by exact id, by lexical overlap through the `\x05gt:` term index, and through declared
-  synonym edges. `GRAPH_SIMILAR id=<node>` answers "what else is like this" from shared neighbours
-  (distributional) and shared id words (lexical). `GRAPH_TERM_INDEX action=stats|rebuild|drop`
-  maintains the index.
+  synonym edges. Node `references` store complete readable sentences and feed the lexical index;
+  `references=1 [reference_limit=…]` returns them plus episodic payloads cited by `edge.props.src`.
+  `GRAPH_SIMILAR id=<node>` answers "what else is like this" from shared neighbours (distributional)
+  and shared id words (lexical). `GRAPH_TERM_INDEX action=stats|rebuild|drop` maintains the index.
 - **Owners:** [`graph_recall.go`](src/graph_recall.go); node-write hooks in
   [`graph.go`](src/graph.go) (`handleGraphNodeSet`, `graphEnsureNode`) and in
   [`micro_del.go`](src/micro_del.go) (`microDelGraphNode`, which took over `handleGraphNodeDel`).
@@ -1099,7 +1109,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `PAIR_REDUCE` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go); its async forms go through [`jobs.go`](src/jobs.go) |
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
-| `GRAPH_RECALL`, `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go) |
+| `GRAPH_RECALL` (including bounded complete references), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go) |
 | `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`jobs.go`](src/jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
 | `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](src/database.go), [`resource_monitor.go`](src/resource_monitor.go), [`logger.go`](src/logger.go), [`file_manager.go`](src/file_manager.go) |
@@ -1261,6 +1271,8 @@ seen in old docs are **client-side**; the server does not read them.
 | Exhausted recall budget answers `truncated=1` on one line instead of stalling | [`TestGraphRecallBudgetDegradesInsteadOfStalling`](src/graph_recall_test.go) |
 | Distributional similarity: shared neighbours and shared id words | [`TestGraphSimilarSharesContextAndWords`](src/graph_recall_test.go) |
 | Term index maintained on write, dropped with the node, rebuildable, switchable | [`TestGraphTermIndexLifecycle`](src/graph_recall_test.go) |
+| Complete node references round-trip, preserve/clear, and feed lexical lookup | [`TestGraphNodeReferencesRoundTripAndFeedTheTermIndex`](src/graph_recall_test.go) |
+| Recall hydrates bounded node sentences + episodic `edge.props.src` payloads | [`TestGraphRecallHydratesCompleteNodeAndEpisodeReferences`](src/graph_recall_test.go) |
 | `LOG_FLUSH` answers on one line and leaves the next response aligned | [`TestLogFlush*`](src/logger_test.go) |
 | Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](src/graph_test.go) |
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go) |
@@ -1309,8 +1321,9 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   sync and async.
 - Graph store with batch upsert and bounded multi-hop `GRAPH_QUERY` incl. edge-property secondary
   index.
-- Associative recall: multi-seed `GRAPH_RECALL` with noisy-OR convergence, `GRAPH_SIMILAR`, and the
-  `\x05gt:` lexical term index behind `GRAPH_TERM_INDEX`.
+- Associative recall: multi-seed `GRAPH_RECALL` with noisy-OR convergence, bounded complete node/
+  episodic reference hydration, `GRAPH_SIMILAR`, and the `\x05gt:` lexical term index behind
+  `GRAPH_TERM_INDEX`.
 - Prediction tables with context-matrix train/query/inherit and CPU merge path.
 - Managed-file layer, payload cache, resource monitor, `SYSTEM_STATS`/`LOG_FLUSH`/`FILE_CHECKPOINT`.
 - Cluster topology registration, fork assignment, gossip, and `CLUSTER_MOVE` payload transfer.

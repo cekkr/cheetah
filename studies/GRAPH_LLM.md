@@ -90,6 +90,25 @@ SUCCESS,reducer=counts,count=2,next_cursor=x657069736f64653a32303236303732325431
 
 That is the whole consolidation input: one command, one page, `next_cursor` for the rest.
 
+Frequently recalled wording can also travel with the semantic node that uses it. Store complete
+sentences as bounded node references (base64 because the protocol splits on spaces), then ask recall
+to hydrate them. An evidence edge whose `props.src` is an `INSERT` key contributes that verbatim
+episode too:
+
+```text
+> GRAPH_NODE_SET id=condition:sterile references=<base64 of [{"id":"sterile-claim","text":"The cat may be sterile.","source":"owner","ordinal":1}]>
+SUCCESS,node_set,id=condition:sterile
+> GRAPH_RECALL seeds=cat:luna references=1 reference_limit=8
+SUCCESS,command=GRAPH_RECALL,…,references=2,…,payload=<base64>
+# the condition association carries the stored sentence and, when its evidence path cites props.src,
+# the original episode payload. The adapter can ground an answer in complete wording, not token ids.
+```
+
+`references` is not a second fact store: graph edges remain authoritative for meaning and
+confidence. It is the readable provenance attached to a node. Omission preserves the current list,
+`references=-` clears it, and reference words enter the derived term index so a free-text seed can
+land on remembered language.
+
 ### 2.2 Semantic: the graph, covered in the README
 
 See [Sentences → Graph → Answers](../README.md#sentences--graph--answers-llm-recipes). The only thing

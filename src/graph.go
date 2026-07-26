@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -30,14 +31,29 @@ const (
 	graphMaxHops         = 16
 	graphDefaultBranch   = 128
 	graphMaxBranch       = 4096
+	graphMaxReferences   = 64
+	graphMaxReferenceLen = 4096
+	graphMaxReferenceAll = 65536
 )
 
+// GraphReferenceSentence conserva una frase completa insieme alla sua
+// provenienza. Le relazioni restano sugli archi; questa è l'evidenza testuale
+// leggibile che un richiamo può restituire senza costringere il client a
+// ricostruirla da token o label.
+type GraphReferenceSentence struct {
+	ID      string `json:"id"`
+	Text    string `json:"text"`
+	Source  string `json:"source,omitempty"`
+	Ordinal int    `json:"ordinal,omitempty"`
+}
+
 type GraphNodeRecord struct {
-	ID        string                 `json:"id"`
-	Labels    []string               `json:"labels,omitempty"`
-	Props     map[string]interface{} `json:"props,omitempty"`
-	CreatedAt string                 `json:"created_at,omitempty"`
-	UpdatedAt string                 `json:"updated_at,omitempty"`
+	ID         string                   `json:"id"`
+	Labels     []string                 `json:"labels,omitempty"`
+	Props      map[string]interface{}   `json:"props,omitempty"`
+	References []GraphReferenceSentence `json:"references,omitempty"`
+	CreatedAt  string                   `json:"created_at,omitempty"`
+	UpdatedAt  string                   `json:"updated_at,omitempty"`
 }
 
 type GraphEdgeRecord struct {
@@ -182,17 +198,22 @@ func (db *Database) handleGraphNodeSet(args string) (string, error) {
 	if err != nil {
 		return fmt.Sprintf("ERROR,invalid_props:%v", err), nil
 	}
+	references, referencesSet, err := graphParseReferences(params["references"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_references:%v", err), nil
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	existing, found, err := db.graphGetNode(id)
 	if err != nil {
 		return "", err
 	}
 	record := GraphNodeRecord{
-		ID:        id,
-		Labels:    labels,
-		Props:     props,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         id,
+		Labels:     labels,
+		Props:      props,
+		References: references,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	if found {
 		record.CreatedAt = existing.CreatedAt
@@ -201,6 +222,9 @@ func (db *Database) handleGraphNodeSet(args string) (string, error) {
 		}
 		if props == nil {
 			record.Props = existing.Props
+		}
+		if !referencesSet {
+			record.References = existing.References
 		}
 	}
 	if err := db.graphPutNode(record); err != nil {
@@ -2778,6 +2802,65 @@ func graphParseProps(raw string) (map[string]interface{}, error) {
 		return nil, err
 	}
 	return props, nil
+}
+
+func graphParseReferences(raw string) ([]GraphReferenceSentence, bool, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, false, nil
+	}
+	if trimmed == graphClearToken {
+		return nil, true, nil
+	}
+	data, err := graphDecodeMaybeBase64JSON(trimmed)
+	if err != nil {
+		return nil, true, err
+	}
+	var decoded []GraphReferenceSentence
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, true, err
+	}
+	if len(decoded) > graphMaxReferences {
+		return nil, true, fmt.Errorf("too_many_references")
+	}
+	out := make([]GraphReferenceSentence, 0, len(decoded))
+	seen := make(map[string]struct{}, len(decoded))
+	total := 0
+	for index, reference := range decoded {
+		reference.Text = strings.TrimSpace(reference.Text)
+		reference.Source = strings.TrimSpace(reference.Source)
+		if reference.Text == "" {
+			return nil, true, fmt.Errorf("reference_%d_requires_text", index)
+		}
+		if len(reference.Text) > graphMaxReferenceLen {
+			return nil, true, fmt.Errorf("reference_%d_too_long", index)
+		}
+		total += len(reference.Text)
+		if total > graphMaxReferenceAll {
+			return nil, true, fmt.Errorf("references_too_large")
+		}
+		if reference.Ordinal < 0 {
+			return nil, true, fmt.Errorf("reference_%d_invalid_ordinal", index)
+		}
+		if strings.TrimSpace(reference.ID) == "" {
+			sum := sha256.Sum256([]byte(reference.Text))
+			reference.ID = "ref_" + hex.EncodeToString(sum[:10])
+		} else {
+			reference.ID = strings.TrimSpace(reference.ID)
+		}
+		if _, ok := seen[reference.ID]; ok {
+			continue
+		}
+		seen[reference.ID] = struct{}{}
+		out = append(out, reference)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Ordinal != out[j].Ordinal {
+			return out[i].Ordinal < out[j].Ordinal
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, true, nil
 }
 
 func graphParseLabels(raw string) []string {
