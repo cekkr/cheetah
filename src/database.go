@@ -23,39 +23,52 @@ import (
 )
 
 type Database struct {
-	name               string
-	path               string
-	highestKey         atomic.Uint64
-	nextPairTableID    atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
-	mainKeys           *MainKeysTable
-	keyRecycle         *RecycleTable // Righe di main_keys liberate da DELETE, riusate dal prossimo INSERT
-	valuesTables       sync.Map
-	recycleTables      sync.Map
-	pairTables         sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
-	fileManager        *FileManager
-	pairTableCache     *pairTableCache
-	payloadCache       *payloadCache
-	mu                 sync.Mutex
-	pairMutationMu     sync.Mutex // Serializza insert/delete sul trie dei pair, vedi setPairValue/deletePairValue
-	pairDir            string     // Path alla cartella /pairs
-	nextPairIDPath     string     // Path al file che memorizza il contatore
-	jumpDataPath       string
-	jumpIndexPath      string
-	jumpMu             sync.Mutex
-	resources          *ResourceMonitor
-	settings           DatabaseConfig
-	branchCodec        pairBranchCodec
-	adaptivePairs      bool // adaptive per-node LIST/DENSE container enabled
-	pairListMaxBytes   int  // LIST densify byte budget
-	pairListMaxFillPct int  // optional extra densify cap (% of capacity, 0 = off)
-	jumpDir            string
-	nextJumpIDPath     string
-	nextJumpID         atomic.Uint32
-	forkScheduler      *ForkScheduler
-	predictStore       *PredictionManager
-	clusterMessenger   *ClusterMessenger
-	jobs               *microJobManager
-	reducers           *ReducerRegistry
+	name            string
+	path            string
+	highestKey      atomic.Uint64
+	nextPairTableID atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
+	// Fondo dell'ultima prenotazione di ID scritta su disco (getNewPairTableID).
+	pairTableIDReserved atomic.Uint32
+	pairTableReserveMu  sync.Mutex
+	mainKeys            *MainKeysTable
+	keyRecycle          *RecycleTable // Righe di main_keys liberate da DELETE, riusate dal prossimo INSERT
+	valuesTables        sync.Map
+	recycleTables       sync.Map
+	pairTables          sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
+	fileManager         *FileManager
+	pairTableCache      *pairTableCache
+	payloadCache        *payloadCache
+	mu                  sync.Mutex
+	pairMutationMu      sync.Mutex // Serializza insert/delete sul trie dei pair, vedi setPairValue/deletePairValue
+	pairDir             string     // Path alla cartella /pairs
+	nextPairIDPath      string     // Path al file che memorizza il contatore
+	jumpDataPath        string
+	jumpIndexPath       string
+	jumpMu              sync.Mutex
+	resources           *ResourceMonitor
+	settings            DatabaseConfig
+	branchCodec         pairBranchCodec
+	adaptivePairs       bool // adaptive per-node LIST/DENSE container enabled
+	pairListMaxBytes    int  // LIST densify byte budget
+	pairListMaxFillPct  int  // optional extra densify cap (% of capacity, 0 = off)
+	jumpDir             string
+	nextJumpIDPath      string
+	nextJumpID          atomic.Uint32
+	// jumpIDReserved è il fondo dell'ultima prenotazione scritta su disco: gli
+	// ID sotto di esso si consegnano senza toccare il filesystem (jump_store.go).
+	jumpIDReserved   atomic.Uint32
+	jumpReserveMu    sync.Mutex
+	jumpDataFile     *os.File // handle persistente, aperto una volta sola
+	jumpIndexFile    *os.File
+	jumpDataEnd      int64 // coda del file append-only, tenuta in memoria
+	jumpNodes        *jumpCache
+	jumpStoreReady   bool
+	jumpLegacyFiles  bool // la cartella conteneva jump nel vecchio formato a file singolo
+	forkScheduler    *ForkScheduler
+	predictStore     *PredictionManager
+	clusterMessenger *ClusterMessenger
+	jobs             *microJobManager
+	reducers         *ReducerRegistry
 	// closeOnce rende Close idempotente: spegnimento per segnale, EXIT dalla
 	// CLI e Engine.Close possono arrivare tutti sullo stesso database.
 	closeOnce sync.Once
@@ -170,6 +183,8 @@ const (
 	minPairTableLimit             = 64
 	pairTableSafetyMargin         = 128
 	maxJumpReloadAttempts         = 8
+	// Quanti ID di tabella pair si prenotano per scrittura del contatore.
+	pairTableIDReservationChunk = 256
 )
 
 var errPairNotFound = errors.New("pair not found")
@@ -489,6 +504,7 @@ func (db *Database) shutdown() error {
 	if db.fileManager != nil {
 		db.fileManager.Close()
 	}
+	db.closeJumpStore()
 	if db.predictStore != nil {
 		db.predictStore.Close()
 	}
@@ -545,22 +561,44 @@ func (db *Database) loadNextPairTableID() error {
 		if os.IsNotExist(err) {
 			// Il file non esiste, partiamo da 1 (0 +-+ la root)
 			db.nextPairTableID.Store(1)
+			db.pairTableIDReserved.Store(1)
 			return nil
 		}
 		return err
 	}
 	if len(data) >= 4 {
-		db.nextPairTableID.Store(binary.BigEndian.Uint32(data))
+		stored := binary.BigEndian.Uint32(data)
+		db.nextPairTableID.Store(stored)
+		// Il file contiene il fondo dell'ultima prenotazione: sotto di esso gli
+		// ID sono bruciati, non liberi.
+		db.pairTableIDReserved.Store(stored)
 	}
 	return nil
 }
 
-// getNewPairTableID restituisce un nuovo ID univoco e lo salva su disco.
+// getNewPairTableID restituisce un nuovo ID univoco, prenotandoli a blocchi.
+//
+// Stessa regola di getNewJumpID: si persiste il fondo del blocco *prima* di
+// consegnarne il primo ID, così un crash può solo bruciare ID mai usati. Una
+// scrittura per ID costava un open+write+close per ogni nodo nuovo del trie.
 func (db *Database) getNewPairTableID() (uint32, error) {
 	newID := db.nextPairTableID.Add(1) - 1
+	if newID < db.pairTableIDReserved.Load() {
+		return newID, nil
+	}
+	db.pairTableReserveMu.Lock()
+	defer db.pairTableReserveMu.Unlock()
+	if newID < db.pairTableIDReserved.Load() {
+		return newID, nil
+	}
+	target := newID + pairTableIDReservationChunk
 	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, newID+1)
-	return newID, os.WriteFile(db.nextPairIDPath, buf, 0644)
+	binary.BigEndian.PutUint32(buf, target)
+	if err := os.WriteFile(db.nextPairIDPath, buf, 0644); err != nil {
+		return 0, err
+	}
+	db.pairTableIDReserved.Store(target)
+	return newID, nil
 }
 
 // getPairTable ora accetta un uint32 ID.

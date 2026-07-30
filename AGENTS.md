@@ -482,11 +482,27 @@ opening a legacy (headerless) directory.
 Persists jump nodes (collapsed unique suffixes) in `pair_jumps/jumps.bin` + `index.bin`, with legacy
 `.jump` file back-fill.
 
-- **Key symbols:** `JumpNode`, `createJump`, `loadJump`/`loadJumpFromIndexLocked`, `writeJump`,
-  `deleteJump`, `ensureJumpStoreLocked`, `loadJumpFromLegacyFileLocked` (migration),
-  `idToIndex`/`decodeJumpAt`.
+Both files are opened **once** and held for the life of the database (`ensureJumpStoreLocked` is a
+one-shot initialiser, `closeJumpStore` releases them from `Database.shutdown`), the append offset of
+`jumps.bin` is tracked in memory rather than re-derived with a `Seek`, and resolved nodes are held in
+a `jumpCache` LRU (`defaultJumpCacheEntries`). Every mutation path already runs under `jumpMu`, which
+is what makes the cache coherent — `writeJumpLocked` refreshes it and `deleteJump` drops the entry.
+
+- **Key symbols:** `JumpNode`, `jumpCache`, `createJump`, `loadJump`/`loadJumpFromIndexLocked`,
+  `writeJump`, `deleteJump`, `ensureJumpStoreLocked`, `closeJumpStore`,
+  `loadJumpFromLegacyFileLocked` (migration), `jumpLegacyFilesPresent`, `idToIndex`/`decodeJumpAt`.
+- **`pair_jumps/next_id.dat` holds the reservation high-water, not "the next free id".**
+  `getNewJumpID` hands out IDs from a block of `jumpIDReservationChunk` and persists the *end* of the
+  block before returning the first id in it, so a crash can only burn IDs that were never used — it
+  can never re-issue a live one. `pairs/next_id.dat` works the same way for pair tables
+  (`getNewPairTableID`, `pairTableIDReservationChunk`). Reading either file as a live allocation count
+  now under-reports by up to one chunk.
 - **Common mistakes:** the single-file store replaced a millions-of-inodes `.jump`-per-file scheme;
-  don't reintroduce per-node files.
+  don't reintroduce per-node files. Do not go back to opening `jumps.bin`/`index.bin` per call
+  either: with a handle-per-operation, `open(2)` was **53% of total CPU** on a graph-edge ingest and a
+  `GRAPH_EDGE_SET_BATCH` cost 19.4 ms/edge against 0.54 ms/edge once the handles were kept
+  (4 000 edges, `CHEETAH_GRAPH_TERM_INDEX=0`, macOS/APFS). Nor should the per-allocation counter write
+  come back: it was a full `os.WriteFile` for every new jump.
 
 #### [`src/file_manager.go`](src/file_manager.go)
 
@@ -849,8 +865,11 @@ sweep, and (b) `TestGraphNELLEndToEnd` — a **real-execution** test gated behin
 that builds the server binary (`go build … cheetahdb/src`), boots it headless on an ephemeral port with an isolated data
 dir, drives the full `run()` pipeline over TCP against a small synthetic NELL dataset, and asserts on
 the returned report plus a direct post-run `GRAPH_QUERY`. Perf note learned here: early NELL edges are
-node-diverse, so ingest is new-node/new-file bound (~30–40 edges/s) and only reaches ~600+ edges/s once
-nodes are reused — keep automated runs to a few hundred edges.
+node-diverse, so ingest is new-node/new-file bound and only speeds up once nodes are reused — keep
+automated runs to a few hundred edges. **The rates originally recorded here (~30–40 edges/s cold,
+~600+ warm) predate the jump-store handle fix** and are no longer representative: the same edge write
+went from 19.4 ms to 0.54 ms on a synthetic benchmark once `jumps.bin`/`index.bin` stopped being
+reopened per operation. Re-measure before quoting a NELL figure.
 
 ### Runtime / generated (never edited or committed)
 

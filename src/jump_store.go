@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,20 @@ import (
 
 var errJumpNodeMissing = errors.New("jump_node_missing")
 
+// Quanti ID di jump si prenotano su disco in una volta sola.
+//
+// Il contatore serve solo a non riassegnare mai un ID: scriverlo a ogni
+// allocazione costava un open+write+close per singolo jump, ed era il costo
+// dominante di una scrittura sul trie. Si prenota a blocchi e si persiste il
+// **fondo** del blocco prima di consegnarne il primo ID, così un crash può al
+// più bruciare gli ID non ancora usati — mai riusarne uno vivo. È la stessa
+// regola dell'high-water mark di ValuesTable.ReserveEntry.
+const jumpIDReservationChunk = 1024
+
+// Quanti nodi jump restano in RAM. Una camminata sul trie ne rilegge gli stessi
+// pochi per ogni chiave inserita, e ognuno costava due open+read+close.
+const defaultJumpCacheEntries = 65536
+
 type JumpNode struct {
 	ID             uint32
 	Bytes          []byte
@@ -20,26 +35,117 @@ type JumpNode struct {
 	NextTableID    uint32
 }
 
+// clone isola la copia in cache dal chiamante: i lettori di loadJump trattano
+// il nodo come proprio (insertThroughJump ne riscrive i campi), e restituire il
+// puntatore in cache lo farebbe mutare alle spalle di tutti gli altri.
+func (n *JumpNode) clone() *JumpNode {
+	if n == nil {
+		return nil
+	}
+	copied := *n
+	copied.Bytes = append([]byte(nil), n.Bytes...)
+	return &copied
+}
+
+// jumpCache è una LRU semplice sullo stesso schema di pairTableCache: la
+// coerenza è garantita dal fatto che ogni mutazione passa da jumpMu.
+type jumpCache struct {
+	limit   int
+	order   *list.List
+	entries map[uint32]*list.Element
+}
+
+func newJumpCache(limit int) *jumpCache {
+	if limit <= 0 {
+		return nil
+	}
+	return &jumpCache{
+		limit:   limit,
+		order:   list.New(),
+		entries: make(map[uint32]*list.Element, limit/8+1),
+	}
+}
+
+func (c *jumpCache) get(id uint32) (*JumpNode, bool) {
+	if c == nil {
+		return nil, false
+	}
+	element, ok := c.entries[id]
+	if !ok {
+		return nil, false
+	}
+	c.order.MoveToFront(element)
+	return element.Value.(*JumpNode), true
+}
+
+func (c *jumpCache) put(node *JumpNode) {
+	if c == nil || node == nil {
+		return
+	}
+	if element, ok := c.entries[node.ID]; ok {
+		element.Value = node
+		c.order.MoveToFront(element)
+		return
+	}
+	c.entries[node.ID] = c.order.PushFront(node)
+	for c.order.Len() > c.limit {
+		oldest := c.order.Back()
+		if oldest == nil {
+			return
+		}
+		c.order.Remove(oldest)
+		delete(c.entries, oldest.Value.(*JumpNode).ID)
+	}
+}
+
+func (c *jumpCache) drop(id uint32) {
+	if c == nil {
+		return
+	}
+	if element, ok := c.entries[id]; ok {
+		c.order.Remove(element)
+		delete(c.entries, id)
+	}
+}
+
 func (db *Database) loadNextJumpID() error {
 	data, err := os.ReadFile(db.nextJumpIDPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			db.nextJumpID.Store(1)
+			db.jumpIDReserved.Store(1)
 			return nil
 		}
 		return err
 	}
 	if len(data) >= 4 {
-		db.nextJumpID.Store(binary.BigEndian.Uint32(data))
+		stored := binary.BigEndian.Uint32(data)
+		db.nextJumpID.Store(stored)
+		// Il file contiene il fondo dell'ultima prenotazione: gli ID sotto di
+		// esso sono bruciati, non liberi.
+		db.jumpIDReserved.Store(stored)
 	}
 	return nil
 }
 
 func (db *Database) getNewJumpID() (uint32, error) {
 	newID := db.nextJumpID.Add(1) - 1
+	if newID < db.jumpIDReserved.Load() {
+		return newID, nil
+	}
+	db.jumpReserveMu.Lock()
+	defer db.jumpReserveMu.Unlock()
+	if newID < db.jumpIDReserved.Load() {
+		return newID, nil
+	}
+	target := newID + jumpIDReservationChunk
 	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, newID+1)
-	return newID, os.WriteFile(db.nextJumpIDPath, buf, 0644)
+	binary.BigEndian.PutUint32(buf, target)
+	if err := os.WriteFile(db.nextJumpIDPath, buf, 0644); err != nil {
+		return 0, err
+	}
+	db.jumpIDReserved.Store(target)
+	return newID, nil
 }
 
 func (db *Database) createJump(bytes []byte, hasTerminal bool, terminalKey uint64, terminalHidden bool, nextTableID uint32) (uint32, error) {
@@ -72,9 +178,21 @@ func (db *Database) loadJump(id uint32) (*JumpNode, error) {
 		return nil, err
 	}
 
+	if cached, ok := db.jumpNodes.get(id); ok {
+		return cached.clone(), nil
+	}
+
 	node, err := db.loadJumpFromIndexLocked(id)
 	if err == nil {
-		return node, nil
+		db.jumpNodes.put(node)
+		return node.clone(), nil
+	}
+
+	// I file `<id>.jump` sono il formato vecchio: se all'apertura non ce n'era
+	// nessuno, non ne comparirà uno adesso e il fallback è solo una open in più
+	// per ogni jump che manca davvero.
+	if !db.jumpLegacyFiles {
+		return nil, err
 	}
 
 	legacy, legacyErr := db.loadJumpFromLegacyFileLocked(id)
@@ -92,23 +210,14 @@ func (db *Database) loadJump(id uint32) (*JumpNode, error) {
 	if writeErr := db.writeJumpLocked(legacy); writeErr == nil {
 		_ = db.deleteLegacyJumpFileLocked(id)
 	}
-	return legacy, nil
+	db.jumpNodes.put(legacy)
+	return legacy.clone(), nil
 }
 
 func (db *Database) loadJumpFromIndexLocked(id uint32) (*JumpNode, error) {
-	indexFile, err := os.Open(db.jumpIndexPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
-		}
-		return nil, err
-	}
-	defer indexFile.Close()
-
 	offsetBuf := make([]byte, 8)
 	pos := idToIndex(id)
-	_, err = indexFile.ReadAt(offsetBuf, pos)
-	if err != nil {
+	if _, err := db.jumpIndexFile.ReadAt(offsetBuf, pos); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
 		}
@@ -120,38 +229,13 @@ func (db *Database) loadJumpFromIndexLocked(id uint32) (*JumpNode, error) {
 	if offsetRaw == 0 {
 		// Backward compatibility: the very first jump written before offset+1 encoding
 		// used offset 0. Only attempt that slot when it exists and only for ID 1.
-		dataFile, err := os.Open(db.jumpDataPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
-			}
-			return nil, err
-		}
-		defer dataFile.Close()
-		if id != 1 {
+		if id != 1 || db.jumpDataEnd == 0 {
 			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
 		}
-		info, err := dataFile.Stat()
-		if err != nil {
-			return nil, err
-		}
-		if info.Size() == 0 {
-			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
-		}
-		return decodeJumpAt(dataFile, 0, id)
+		return decodeJumpAt(db.jumpDataFile, 0, id)
 	}
-	offset := int64(offsetRaw - 1)
 
-	dataFile, err := os.Open(db.jumpDataPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
-		}
-		return nil, err
-	}
-	defer dataFile.Close()
-
-	return decodeJumpAt(dataFile, offset, id)
+	return decodeJumpAt(db.jumpDataFile, int64(offsetRaw-1), id)
 }
 
 func (db *Database) writeJump(node *JumpNode) error {
@@ -190,31 +274,23 @@ func (db *Database) writeJumpLocked(node *JumpNode) error {
 	offset += 8
 	binary.BigEndian.PutUint32(buf[offset:], node.NextTableID)
 
-	dataFile, err := os.OpenFile(db.jumpDataPath, os.O_CREATE|os.O_WRONLY, 0644)
+	// Il file dei dati è append-only: la coda è nota in memoria e non va
+	// richiesta al filesystem a ogni scrittura (era una Seek per jump).
+	dataOffset := db.jumpDataEnd
+	written, err := db.jumpDataFile.WriteAt(buf, dataOffset)
 	if err != nil {
 		return err
 	}
-	defer dataFile.Close()
-
-	dataOffset, err := dataFile.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
-	}
-	if _, err := dataFile.Write(buf); err != nil {
-		return err
-	}
-
-	indexFile, err := os.OpenFile(db.jumpIndexPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	defer indexFile.Close()
+	db.jumpDataEnd = dataOffset + int64(written)
 
 	offsetBuf := make([]byte, 8)
 	// Store offset+1 so zero stays reserved for "missing".
 	binary.BigEndian.PutUint64(offsetBuf, uint64(dataOffset)+1)
-	_, err = indexFile.WriteAt(offsetBuf, idToIndex(node.ID))
-	return err
+	if _, err := db.jumpIndexFile.WriteAt(offsetBuf, idToIndex(node.ID)); err != nil {
+		return err
+	}
+	db.jumpNodes.put(node.clone())
+	return nil
 }
 
 func (db *Database) deleteJump(id uint32) error {
@@ -228,31 +304,88 @@ func (db *Database) deleteJump(id uint32) error {
 	if err := db.zeroJumpIndexLocked(id); err != nil {
 		return err
 	}
-	if err := db.deleteLegacyJumpFileLocked(id); err != nil {
-		return err
+	db.jumpNodes.drop(id)
+	if db.jumpLegacyFiles {
+		if err := db.deleteLegacyJumpFileLocked(id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
+// ensureJumpStoreLocked apre lo store una volta sola e tiene i due handle
+// aperti per la vita del database. Prima riapriva (e ri-statava) i file a ogni
+// load e a ogni write: su un ingest di migliaia di archi era il 50% del tempo
+// totale, tutto in open(2).
 func (db *Database) ensureJumpStoreLocked() error {
+	if db.jumpStoreReady {
+		return nil
+	}
 	if err := os.MkdirAll(db.jumpDir, 0755); err != nil {
 		return err
 	}
-	if _, err := os.Stat(db.jumpDataPath); os.IsNotExist(err) {
-		if err := os.WriteFile(db.jumpDataPath, nil, 0644); err != nil {
-			return err
-		}
-	} else if err != nil {
+	dataFile, err := os.OpenFile(db.jumpDataPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(db.jumpIndexPath); os.IsNotExist(err) {
-		if err := os.WriteFile(db.jumpIndexPath, nil, 0644); err != nil {
-			return err
-		}
-	} else if err != nil {
+	indexFile, err := os.OpenFile(db.jumpIndexPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		dataFile.Close()
 		return err
 	}
+	info, err := dataFile.Stat()
+	if err != nil {
+		dataFile.Close()
+		indexFile.Close()
+		return err
+	}
+	db.jumpDataFile = dataFile
+	db.jumpIndexFile = indexFile
+	db.jumpDataEnd = info.Size()
+	db.jumpLegacyFiles = jumpLegacyFilesPresent(db.jumpDir)
+	if db.jumpNodes == nil {
+		db.jumpNodes = newJumpCache(defaultJumpCacheEntries)
+	}
+	db.jumpStoreReady = true
 	return nil
+}
+
+// closeJumpStore rilascia gli handle allo spegnimento. I dati sono già nel page
+// cache del sistema: come prima, non c'è fsync per singolo jump.
+func (db *Database) closeJumpStore() {
+	db.jumpMu.Lock()
+	defer db.jumpMu.Unlock()
+	if db.jumpDataFile != nil {
+		db.jumpDataFile.Close()
+		db.jumpDataFile = nil
+	}
+	if db.jumpIndexFile != nil {
+		db.jumpIndexFile.Close()
+		db.jumpIndexFile = nil
+	}
+	db.jumpNodes = nil
+	db.jumpStoreReady = false
+}
+
+// jumpLegacyFilesPresent dice se la cartella contiene ancora jump nel formato a
+// file singolo. Si guarda una volta all'apertura: nuovi file di quel formato non
+// vengono più creati da nessuna parte.
+func jumpLegacyFilesPresent(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// Non poter leggere la cartella non è una prova che i legacy non ci
+		// siano: si tiene il fallback, che è solo più lento.
+		return true
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if filepath.Ext(entry.Name()) == ".jump" {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *Database) loadJumpFromLegacyFileLocked(id uint32) (*JumpNode, error) {
@@ -305,14 +438,8 @@ func (db *Database) deleteLegacyJumpFileLocked(id uint32) error {
 }
 
 func (db *Database) zeroJumpIndexLocked(id uint32) error {
-	indexFile, err := os.OpenFile(db.jumpIndexPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	defer indexFile.Close()
-
 	zero := make([]byte, 8)
-	_, err = indexFile.WriteAt(zero, idToIndex(id))
+	_, err := db.jumpIndexFile.WriteAt(zero, idToIndex(id))
 	return err
 }
 

@@ -108,6 +108,23 @@ it *before* the `SCAN` refactor, with expectations captured from a server runnin
 the way the `DEL`/`JOB` expectations were.
 
 # Done (implemented + verified by tests — do not re-add):
+- **The jump store stopped reopening its files on every operation.** `jumps.bin` and `index.bin` are
+  now opened once per database and held (`ensureJumpStoreLocked` is a one-shot initialiser,
+  `closeJumpStore` releases them from `shutdown`), the append offset lives in memory instead of being
+  re-derived with a `Seek(0, SeekEnd)` per write, resolved nodes sit in a `jumpCache` LRU, and the
+  `.jump` legacy fallback is only attempted when such files were actually present at open. ID
+  allocation for both jumps and pair tables reserves a block and persists its **end** before handing
+  out the first id in it, replacing a full `os.WriteFile` per allocation — a crash can burn unused
+  ids but can never re-issue a live one (`TestJumpIDsNeverRepeatAcrossReopen`).
+  The profile that prompted this: on a 4 000-edge `GRAPH_EDGE_SET_BATCH` ingest, `syscall.syscall`
+  was 80% of CPU and `os.OpenFile`/`os.Open` alone 53%, all under `loadJump`/`createJump`/`writeJump`.
+  Cost per edge went **19.4 ms → 0.54 ms** (`CHEETAH_GRAPH_TERM_INDEX=0`, macOS/APFS), and the
+  image-sign-db ingest that motivated it went from 95 s to 6.7 s per image. Covered by
+  [`src/jump_store_test.go`](src/jump_store_test.go) — id reuse across reopen, cache coherence across
+  rewrite/delete, and the legacy-file backfill.
+  Known, pre-existing and untouched: `deleteJump(1)` does not hide jump id 1, because
+  `loadJumpFromIndexLocked` still reads a raw offset of 0 for that one id as "the very first jump"
+  rather than as the missing marker.
 - **Equal-size `INSERT`s now reserve distinct value slots before the asynchronous write.** Each
   `ValuesTable` seeds an atomic high-water mark from its file once at open and `ReserveEntry`
   advances it before `WriteAt` queues bytes. `getAvailableLocation` still consumes recycled slots
