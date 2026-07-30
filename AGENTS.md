@@ -877,15 +877,29 @@ nodes are reused — keep automated runs to a few hundred edges.
 ### Pair-trie namespaces + scan/summary — Shipped
 
 - **Behavior:** `PAIR_SET`/`PAIR_GET`/`PAIR_DEL`/`PAIR_SET_HIDDEN` bind byte prefixes to keys;
-  `PAIR_SCAN` streams ordered slices with cursors; `PAIR_SUMMARY` aggregates fan-out/payload stats;
-  `PAIR_PURGE` batch-wipes a namespace. Unique suffixes collapse into jump nodes.
+  `PAIR_PUT_BATCH` stores and binds many pairs in one request; `PAIR_SCAN` streams ordered slices
+  with cursors; `PAIR_SUMMARY` aggregates fan-out/payload stats; `PAIR_PURGE` batch-wipes a
+  namespace. Unique suffixes collapse into jump nodes.
 - **Flow & owners:** [`database.go`](src/database.go) (`insertPairAt`, `PairScanWithOptions`,
-  `PairSummaryWithOptions`) + [`pair_codec.go`](src/pair_codec.go) + [`jump_store.go`](src/jump_store.go).
+  `PairSummaryWithOptions`) + [`pair_codec.go`](src/pair_codec.go) + [`jump_store.go`](src/jump_store.go)
+  + [`pair_batch.go`](src/pair_batch.go) (`handlePairPutBatch`).
 - **Constraints:** cursor continuation is positional (`PAIR_SCAN <prefix> <limit> <cursor>`);
   `include_hidden=1` surfaces hidden terminals. **Gaps:** rolling-hash/Top-K digests are roadmap
   ([`NEXT_STEPS.md`](NEXT_STEPS.md)).
 - **Mutations share one lock.** `PAIR_SET`/`PAIR_SET_HIDDEN` and delete/purge paths take
   `pairMutationMu` around the complete trie mutation. Reads and scans do not take it.
+- **`PAIR_PUT_BATCH` removes requests, not per-record work — and that is a smaller win than it
+  sounds.** It calls `persistPayload` + `setPairValue` per item, so each item still takes
+  `pairMutationMu` exactly as a single `PAIR_SET` would, and the total server-side work is unchanged.
+  Measured against `INSERT`+`PAIR_SET` from a client that pipelines (256 concurrent writes over a
+  4-connection pool), 2 000 rows took 1.63 s batched versus 1.53 s unbatched — **0.94×, no speedup**.
+  A pipelining client has already hidden the round-trip latency, so what is left is the write cost
+  itself. Use this command for what it actually gives: one request instead of 2N, which matters for a
+  client that cannot pipeline, for a high-latency link, and for keeping request/parse overhead down.
+  Do not reach for it expecting throughput.
+- **`PAIR_PUT_BATCH` is not a transaction.** A failure part-way leaves the earlier items written,
+  which is why the reply reports `applied` and `failed` instead of one status. Callers must treat
+  `failed > 0` as an error; a partial batch is an index with holes in it.
 - **A page is a page: complete, ordered, and resumable.** `PAIR_SCAN` keeps the smallest `limit+1`
   keys above the cursor in a bounded heap and prunes any branch whose path already exceeds the
   largest kept — a subtree can only contain keys ≥ its path, so the cut is sound whatever the visit
@@ -1252,6 +1266,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Concurrent shared-prefix `PAIR_SET` retains every acknowledged mapping | [`TestConcurrentPairSetSharedAncestors`](src/pair_scan_test.go) |
 | Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](src/pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](src/pair_scan_test.go) |
 | `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](src/pair_scan_test.go) |
+| `PAIR_PUT_BATCH`: pairs readable after a batch, indistinguishable from single writes, `x<HEX>` fields, per-item failure counts, stop-at-first-failure vs `continue_on_error`, opt-in assigned keys, malformed-request and item-cap rejection, dispatcher routing | [`pair_batch_test.go`](src/pair_batch_test.go) (8 tests) |
 | Cursor pagination returns every key once, any page size | [`TestPairScanCursorPagination`](src/pair_scan_test.go) |
 | `ManagedFile` handle + sector-cache lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](src/file_manager_test.go) |
 | Repeated shutdown: `Database.Close` / `Engine.Close` are idempotent | [`TestDatabaseCloseIsIdempotent`](src/lifecycle_test.go), [`TestEngineCloseIsIdempotent`](src/lifecycle_test.go) |
