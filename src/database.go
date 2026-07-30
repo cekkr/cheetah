@@ -1496,6 +1496,8 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response, err = db.PairSet(value, absKey)
+	case command == "PAIR_PUT_BATCH":
+		response, err = db.handlePairPutBatch(args)
 	case command == "PAIR_SET_HIDDEN":
 		setArgs := strings.SplitN(args, " ", 2)
 		if len(setArgs) < 2 {
