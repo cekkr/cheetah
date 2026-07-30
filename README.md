@@ -134,6 +134,23 @@ settings. A `pairs/` directory written before this format existed is refused at 
 The binary prints `[cheetah_data/default]>` when ready. Use `DATABASE <name>` (CLI) to switch between
 logical databases or send the same command over TCP.
 
+### Client libraries
+
+The protocol is plain text over TCP, so any language can speak it with a socket — but the encoding
+rules below (a leading `x` meaning hex, `value=` running to end of line, cursors that must travel
+back verbatim) are easy to get subtly wrong. `binders/` holds clients that already handle them:
+
+- **Node.js** — [`binders/nodejs/`](binders/nodejs/), dependency-free CommonJS, Node 18+. Pooled
+  client, KV/graph helpers, key primitives and a subclassable `CheetahDatabase`. See
+  [its README](binders/nodejs/README.md).
+
+```js
+const { CheetahPool, kv } = require('./binders/nodejs');
+const pool = new CheetahPool({ port: 4455, database: 'app' });
+await pool.connect();
+await kv.putJson(pool, 'user:42', { name: 'Ada' }, { upsert: true });
+```
+
 ## Command Reference
 
 Every command is **one line in, one line out**. A response opens with `SUCCESS` or `ERROR,<reason>`

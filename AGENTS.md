@@ -10,7 +10,9 @@ prediction tables, and cluster-fork scheduling.
 
 **Repository layout:** [`src/`](src/) holds the whole server (`package main`, all `*.go` and `*_test.go`
 of the engine); [`gold/`](gold/) and [`demo/graph-nell/`](demo/graph-nell/) are separate `package main`
-build targets; everything else at the root is docs, config, and the build script. Build with
+build targets; [`binders/`](binders/) holds **client** libraries for this server, one directory per
+language ([`binders/nodejs/`](binders/nodejs/) today) — no Go, not part of the binary; everything
+else at the root is docs, config, and the build script. Build with
 `go build -o cheetah-server ./src`, test with `go test ./src`.
 
 This file is the fast-access operational map for agents working in this repository. Read it before
@@ -871,6 +873,41 @@ automated runs to a few hundred edges. **The rates originally recorded here (~30
 went from 19.4 ms to 0.54 ms on a synthetic benchmark once `jumps.bin`/`index.bin` stopped being
 reopened per operation. Re-measure before quoting a NELL figure.
 
+### Client binders
+
+#### [`binders/nodejs/`](binders/nodejs/)
+
+The **Node.js binder** — a dependency-free CommonJS client for this server, living in this repository
+rather than in each consumer, because a protocol description kept in two places diverges in silence.
+Its handbook is [`binders/nodejs/README.md`](binders/nodejs/README.md).
+
+Four layers, each usable alone: [`lib/protocol.js`](binders/nodejs/lib/protocol.js) (pure codec —
+`buildCommand`, `parseResponse`, `parseItems`, `parseCursor`, `encodeArgument`, `rawArgument`),
+[`lib/client.js`](binders/nodejs/lib/client.js) (`CheetahClient`, one socket with FIFO response
+matching and bounded pipelining; `CheetahPool`, which spreads, leases and broadcasts),
+[`lib/kv.js`](binders/nodejs/lib/kv.js) + [`lib/graph.js`](binders/nodejs/lib/graph.js) (free
+functions over a connection), and [`lib/database.js`](binders/nodejs/lib/database.js)
+(`CheetahDatabase` — a subclassable handle holding the plumbing every application otherwise
+rewrites: pool construction, a layout-version guard on connect, a `close` that only closes a pool it
+owns, a per-key mutation chain, collision-checked id allocation, namespace payload accounting). Plus
+[`lib/keys.js`](binders/nodejs/lib/keys.js) (fixed-width hex and integer bucketing),
+[`lib/vocabulary.js`](binders/nodejs/lib/vocabulary.js) (a persisted string→uint32 allocator) and
+[`lib/server.js`](binders/nodejs/lib/server.js) (spawns this repository's binary for tests, building
+it if missing).
+
+- **It is a client, not part of the server binary.** `go build ./...` never sees it. It is also not
+  published to npm from here; consumers vendor the repository (usually as a git submodule) and
+  `require` the directory.
+- **Common mistakes:** the binder encodes the protocol's traps — a leading `x` decoded as hex, a
+  `next_cursor` that must travel back verbatim, `value=` owning the rest of a response line,
+  `GRAPH_*` splitting on whitespace, the 32-seed `GRAPH_RECALL` cap. **Any change to those on the Go
+  side is a change here too**, and the binder's tests are where a client would first notice.
+- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — codec, key
+  primitives, and `CheetahDatabase` against an in-memory stand-in that speaks the same line
+  protocol. `CHEETAH_INTEGRATION=1` additionally builds the server and round-trips against it
+  ([`test/integration.test.js`](binders/nodejs/test/integration.test.js)). These are **not** part of
+  `go test ./src`; run them when you change a command's response shape.
+
 ### Runtime / generated (never edited or committed)
 
 - `cheetah-server` — the built binary (`.gitignore`d).
@@ -1155,6 +1192,11 @@ plus the two front-end handlers. There is no generated API manifest.
 Full argument syntax and response grammar live in [`README.md`](README.md#command-reference); verify
 any command against the switch before relying on the README.
 
+On the client side of the same surface, [`binders/nodejs/lib/protocol.js`](binders/nodejs/lib/protocol.js)
+owns the encode/parse half and [`binders/nodejs/lib/kv.js`](binders/nodejs/lib/kv.js) /
+[`graph.js`](binders/nodejs/lib/graph.js) own the per-command spellings. Changing a response line
+without changing them ships a client that parses the old one.
+
 ---
 
 ## Build, run, test, and debug
@@ -1196,6 +1238,16 @@ go test -race ./src              # required for the ManagedFile handle-lifecycle
 ```
 ```bash
 go vet ./... && gofmt -l .       # both silent on a clean tree
+```
+
+Test the Node binder ([`binders/nodejs/`](binders/nodejs/) — a client, so `go test` never sees it;
+needs Node 18+, no npm install):
+
+```bash
+cd binders/nodejs && node --test test/*.test.js
+```
+```bash
+cd binders/nodejs && CHEETAH_INTEGRATION=1 node --test test/*.test.js   # builds + boots the server
 ```
 
 Throughput benchmark (writes a client-rotated log; long-running):
@@ -1318,6 +1370,10 @@ seen in old docs are **client-side**; the server does not read them.
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go) |
 | Graph-NELL demo eval/loader math (AUC/AP/P@K, models, split, loader) | [`TestRankingMetrics`/`TestBuildModels`/`TestLoadNELLEdges`/…](demo/graph-nell/main_test.go) |
 | End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
+| Node binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors | [`binders/nodejs/test/protocol.test.js`](binders/nodejs/test/protocol.test.js) (`node --test`) |
+| Node binder: fixed-width hex ordering, integer bucketing and tolerance sweeps | [`binders/nodejs/test/keys.test.js`](binders/nodejs/test/keys.test.js) |
+| Node binder: `CheetahDatabase` layout guard, mutation chain, id allocation, accounting | [`binders/nodejs/test/database.test.js`](binders/nodejs/test/database.test.js) |
+| Node binder against a live server (KV, batch, scan paging, recall, reset, pipelining) | [`binders/nodejs/test/integration.test.js`](binders/nodejs/test/integration.test.js) (`CHEETAH_INTEGRATION=1`) |
 
 **Known test gaps:** no focused coverage for prediction-table train/inherit, cluster
 scheduling/gossip, the payload cache, or cursor pagination edge cases. Jump split/promote cycles are
@@ -1367,6 +1423,12 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - Prediction tables with context-matrix train/query/inherit and CPU merge path.
 - Managed-file layer, payload cache, resource monitor, `SYSTEM_STATS`/`LOG_FLUSH`/`FILE_CHECKPOINT`.
 - Cluster topology registration, fork assignment, gossip, and `CLUSTER_MOVE` payload transfer.
+- **Node.js binder** ([`binders/nodejs/`](binders/nodejs/)) — dependency-free client: codec, pooled
+  TCP client, KV/graph helpers, key primitives, token vocabulary, subclassable `CheetahDatabase`,
+  and a test-server launcher. Verified by its own suite (42 unit tests) plus a live round-trip
+  against a spawned server (`CHEETAH_INTEGRATION=1`, 15 subtests: KV, UTF-8 payloads, batch writes,
+  cursor paging, the `continuations` reducer, vocabulary allocation, `GRAPH_RECALL` convergence,
+  subclass lifecycle, layout-mismatch refusal, `RESET_DB` across a pool, pipelining).
 
 ### Experimental / scaffold
 
@@ -1435,5 +1497,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 | Add a config key / env var | Update [`config.go`](src/config.go) subsection + [Configuration reference](#configuration-reference). |
 | Change an on-disk format | Update [contracts](#critical-implementation-contracts) + [data boundaries](#data-security-privacy-and-compatibility-boundaries) + migration note. |
 | Add/move a test | Update [test ownership map](#test-ownership-map) and known gaps. |
+| Change a command's response shape or argument encoding | Update every [client binder](#client-binders) that spells it, and run the binder's own tests — the Go suite will not catch a client that still parses the old line. |
+| Add a binder, or change a binder's public surface | Add/rewrite its subsection under [Client binders](#client-binders) + its own README; list its tests in the [test ownership map](#test-ownership-map). |
 | Fix/discover a recurring bug | Add or consolidate a pitfall entry; keep active defects under [Known Gaps](#known-gaps). |
 | Implement a `NEXT_STEPS.md` item | Move it to Shipped only after code + test verification. |

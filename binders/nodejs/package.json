@@ -1,0 +1,40 @@
+{
+  "name": "cheetah-db",
+  "version": "0.1.0",
+  "description": "Node.js binder for cheetah-db: protocol codec, pooled TCP client, KV/graph helpers and a subclassable database handle.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./protocol": "./lib/protocol.js",
+    "./client": "./lib/client.js",
+    "./kv": "./lib/kv.js",
+    "./graph": "./lib/graph.js",
+    "./keys": "./lib/keys.js",
+    "./vocabulary": "./lib/vocabulary.js",
+    "./database": "./lib/database.js",
+    "./server": "./lib/server.js"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:integration": "CHEETAH_INTEGRATION=1 node --test test/*.test.js"
+  },
+  "keywords": [
+    "cheetah",
+    "cheetah-db",
+    "key-value",
+    "graph",
+    "database",
+    "client"
+  ],
+  "dependencies": {}
+}
