@@ -880,7 +880,12 @@ nodes are reused — keep automated runs to a few hundred edges.
   `PAIR_PUT_BATCH` stores and binds many pairs in one request; `PAIR_SCAN` streams ordered slices
   with cursors; `PAIR_SUMMARY` aggregates fan-out/payload stats; `PAIR_PURGE` batch-wipes a
   namespace. Unique suffixes collapse into jump nodes.
+  `PAIR_PUT_BATCH` stores and binds many pairs in one request; `PAIR_SCAN` streams ordered slices
+  with cursors; `PAIR_SUMMARY` aggregates fan-out/payload stats; `PAIR_PURGE` batch-wipes a
+  namespace. Unique suffixes collapse into jump nodes.
 - **Flow & owners:** [`database.go`](src/database.go) (`insertPairAt`, `PairScanWithOptions`,
+  `PairSummaryWithOptions`) + [`pair_codec.go`](src/pair_codec.go) + [`jump_store.go`](src/jump_store.go)
+  + [`pair_batch.go`](src/pair_batch.go) (`handlePairPutBatch`).
   `PairSummaryWithOptions`) + [`pair_codec.go`](src/pair_codec.go) + [`jump_store.go`](src/jump_store.go)
   + [`pair_batch.go`](src/pair_batch.go) (`handlePairPutBatch`).
 - **Constraints:** cursor continuation is positional (`PAIR_SCAN <prefix> <limit> <cursor>`);
@@ -1266,6 +1271,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Concurrent shared-prefix `PAIR_SET` retains every acknowledged mapping | [`TestConcurrentPairSetSharedAncestors`](src/pair_scan_test.go) |
 | Prefixes ending mid-branch at stride 2 (scan + summary) | [`TestPairScanMidChunkPrefix`](src/pair_scan_test.go), [`TestPairScanPrefixParityAcrossStrides`](src/pair_scan_test.go) |
 | `PAIR_SUMMARY` completes with a saturated task queue | [`TestPairSummaryDrainsSaturatedQueue`](src/pair_scan_test.go) |
+| `PAIR_PUT_BATCH`: pairs readable after a batch, indistinguishable from single writes, `x<HEX>` fields, per-item failure counts, stop-at-first-failure vs `continue_on_error`, opt-in assigned keys, malformed-request and item-cap rejection, dispatcher routing | [`pair_batch_test.go`](src/pair_batch_test.go) (8 tests) |
 | `PAIR_PUT_BATCH`: pairs readable after a batch, indistinguishable from single writes, `x<HEX>` fields, per-item failure counts, stop-at-first-failure vs `continue_on_error`, opt-in assigned keys, malformed-request and item-cap rejection, dispatcher routing | [`pair_batch_test.go`](src/pair_batch_test.go) (8 tests) |
 | Cursor pagination returns every key once, any page size | [`TestPairScanCursorPagination`](src/pair_scan_test.go) |
 | `ManagedFile` handle + sector-cache lifecycle under concurrent IO (`-race`) | [`TestManagedFileConcurrentHandleLifecycle`](src/file_manager_test.go) |
