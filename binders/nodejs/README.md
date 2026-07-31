@@ -26,7 +26,7 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `protocol` | Pure codec. `buildCommand`, `buildKeyValueCommand`, `parseResponse`, `parseItems`, `parseCursor`, `decodePayload`, `encodeArgument`, `rawArgument`. No socket, no state. |
 | `client` | `CheetahClient` (one socket, FIFO response matching, pipelining, reconnect) and `CheetahPool` (spread, lease, broadcast). |
 | `kv` | The two-step write and its reads: `putValue`/`getValue`, `putJson`/`getJson`, `putJsonBatch`, `deletePair`, `scanPage`/`scanPrefix`/`scanAll`. |
-| `graph` | `setNode`, `getNode`, `setEdgeBatch`, `degree`, `recall`, `recallBatched`. |
+| `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `similar`, `termIndex`. Plus a pure `build*` for each command, for callers assembling their own batch. |
 | `keys` | Key-building primitives: fixed-width `hex`/`unhex`, `sha1`, and integer `quantize`/`bucketize`/`bucketSweep`. |
 | `vocabulary` | `TokenVocabulary` — a persisted string → uint32 allocator, both directions. |
 | `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it. |
@@ -60,6 +60,17 @@ to prevent.
   space, so anything free-form travels base64 (`graph.encodeJsonArgument`).
   `GRAPH_RECALL` also caps seeds at 32 per call; `recallBatched` batches above
   that and merges with the same noisy-OR the server uses within a batch.
+- **Omitting a graph field preserves it; clearing it is a different spelling.**
+  `GRAPH_NODE_SET` keeps stored labels/props/references when the argument is
+  absent, so `references: undefined` is "leave them alone" and `references:
+  null` is the `-` that empties them. Passing `[]` writes an empty list, which
+  is a third thing again. The same asymmetry is why flags must be `1`/`0`: a
+  JavaScript `false` stringified as `false` is not a flag the server reads.
+- **A batch is not a transaction.** `GRAPH_EDGE_SET_BATCH` reports
+  `requested`/`applied`/`failed` and can succeed with edges missing;
+  `setEdgeBatch` returns that accounting rather than a boolean, and its optional
+  `chunkSize` is off by default because splitting a list changes what a partial
+  failure leaves behind.
 - **The socket speaks latin1** for byte transparency, so UTF-8 payloads are
   transcoded at both edges (`kv.toWire`/`kv.fromWire`). Skipping that mangles
   any non-ASCII string you store.

@@ -887,7 +887,11 @@ Four layers, each usable alone: [`lib/protocol.js`](binders/nodejs/lib/protocol.
 [`lib/client.js`](binders/nodejs/lib/client.js) (`CheetahClient`, one socket with FIFO response
 matching and bounded pipelining; `CheetahPool`, which spreads, leases and broadcasts),
 [`lib/kv.js`](binders/nodejs/lib/kv.js) + [`lib/graph.js`](binders/nodejs/lib/graph.js) (free
-functions over a connection), and [`lib/database.js`](binders/nodejs/lib/database.js)
+functions over a connection; `graph.js` covers the whole `GRAPH_*` surface — nodes with
+`references`, edges single and batched, `neighbors`/`neighborsAll`/`neighborTypes`/`degree`,
+`query`, `recall`/`recallBatched`, `similar`, `termIndex` — and exports a pure `build*` for each,
+so a caller that writes several commands to a connection as one batch shares the binder's encoding
+instead of re-deriving base64 and `x<hex>`), and [`lib/database.js`](binders/nodejs/lib/database.js)
 (`CheetahDatabase` — a subclassable handle holding the plumbing every application otherwise
 rewrites: pool construction, a layout-version guard on connect, a `close` that only closes a pool it
 owns, a per-key mutation chain, collision-checked id allocation, namespace payload accounting). Plus
@@ -901,11 +905,14 @@ it if missing).
   `require` the directory.
 - **Common mistakes:** the binder encodes the protocol's traps — a leading `x` decoded as hex, a
   `next_cursor` that must travel back verbatim, `value=` owning the rest of a response line,
-  `GRAPH_*` splitting on whitespace, the 32-seed `GRAPH_RECALL` cap. **Any change to those on the Go
-  side is a change here too**, and the binder's tests are where a client would first notice.
+  `GRAPH_*` splitting on whitespace, the 32-seed `GRAPH_RECALL` cap, `GRAPH_NODE_SET`'s three-way
+  distinction between an omitted field (preserve), `-` (clear) and an empty list, and flags that must
+  be `1`/`0` rather than a stringified `false`. **Any change to those on the Go side is a change here
+  too**, and the binder's tests are where a client would first notice.
 - **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — codec, key
-  primitives, and `CheetahDatabase` against an in-memory stand-in that speaks the same line
-  protocol. `CHEETAH_INTEGRATION=1` additionally builds the server and round-trips against it
+  primitives, the `GRAPH_*` command spellings
+  ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), and `CheetahDatabase` against an
+  in-memory stand-in that speaks the same line protocol. `CHEETAH_INTEGRATION=1` additionally builds the server and round-trips against it
   ([`test/integration.test.js`](binders/nodejs/test/integration.test.js)). These are **not** part of
   `go test ./src`; run them when you change a command's response shape.
 
