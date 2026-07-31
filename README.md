@@ -151,6 +151,17 @@ await pool.connect();
 await kv.putJson(pool, 'user:42', { name: 'Ada' }, { upsert: true });
 ```
 
+- **Python** — [`binders/python/`](binders/python/), standard library only, Python 3.10+. The same
+  layering for a threaded host: one socket per thread, KV/graph/job/prediction/admin helpers, key
+  primitives and a subclassable `CheetahDatabase`. See [its README](binders/python/README.md).
+
+```python
+from cheetah_db import CheetahClient, kv
+
+with CheetahClient("127.0.0.1", 4455, database="app") as conn:
+    kv.put_json(conn, "user:42", {"name": "Ada"}, upsert=True)
+```
+
 ## Command Reference
 
 Every command is **one line in, one line out**. A response opens with `SUCCESS` or `ERROR,<reason>`

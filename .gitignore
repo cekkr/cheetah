@@ -5,6 +5,11 @@ cheetah_data/*
 binders/nodejs/node_modules/
 binders/nodejs/package-lock.json
 
+# The Python binder likewise: caches and editable installs are local artifacts.
+binders/python/**/__pycache__/
+binders/python/*.egg-info/
+binders/python/.venv/
+
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
