@@ -365,6 +365,22 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
 - **Lifecycle / tables:** `NewDatabase` (creates `pairs/` + `pair_jumps/`, wires cache, file manager,
   scheduler, reducers, prediction store), `Close`, `getValuesTable`, `getRecycleTable`, `getPairTable`,
   `pairTableCache` (fd-bounded LRU of open `PairTable`s via `resolvePairTableLimit`).
+- **The fd margin is proportional, and that was the bug.** `resolvePairTableLimit` returns
+  `max_pair_tables` when configured, else `soft - max(soft/8, 128)` clamped into
+  `[minPairTableLimit, maxPairTableLimit]` (64 … 65536). Pair tables are not the process's only
+  files — values, recycle, main-keys, the jump store, TCP sockets and the Go runtime all need
+  descriptors — so the reserve has to scale with the limit. The old **fixed** `soft - 128` was sized
+  for a 1024-fd Linux box and became pathological where the limit is high: on macOS
+  (`RLIMIT_NOFILE` = `kern.maxfilesperproc` = 61440) it granted 61312 handles to pair tables alone
+  and a heavy ingest died with `too many open files`. It now leaves 7 680 free there.
+- **Do not widen the margin beyond what headroom needs, and keep `maxPairTableLimit` high.**
+  Starving the handle cache costs far more than it saves, because `open(2)` becomes the dominant
+  cost (the same trap already recorded for the jump store). Measured on image-sign-db, 12 images ×
+  3600 constellations, macOS, soft limit 61440: an 8192 ceiling gave 13.3 s / 97.9 s / 156.9 s for
+  the first three images and 2135 s overall, degrading as the corpus grew, against 4.0 s and 6.6 s
+  at the full budget. Halving the budget (`soft/2` = 30720) still ran ~2× slower per image than the
+  proportional margin at the same corpus size. `openFileWithReclaim` — not a wide margin — is what
+  makes a generous budget safe.
 - **Trie entry codec:** `entryHasTerminal/entryHasChild/entryHasJump/entryIsHidden`,
   `setEntryTerminal/setEntryChild/setEntryJump` — the bit-level accessors over an 11-byte entry.
 - **Trie mutation:** `insertPairAt`, `insertThroughJump`, `splitJumpWithCommonPrefix`,
@@ -524,6 +540,15 @@ memory-pressure eviction, an fd cap, and a checkpoint controller.
   descriptor mid-IO. Never read the field directly — pass the `*os.File` down (`readWithCache`,
   `writeWithCache`, `getSector`, `ensureSector` all take it as a parameter) and fsync via
   `syncHandle`. Lock order is `handleMu` → `cacheMu`/`pendingMu`, never the reverse.
+- **`open` survives descriptor exhaustion.** The fd cap is enforced asynchronously and only evicts
+  handles at `refCount == 0`, so a burst of opens can still reach the kernel limit. Every open goes
+  through `openFileWithReclaim`, which on `EMFILE`/`ENFILE` (`isFileDescriptorExhaustion`) closes
+  idle handles and retries — up to `handleReclaimAttempts` rounds. Without it the error surfaced at
+  the client as `pair_set_failed` and the write was lost. **`reclaimHandles` must use
+  `tryCloseIdleHandle` (a `TryLock`), never a blocking `closeHandle`**: the caller already holds one
+  file's `handleMu`, so two concurrent opens evicting each other with blocking locks would deadlock.
+  It also skips the `keep` file for the same reason. Best-effort eviction is the point — a busy file
+  is skipped, not waited on.
 - **Sector contract:** `cacheMu` guards the sector *map* and the `dirty` flag; the *contents* of a
   `sectorEntry` are guarded by its own `dataMu`, because two `cacheMu` read locks do not exclude each
   other — two writers to one sector, or a writer against the flusher's copy, would race. Go through
@@ -537,6 +562,11 @@ memory-pressure eviction, an fd cap, and a checkpoint controller.
 
 Build-tagged `fileDescriptorSoftLimit()` used to derive the default open-`PairTable` cap. Unix reads
 `RLIMIT_NOFILE`; Windows returns a safe constant. Edit the pair whose platform you target.
+
+- **The soft limit is not a budget.** It is the whole process's allowance; `resolvePairTableLimit`
+  takes half of it and caps the result. Do not reintroduce a fixed subtraction — see the
+  [`database.go`](src/database.go) entry above. Covered by
+  [`fd_budget_test.go`](src/fd_budget_test.go).
 
 ### Reducers and async jobs
 
@@ -1470,7 +1500,9 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   `CLUSTER_GOSSIP` accepts base64 JSON from peers and applies fork payloads; only enable clustering
   among trusted nodes.
 - **Secrets:** none are stored or expected. Do not add credentials to `config.ini` or this handbook.
-- **Resource limits:** open pair-table handles are capped (`CHEETAH_MAX_PAIR_TABLES`/`RLIMIT_NOFILE`);
+- **Resource limits:** open pair-table handles are capped at `RLIMIT_NOFILE` less a proportional
+  eighth, at most 65536 (`CHEETAH_MAX_PAIR_TABLES` overrides); opens that still hit `EMFILE` evict
+  idle handles and retry;
   caches shed under memory pressure. New unbounded caches or handle pools violate the degradation
   principle.
 

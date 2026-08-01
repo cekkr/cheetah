@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -19,6 +20,14 @@ const (
 	defaultSectorSize       = 4096
 	defaultMaxCachedSectors = 64
 	flushQueueSize          = 1024
+)
+
+const (
+	// Quante volte si riprova ad aprire un file dopo EMFILE, sfrattando handle
+	// inattivi fra un tentativo e l'altro.
+	handleReclaimAttempts = 3
+	// Quanti handle si tenta di liberare per tentativo, come minimo.
+	minHandleReclaimBatch = 64
 )
 
 const (
@@ -454,6 +463,91 @@ func (fm *FileManager) enforceLimit() {
 	}
 }
 
+// isFileDescriptorExhaustion riconosce i due soli errori di open che si
+// risolvono chiudendo descrittori già aperti: EMFILE (limite di processo) e
+// ENFILE (limite di sistema). Ogni altro errore va propagato com'è.
+func isFileDescriptorExhaustion(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
+}
+
+func (fm *FileManager) reclaimBatchSize() int {
+	batch := minHandleReclaimBatch
+	if fm != nil && fm.limit/8 > batch {
+		batch = fm.limit / 8
+	}
+	return batch
+}
+
+// reclaimHandles chiude fino a `target` handle inattivi, dal meno usato di
+// recente, per fare posto a un'apertura che ha risposto EMFILE. Restituisce
+// quanti ne ha liberati.
+//
+// `keep` è il file che sta tentando di aprirsi e viene saltato: il chiamante ne
+// tiene già handleMu. Sugli altri si usa TryLock — mai Lock — perché due
+// aperture concorrenti che si sfrattassero a vicenda con lock bloccanti
+// formerebbero un ciclo di attesa. Saltare un file occupato è accettabile: il
+// recupero è best effort e ha altri candidati.
+func (fm *FileManager) reclaimHandles(keep *ManagedFile, target int) int {
+	if fm == nil || target <= 0 {
+		return 0
+	}
+	type candidate struct {
+		file *ManagedFile
+		last int64
+	}
+	var candidates []candidate
+	fm.files.Range(func(_, value interface{}) bool {
+		file, ok := value.(*ManagedFile)
+		if !ok || file == nil || file == keep {
+			return true
+		}
+		last := file.lastUsed.Load()
+		if last == 0 {
+			// Mai usato: ultimo candidato, non il primo.
+			last = math.MaxInt64
+		}
+		candidates = append(candidates, candidate{file: file, last: last})
+		return true
+	})
+	if len(candidates) == 0 {
+		return 0
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].last < candidates[j].last })
+	released := 0
+	for _, cand := range candidates {
+		if released >= target {
+			break
+		}
+		if cand.file.tryCloseIdleHandle() {
+			released++
+		}
+	}
+	return released
+}
+
+// openFileWithReclaim apre path e, se il kernel risponde EMFILE/ENFILE, chiude
+// handle inattivi e riprova. È il "degrade, don't stall" di questo livello: il
+// cap sui descrittori è applicato in modo asincrono e sfratta solo handle con
+// refCount a zero, quindi una raffica di aperture può comunque toccare il
+// limite. Senza questo recupero l'errore risaliva fino al client come
+// pair_set_failed, perdendo la scrittura.
+func openFileWithReclaim(fm *FileManager, path string, keep *ManagedFile) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err == nil || fm == nil || !isFileDescriptorExhaustion(err) {
+		return file, err
+	}
+	for attempt := 0; attempt < handleReclaimAttempts; attempt++ {
+		if fm.reclaimHandles(keep, fm.reclaimBatchSize()) == 0 {
+			break
+		}
+		file, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+		if err == nil || !isFileDescriptorExhaustion(err) {
+			return file, err
+		}
+	}
+	return nil, err
+}
+
 func (fm *FileManager) ForceCheckpoint(opts FileCheckpointOptions) int {
 	if fm == nil {
 		return 0
@@ -654,7 +748,7 @@ func (mf *ManagedFile) ensureFileExists(preallocate int64) error {
 	if err := os.MkdirAll(filepath.Dir(mf.path), 0755); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(mf.path, os.O_RDWR|os.O_CREATE, 0644)
+	file, err := mf.openWithReclaim()
 	if err != nil {
 		return err
 	}
@@ -665,6 +759,12 @@ func (mf *ManagedFile) ensureFileExists(preallocate int64) error {
 		}
 	}
 	return file.Close()
+}
+
+// openWithReclaim apre il file di questo ManagedFile tollerando l'esaurimento
+// dei descrittori. Non tocca mf.file: chi chiama decide se conservarlo.
+func (mf *ManagedFile) openWithReclaim() (*os.File, error) {
+	return openFileWithReclaim(mf.manager, mf.path, mf)
 }
 
 func (mf *ManagedFile) touch() {
@@ -691,7 +791,7 @@ func (mf *ManagedFile) acquireHandle() (*os.File, func(), error) {
 
 	mf.handleMu.Lock()
 	if mf.file == nil {
-		file, err := os.OpenFile(mf.path, os.O_RDWR|os.O_CREATE, 0644)
+		file, err := mf.openWithReclaim()
 		if err != nil {
 			mf.handleMu.Unlock()
 			return nil, nil, err
@@ -741,6 +841,29 @@ func (mf *ManagedFile) forceCloseHandle() {
 	if mf.manager != nil {
 		mf.manager.handleClosed()
 	}
+}
+
+// tryCloseIdleHandle è closeHandle(force) senza attesa: se handleMu è già preso
+// il file viene saltato invece di bloccare. Serve al recupero da EMFILE, dove
+// chi chiama tiene l'handleMu di un *altro* file e un Lock bloccante aprirebbe
+// un ciclo di attesa fra due aperture concorrenti.
+func (mf *ManagedFile) tryCloseIdleHandle() bool {
+	if mf == nil {
+		return false
+	}
+	if !mf.handleMu.TryLock() {
+		return false
+	}
+	defer mf.handleMu.Unlock()
+	if mf.file == nil || mf.refCount.Load() > 0 {
+		return false
+	}
+	mf.file.Close()
+	mf.file = nil
+	if mf.manager != nil {
+		mf.manager.handleClosed()
+	}
+	return true
 }
 
 func (mf *ManagedFile) closeHandle(force bool) bool {

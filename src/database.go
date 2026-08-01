@@ -158,19 +158,50 @@ func (c *pairTableCache) collectEvictionsLocked() []*PairTable {
 	return victims
 }
 
+// resolvePairTableLimit decide quanti descrittori il file manager può tenere
+// aperti quando max_pair_tables non è configurato.
+//
+// La forma è "il limite meno un margine", ma il margine è *proporzionale*: era
+// quello il difetto, non l'idea. Con una costante di 128 il calcolo funzionava
+// col tipico soft limit Linux di 1024 e diventava patologico dove il limite è
+// alto: su macOS (RLIMIT_NOFILE = kern.maxfilesperproc = 61440) concedeva 61312
+// handle alle sole tabelle pair — tutti tranne 128 — senza lasciare niente a
+// tabelle values e recycle, main_keys, jump store, socket TCP e runtime Go, e
+// un'ingestione intensa arrivava a EMFILE ("too many open files") invece di
+// sfrattare.
+//
+// Il margine non va allargato oltre il necessario: la cache di handle paga, e
+// strozzarla costa molto più di quanto si risparmi, perché open(2) diventa in
+// fretta la voce dominante di CPU (stessa trappola già registrata per il jump
+// store). Misurato su image-sign-db, 12 immagini × 3600 costellazioni, macOS,
+// soft limit 61440: con un tetto a 8192 le prime tre immagini costavano 13,3 s,
+// 97,9 s e 156,9 s — 2135 s in totale, con degrado progressivo — contro 4,0 s e
+// 6,6 s a budget pieno. Riservare un ottavo lascia qui 7 680 descrittori
+// liberi, molti più di quanti ne servano fuori dal file manager, e
+// openFileWithReclaim resta la rete di sicurezza se il conto non tornasse.
+//
+// Il tetto assoluto è solo una difesa contro rlimit patologici, non una
+// manopola di tuning: va tenuto alto.
 func resolvePairTableLimit(configured int) int {
 	if configured > 0 {
 		return configured
 	}
 	limit := fileDescriptorSoftLimit()
-	if limit > 0 {
-		candidate := limit - pairTableSafetyMargin
-		if candidate < minPairTableLimit {
-			candidate = minPairTableLimit
-		}
-		return candidate
+	if limit <= 0 {
+		return defaultPairTableLimit
 	}
-	return defaultPairTableLimit
+	margin := limit / pairTableReserveDivisor
+	if margin < minPairTableReserve {
+		margin = minPairTableReserve
+	}
+	candidate := limit - margin
+	if candidate > maxPairTableLimit {
+		candidate = maxPairTableLimit
+	}
+	if candidate < minPairTableLimit {
+		candidate = minPairTableLimit
+	}
+	return candidate
 }
 
 const (
@@ -181,8 +212,14 @@ const (
 	pairSummaryMaxBranchLimit     = 1024
 	defaultPairTableLimit         = 1024
 	minPairTableLimit             = 64
-	pairTableSafetyMargin         = 128
-	maxJumpReloadAttempts         = 8
+	maxPairTableLimit             = 65536
+	// Quota di RLIMIT_NOFILE lasciata fuori dal file manager — un ottavo — per
+	// socket, jump store, scritture transitorie e runtime. Vedi
+	// resolvePairTableLimit.
+	pairTableReserveDivisor = 8
+	// Il margine proporzionale non scende sotto questo valore sui limiti bassi.
+	minPairTableReserve   = 128
+	maxJumpReloadAttempts = 8
 	// Quanti ID di tabella pair si prenotano per scrittura del contatore.
 	pairTableIDReservationChunk = 256
 )
