@@ -431,8 +431,9 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
   `DATABASE`/`RESET_DB`/`EXIT` are outside all of them. `normalizeCommandResponse` runs on the way
   out and prefixes any response that opens with neither `SUCCESS`, `ERROR` nor `PENDING`.
 - **Lifecycle / tables:** `NewDatabase` (creates `pairs/` + `pair_jumps/`, wires cache, file manager,
-  scheduler, reducers, prediction store), `Close`, `getValuesTable`, `getRecycleTable`, `getPairTable`,
-  `pairTableCache` (fd-bounded LRU of open `PairTable`s via `resolvePairTableLimit`).
+  scheduler, reducers, prediction store, and closes `main_keys.table` on every failed initialization
+  path), `Close`, `getValuesTable`, `getRecycleTable`, `getPairTable`, `pairTableCache` (fd-bounded LRU
+  of open `PairTable`s via `resolvePairTableLimit`).
 - **The fd margin is proportional, and that was the bug.** `resolvePairTableLimit` returns
   `max_pair_tables` when configured, else `soft - max(soft/8, 128)` clamped into
   `[minPairTableLimit, maxPairTableLimit]` (64 … 65536). Pair tables are not the process's only
@@ -1117,7 +1118,8 @@ owns, a per-key mutation chain, collision-checked id allocation, namespace paylo
 [`lib/keys.js`](binders/nodejs/lib/keys.js) (fixed-width hex and integer bucketing),
 [`lib/vocabulary.js`](binders/nodejs/lib/vocabulary.js) (a persisted string→uint32 allocator) and
 [`lib/server.js`](binders/nodejs/lib/server.js) (spawns this repository's binary for tests, building
-it if missing).
+it if missing; `serverBinaryName` selects `cheetah-server.exe` on Windows so the built binary is
+actually spawnable).
 
 - **It is a client, not part of the server binary.** `go build ./...` never sees it. It is also not
   published to npm from here; consumers vendor the repository (usually as a git submodule) and
@@ -1126,9 +1128,11 @@ it if missing).
   `next_cursor` that must travel back verbatim, `value=` owning the rest of a response line,
   `GRAPH_*` splitting on whitespace, the 32-seed `GRAPH_RECALL` cap, `GRAPH_NODE_SET`'s three-way
   distinction between an omitted field (preserve), `-` (clear) and an empty list, and flags that must
-  be `1`/`0` rather than a stringified `false`. **Any change to those on the Go side is a change here
-  too**, and the binder's tests are where a client would first notice.
-- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 99 unit tests:
+  be `1`/`0` rather than a stringified `false`. In particular, binder `BATCH` defaults to continuing
+  while the server defaults to stopping, so `continue_on_error=1` must travel explicitly. **Any
+  change to those on the Go side is a change here too**, and the binder's tests are where a client
+  would first notice.
+- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 118 tests (117 passing + 1 opt-in integration test skipped by default):
   codec, key primitives, the `GRAPH_*` command spellings
   ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), the `RECORD` ones
   ([`test/records.test.js`](binders/nodejs/test/records.test.js)), the job/prediction/admin ones
@@ -1141,7 +1145,7 @@ it if missing).
   ([`lib/server.js`](binders/nodejs/lib/server.js)) builds only when `cheetah-server` is *missing*,
   and the same is true of the Python launcher. An integration run answering `ERROR,unknown_command`
   for a command that exists means the binary predates it — rebuild with
-  `go build -o cheetah-server ./src` rather than hunting the binder.
+  `go build -o cheetah-server ./src` (`cheetah-server.exe` on Windows) rather than hunting the binder.
 
 #### [`binders/python/`](binders/python/)
 
@@ -1158,7 +1162,8 @@ Same layering, adapted to a synchronous, threaded host language:
 destination; the WSL host's address as a fallback candidate),
 [`cheetah_db/client.py`](binders/python/cheetah_db/client.py) (`CheetahClient`, one socket with
 lock-serialized send+receive, reconnect and an *inactivity* grace so a long reducer is not mistaken
-for a dead socket; `ThreadLocalClientPool`, one socket per thread), the free-function layers
+for a dead socket; `ThreadLocalClientPool`, one socket per thread, retaining registered client
+objects across `close_all()` so post-reset reconnects remain owned), the free-function layers
 [`kv.py`](binders/python/cheetah_db/kv.py) (including `PAIR_PUT_BATCH`),
 [`graph.py`](binders/python/cheetah_db/graph.py) (the whole `GRAPH_*` surface),
 [`records.py`](binders/python/cheetah_db/records.py) (the `RECORD` family plus `DEL records`, with
@@ -1170,7 +1175,8 @@ for a dead socket; `ThreadLocalClientPool`, one socket per thread), the free-fun
 [`database.py`](binders/python/cheetah_db/database.py) (`CheetahDatabase`, the subclassable handle).
 Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 [`vocabulary.py`](binders/python/cheetah_db/vocabulary.py) and
-[`server.py`](binders/python/cheetah_db/server.py).
+[`server.py`](binders/python/cheetah_db/server.py) (`server_binary_name` applies the same Windows
+`.exe` rule as the Node launcher).
 
 - **It is a client, not part of the server binary,** and not published to PyPI from here: consumers
   vendor the repository (usually as a git submodule) and put `binders/python` on `sys.path`.
@@ -1180,9 +1186,11 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   payloads travel base64 (`kv.put_bytes`) rather than latin1, because the wire is read as UTF-8.
 - **Common mistakes:** the same protocol traps the Node binder encodes, plus two the batch command
   adds — an item value beginning with `x` is re-read as hex unless escaped, and `PAIR_PUT_BATCH` is
-  not a transaction, so `applied`/`failed` must be checked rather than the status word alone.
+  not a transaction, so `applied`/`failed` must be checked rather than the status word alone. Generic
+  `BATCH` must explicitly send `continue_on_error=1` when using the binders' continue-by-default API;
+  omission means stop-on-error to the server.
 - **Tests:** `python3 -m unittest discover -s tests -t .` from
-  [`binders/python/`](binders/python/) — 124 unit tests: codec, key primitives, KV/graph/record/job
+  [`binders/python/`](binders/python/) — 165 tests (154 passing + 11 opt-in integration tests skipped by default): codec, key primitives, KV/graph/record/job
   and database-operation call shapes, and `CheetahDatabase` against an in-memory stand-in
   ([`tests/fakes.py`](binders/python/tests/fakes.py), which reproduces enough record-table semantics
   to be worth asserting against: append-only offsets, a drop that leaves a hole, a short row reading
@@ -1193,7 +1201,7 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 
 ### Runtime / generated (never edited or committed)
 
-- `cheetah-server` — the built binary (`.gitignore`d).
+- `cheetah-server` / `cheetah-server.exe` — the platform-specific built binary (`.gitignore`d).
 - `cheetah_data/<db>/` — per-database directory: `main_keys.table`, `main_keys.recycle.table`
   (free list of deleted key rows), `values_<size>_<id>.table`,
   `values_<size>.recycle.table` (free list of value slots; both carry the `"CHRL"` header),
@@ -1670,7 +1678,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](src/pair_adaptive_test.go) |
 | LIST→DENSE densify + ordered `PopulatedBranchIndices` over a sparse body | [`TestPairTableListToDense`](src/pair_adaptive_test.go) |
 | LIST insert/replace/delete ordering + count | [`TestPairTableListDelete`](src/pair_adaptive_test.go), [`TestAdaptivePairListLifecycle`](src/pair_adaptive_test.go) |
-| Legacy-directory guard + format marker pinned across reopen | [`TestPairFormatGuardRejectsLegacy`](src/pair_adaptive_test.go), [`TestPairFormatPinnedAcrossReopen`](src/pair_adaptive_test.go) |
+| Legacy-directory guard (including failed-open handle cleanup) + format marker pinned across reopen | [`TestPairFormatGuardRejectsLegacy`](src/pair_adaptive_test.go), [`TestPairFormatPinnedAcrossReopen`](src/pair_adaptive_test.go) |
 | Adaptive vs fixed storage/throughput comparison | [`TestAdaptivePairIndexBenchmark`](src/pair_adaptive_bench_test.go) (`CHEETAHDB_ADAPTIVE_BENCH=1`) |
 | Prefix overlaps: terminal beside a jump, sibling-safe delete, strict-prefix keys | [`TestJumpTerminalOverlaps`](src/pair_adaptive_test.go) |
 | Set/get/delete/scan round trip over overlapping keys, both strides | [`TestPairSetGetDeleteRoundTrip`](src/pair_scan_test.go) |
@@ -1719,13 +1727,14 @@ seen in old docs are **client-side**; the server does not read them.
 | Node binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors | [`binders/nodejs/test/protocol.test.js`](binders/nodejs/test/protocol.test.js) (`node --test`) |
 | Node binder: fixed-width hex ordering, integer bucketing and tolerance sweeps | [`binders/nodejs/test/keys.test.js`](binders/nodejs/test/keys.test.js) |
 | Node binder: `CheetahDatabase` layout guard, mutation chain, id allocation, accounting | [`binders/nodejs/test/database.test.js`](binders/nodejs/test/database.test.js) |
+| Node/Python server launchers select `cheetah-server.exe` on Windows | [`binders/nodejs/test/server.test.js`](binders/nodejs/test/server.test.js), [`binders/python/tests/test_server.py`](binders/python/tests/test_server.py) |
 | Node binder against a live server (KV, batch, scan paging, recall, reset, pipelining) | [`binders/nodejs/test/integration.test.js`](binders/nodejs/test/integration.test.js) (`CHEETAH_INTEGRATION=1`) |
 | Python binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors | [`binders/python/tests/test_protocol.py`](binders/python/tests/test_protocol.py) (`python3 -m unittest`) |
 | Python binder: fixed-width hex ordering, integer bucketing and tolerance sweeps | [`binders/python/tests/test_keys.py`](binders/python/tests/test_keys.py) |
 | Python binder: two-step write, `PAIR_PUT_BATCH` item escaping and partial-batch refusal, cursor paging | [`binders/python/tests/test_kv.py`](binders/python/tests/test_kv.py) |
 | Python binder: `GRAPH_*` encoding, clamped recall bounds, batched noisy-OR merge | [`binders/python/tests/test_graph.py`](binders/python/tests/test_graph.py) |
 | Python binder: `JOB` submit/poll/fetch, consumed job, failure and timeout | [`binders/python/tests/test_jobs.py`](binders/python/tests/test_jobs.py) |
-| Python binder: socket handshake, reconnect, inactivity grace, thread-local pool | [`binders/python/tests/test_client.py`](binders/python/tests/test_client.py) |
+| Python binder: socket handshake, reconnect, inactivity grace, thread-local pool and post-reset close ownership | [`binders/python/tests/test_client.py`](binders/python/tests/test_client.py) |
 | Python binder: `CheetahDatabase` layout guard, per-key mutation lock, id allocation, accounting | [`binders/python/tests/test_database.py`](binders/python/tests/test_database.py) |
 | Python binder against a live server (KV, binary, batch, hidden pairs, paging, recall, jobs, reset) | [`binders/python/tests/test_integration.py`](binders/python/tests/test_integration.py) (`CHEETAH_INTEGRATION=1`) |
 

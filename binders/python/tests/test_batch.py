@@ -49,11 +49,11 @@ def payload_of(value) -> str:
 
 
 class BuildBatchTests(unittest.TestCase):
-    def test_items_travel_as_base64_json_and_defaults_stay_off_the_wire(self) -> None:
+    def test_items_and_continue_on_error_default_travel_explicitly(self) -> None:
         line = build_batch("PAIR_SET", ["ctx:a 1", "ctx:b 2"])
         self.assertTrue(line.startswith("BATCH PAIR_SET items="))
         self.assertEqual(items_of(line), ["ctx:a 1", "ctx:b 2"])
-        self.assertNotIn("continue_on_error=", line)
+        self.assertEqual(field_of(line, "continue_on_error"), "1")
         self.assertNotIn("results=", line)
 
     def test_non_default_and_shared_modifiers_are_carried(self) -> None:

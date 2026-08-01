@@ -401,6 +401,12 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	if err != nil {
 		return nil, err
 	}
+	keepMainKeysOpen := false
+	defer func() {
+		if !keepMainKeysOpen {
+			mkt.Close()
+		}
+	}()
 
 	pairDir := filepath.Join(path, "pairs")
 	if err := os.MkdirAll(pairDir, 0755); err != nil {
@@ -470,12 +476,10 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		return nil, err
 	}
 	if err := db.loadNextJumpID(); err != nil {
-		mkt.Close()
 		return nil, err
 	}
 
 	if err := db.loadHighestKey(); err != nil {
-		mkt.Close()
 		return nil, err
 	}
 
@@ -486,17 +490,16 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	_, missing := os.Stat(keyRecyclePath)
 	keyRecycle, err := NewRecycleTable(fileManager, keyRecyclePath, RecycleKeyEntrySize)
 	if err != nil {
-		mkt.Close()
 		return nil, err
 	}
 	db.keyRecycle = keyRecycle
 	if os.IsNotExist(missing) {
 		if err := db.seedKeyRecycle(); err != nil {
 			keyRecycle.Close()
-			mkt.Close()
 			return nil, err
 		}
 	}
+	keepMainKeysOpen = true
 	return db, nil
 }
 

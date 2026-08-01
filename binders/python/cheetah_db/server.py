@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -27,13 +28,21 @@ __all__ = [
     "DEFAULT_BINARY",
     "MODULE_ROOT",
     "ensure_server_binary",
+    "server_binary_name",
     "start_server",
     "wait_for_listener",
 ]
 
 #: The cheetah repository root: ``<root>/binders/python/cheetah_db`` → ``<root>``.
 MODULE_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_BINARY = MODULE_ROOT / "cheetah-server"
+
+
+def server_binary_name(platform: str = sys.platform) -> str:
+    """Return the executable file name Go and the host launcher agree on."""
+    return "cheetah-server.exe" if platform == "win32" else "cheetah-server"
+
+
+DEFAULT_BINARY = MODULE_ROOT / server_binary_name()
 
 
 def ensure_server_binary(

@@ -485,7 +485,11 @@ class ThreadLocalClientPool:
     def close_all(self) -> None:
         with self._lock:
             clients = list(self._clients)
-            self._clients.clear()
+            # Thread-local slots keep their client objects. Keep those same
+            # objects registered too: a later command can reconnect one after
+            # RESET_DB, and a subsequent close_all must still find and close
+            # that new socket. Clearing only this shared list leaked the
+            # reconnected handle at final shutdown.
         for client in clients:
             try:
                 client.close()

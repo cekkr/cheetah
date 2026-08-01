@@ -153,10 +153,10 @@ def build_batch(
     that lets one command serve both dialects.
     """
     parts = [f"BATCH {_assert_batchable(command)}", f"items={_encode_items(items)}"]
-    # Only the non-defaults travel: the server's defaults are the ones this
-    # module already wants, and a shorter line is a cheaper line.
-    if not continue_on_error:
-        parts.append("continue_on_error=0")
+    # The server defaults to stop-on-error, while this binder deliberately
+    # defaults to continuing. Always spell the flag so either caller choice
+    # survives the wire unchanged.
+    parts.append(f"continue_on_error={1 if continue_on_error else 0}")
     if not results:
         parts.append("results=0")
     if detached:

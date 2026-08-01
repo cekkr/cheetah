@@ -138,6 +138,17 @@ class PoolTests(unittest.TestCase):
         self.addCleanup(pool.close_all)
         self.assertIs(pool.acquire(), pool.acquire())
 
+    def test_close_all_keeps_reconnected_thread_local_client_registered(self) -> None:
+        pool = ThreadLocalClientPool(
+            lambda: CheetahClient(self.server.host, self.server.port, timeout=1.0)
+        )
+        client = pool.acquire()
+        self.assertTrue(client.connect())
+        pool.close_all()
+        self.assertTrue(client.connect())
+        pool.close_all()
+        self.assertIsNone(client._sock)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

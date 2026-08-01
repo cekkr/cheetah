@@ -153,7 +153,9 @@ batch.run_batch_async(
 `BATCH` is **not** a transaction — items apply in order and independently — so
 the result carries `applied`/`failed`/`first_error` rather than raising, and
 `continue_on_error` (default `True` here) decides whether one bad item stops the
-rest. An item that never ran is `None` in `results`, positionally aligned.
+rest. The binder explicitly sends `continue_on_error=1` because the server's
+raw-command default is stop-on-error. An item that never ran is `None` in
+`results`, positionally aligned.
 
 ### Automatic batching
 
@@ -226,6 +228,10 @@ conn = pool.acquire()   # this thread's client, connected
 pool.close_all()
 ```
 
+`close_all()` closes every registered socket without forgetting the thread-local client objects;
+if a later command reconnects one (for example after `CheetahDatabase.reset()`), a final
+`close_all()` still owns and closes that replacement socket.
+
 ## `CheetahDatabase`
 
 The class exists because every application ends up writing the same handful of
@@ -290,8 +296,9 @@ server = start_server(port=4467, data_dir="/tmp/cheetah-test")
 server.stop()
 ```
 
-It builds `cheetah-server` from this repository if the binary is missing, which
-needs a Go toolchain. `graph_term_index` and `pair_index_bytes` are left unset
+It builds `cheetah-server` (`cheetah-server.exe` on Windows) from this repository if the binary is
+missing, which needs a Go toolchain. The platform-specific name is important because Windows cannot
+spawn the extensionless Go output. `graph_term_index` and `pair_index_bytes` are left unset
 unless you pass them, so the server's own configuration decides; note that
 `pair_index_bytes` is adopted when a database directory is **created** and
 pinned from then on, so setting it against an existing database does nothing.

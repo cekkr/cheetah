@@ -156,7 +156,9 @@ await batch.runBatchAsync(pool, 'PAIR_SET', millionsOfLines, {
 `BATCH` is **not** a transaction — items apply in order and independently — so the
 result carries `applied`/`failed`/`firstError` rather than throwing, and
 `continueOnError` (default `true` here) decides whether one bad item stops the
-rest. An item that never ran is `null` in `results`, positionally aligned.
+rest. The binder explicitly sends `continue_on_error=1` because the server's
+raw-command default is stop-on-error. An item that never ran is `null` in
+`results`, positionally aligned.
 
 **You usually do not have to call any of it.** `CheetahClient` watches for bulk
 work: once a command has been issued `threshold` times inside `windowMs` it is
@@ -282,8 +284,9 @@ const server = await startServer({ port: 4467, dataDir: '/tmp/cheetah-test' });
 await server.stop();
 ```
 
-It builds `cheetah-server` from this repository if the binary is missing, which
-needs a Go toolchain. `graphTermIndex` and `pairIndexBytes` are left unset unless
+It builds `cheetah-server` (`cheetah-server.exe` on Windows) from this repository if the binary is
+missing, which needs a Go toolchain. The platform-specific name is important because Windows cannot
+spawn the extensionless Go output. `graphTermIndex` and `pairIndexBytes` are left unset unless
 you pass them, so the server's own configuration decides; note that
 `pairIndexBytes` is adopted when a database directory is **created** and pinned
 from then on, so setting it against an existing database does nothing.

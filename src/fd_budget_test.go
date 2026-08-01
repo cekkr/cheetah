@@ -1,9 +1,9 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -79,8 +79,8 @@ func TestOpenFileWithReclaimRecoversFromEMFILE(t *testing.T) {
 	// deve chiudere handle inattivi e riuscire comunque.
 	hogs := exhaustDescriptors(t)
 	defer func() {
-		for _, fd := range hogs {
-			syscall.Close(fd)
+		for _, file := range hogs {
+			file.Close()
 		}
 	}()
 
@@ -91,26 +91,26 @@ func TestOpenFileWithReclaimRecoversFromEMFILE(t *testing.T) {
 	file.Close()
 }
 
-// exhaustDescriptors apre /dev/null finché il kernel risponde EMFILE/ENFILE e
-// restituisce i descrittori catturati, da chiudere a fine test.
-func exhaustDescriptors(t *testing.T) []int {
+// exhaustDescriptors apre il null device della piattaforma finché il kernel
+// risponde EMFILE/ENFILE e restituisce i file catturati, da chiudere a fine test.
+func exhaustDescriptors(t *testing.T) []*os.File {
 	t.Helper()
-	var fds []int
+	var files []*os.File
 	for i := 0; i < 1<<20; i++ {
-		fd, err := syscall.Open("/dev/null", syscall.O_RDONLY, 0)
+		file, err := os.Open(os.DevNull)
 		if err != nil {
 			if !isFileDescriptorExhaustion(err) {
-				for _, held := range fds {
-					syscall.Close(held)
+				for _, held := range files {
+					held.Close()
 				}
 				t.Skipf("impossibile esaurire i descrittori: %v", err)
 			}
-			return fds
+			return files
 		}
-		fds = append(fds, fd)
+		files = append(files, file)
 	}
-	for _, held := range fds {
-		syscall.Close(held)
+	for _, held := range files {
+		held.Close()
 	}
 	t.Skip("soft limit troppo alto per esaurire i descrittori in un test")
 	return nil

@@ -18,7 +18,12 @@ const { spawn, spawnSync } = require('child_process');
 
 /** The cheetah repository root: `<root>/binders/nodejs/lib` → `<root>`. */
 const MODULE_ROOT = path.resolve(__dirname, '..', '..', '..');
-const DEFAULT_BINARY = path.join(MODULE_ROOT, 'cheetah-server');
+
+function serverBinaryName(platform = process.platform) {
+    return platform === 'win32' ? 'cheetah-server.exe' : 'cheetah-server';
+}
+
+const DEFAULT_BINARY = path.join(MODULE_ROOT, serverBinaryName());
 
 function binaryExists(binaryPath) {
     try {
@@ -193,6 +198,7 @@ module.exports = {
     DEFAULT_BINARY,
     MODULE_ROOT,
     ensureServerBinary,
+    serverBinaryName,
     startServer,
     waitForListener,
 };

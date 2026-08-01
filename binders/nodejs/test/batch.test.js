@@ -42,12 +42,12 @@ const payloadOf = (value) => Buffer.from(JSON.stringify(value), 'utf8').toString
 
 // --- builders --------------------------------------------------------------
 
-test('buildBatch encodes items as base64 JSON and omits the server defaults', () => {
+test('buildBatch encodes items and carries its continue-on-error default explicitly', () => {
     const line = buildBatch('PAIR_SET', ['ctx:a 1', 'ctx:b 2']);
     assert.equal(line.startsWith('BATCH PAIR_SET items='), true);
     assert.deepEqual(itemsOf(line), ['ctx:a 1', 'ctx:b 2']);
-    // continue_on_error and results already default the way this module wants.
-    assert.equal(line.includes('continue_on_error='), false);
+    // The server defaults to stop-on-error, unlike this binder.
+    assert.equal(fieldOf(line, 'continue_on_error'), '1');
     assert.equal(line.includes('results='), false);
 });
 

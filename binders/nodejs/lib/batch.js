@@ -135,9 +135,10 @@ function assertBatchable(command) {
 function buildBatch(command, items, options = {}) {
     const { continueOnError = true, results = true, async: asJob = false, shared = null } = options;
     const parts = [`BATCH ${assertBatchable(command)}`, `items=${encodeItems(items)}`];
-    // Only the non-defaults travel: a shorter line is a cheaper line, and the
-    // server's defaults are the ones this module already wants.
-    if (!continueOnError) parts.push('continue_on_error=0');
+    // The server defaults to stop-on-error, while this binder deliberately
+    // defaults to continuing. Always spell the flag so either caller choice
+    // survives the wire unchanged.
+    parts.push(`continue_on_error=${continueOnError ? '1' : '0'}`);
     if (!results) parts.push('results=0');
     if (asJob) parts.push('async=1');
     for (const [key, value] of Object.entries(shared || {})) {
