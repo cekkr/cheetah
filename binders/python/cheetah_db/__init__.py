@@ -10,6 +10,8 @@ any particular schema. Layers, each usable on its own::
     records / predict   batches, scans, nodes, edges, recall, multi-field rows,
     admin               detached jobs, prediction tables, server and database
                         operations
+    batch               BATCH — one command, N argument sets, one round trip,
+                        plus the policy that folds bulk loops into it
     database            CheetahDatabase — the plumbing an application ends up
                         writing around all of the above, meant to be subclassed
 
@@ -28,7 +30,21 @@ Requires Python 3.10+ and nothing else.
 
 from __future__ import annotations
 
-from . import admin, graph, hosts, jobs, keys, kv, predict, protocol, records, server, vocabulary
+from . import (
+    admin,
+    batch,
+    graph,
+    hosts,
+    jobs,
+    keys,
+    kv,
+    predict,
+    protocol,
+    records,
+    server,
+    vocabulary,
+)
+from .batch import AutoBatchPolicy, BatchResult, DeferredResponse, run_batch, run_batch_async
 from .client import (
     CheetahClient,
     CheetahConnectionError,
@@ -40,16 +56,20 @@ from .protocol import RawArgument, Response, ScanItem, build_command, build_key_
 from .vocabulary import TokenVocabulary
 
 __all__ = [
+    "AutoBatchPolicy",
+    "BatchResult",
     "CheetahClient",
     "CheetahConnectionError",
     "CheetahDatabase",
     "CheetahError",
+    "DeferredResponse",
     "RawArgument",
     "Response",
     "ScanItem",
     "ThreadLocalClientPool",
     "TokenVocabulary",
     "admin",
+    "batch",
     "build_command",
     "build_key_value_command",
     "graph",
@@ -62,6 +82,8 @@ __all__ = [
     "predict",
     "protocol",
     "records",
+    "run_batch",
+    "run_batch_async",
     "server",
     "vocabulary",
 ]

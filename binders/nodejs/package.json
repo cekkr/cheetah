@@ -9,6 +9,7 @@
     ".": "./index.js",
     "./protocol": "./lib/protocol.js",
     "./client": "./lib/client.js",
+    "./batch": "./lib/batch.js",
     "./kv": "./lib/kv.js",
     "./graph": "./lib/graph.js",
     "./keys": "./lib/keys.js",

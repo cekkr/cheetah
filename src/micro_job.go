@@ -2,9 +2,15 @@
 //
 // JOB è l'involucro asincrono unico:
 //
-//	JOB submit <comando>            oppure  JOB submit command=<base64 riga>
-//	JOB status id=<job>             (anche  JOB status <job>)
-//	JOB fetch  id=<job>             (anche  JOB fetch  <job>)
+//	JOB submit  <comando>           oppure  JOB submit command=<base64 riga>
+//	JOB status  id=<job>            (anche  JOB status <job>)
+//	JOB fetch   id=<job>            (anche  JOB fetch  <job>)
+//	JOB results id=<job> [from=] [limit=]
+//
+// `results` è la lettura *in corsa*: un job che produce un esito per elemento
+// (BATCH) li rende disponibili appena prodotti, quindi il chiamante può
+// consumarli mentre il job gira invece di aspettare la fine. Non consuma il
+// job — solo `fetch` lo fa.
 //
 // Sostituisce PAIR_REDUCE_ASYNC/_STATUS/_FETCH e PREDICT_INHERIT_ASYNC/_STATUS/
 // _FETCH, che restano come alias. Un comando lungo nuovo si registra in
@@ -14,7 +20,9 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -26,6 +34,8 @@ func microJobCommand(db *Database, args microArgs) (microResponse, error) {
 		return db.microJobStatus(args)
 	case "fetch":
 		return db.microJobFetch(args)
+	case "results":
+		return db.microJobResults(args)
 	case "":
 		return microFail("job_requires_action"), nil
 	default:
@@ -111,6 +121,11 @@ func jobProgressFields(snap microJobSnapshot) []microField {
 		mfi("total", snap.Total),
 	}
 	fields = append(fields, snap.counterFields()...)
+	// `available` compare solo per i job che producono risultati progressivi:
+	// per gli altri sarebbe un campo sempre a zero in ogni risposta storica.
+	if snap.Available > 0 {
+		fields = append(fields, mfi("available", snap.Available))
+	}
 	fields = append(fields, snap.Meta...)
 	return fields
 }
@@ -155,6 +170,77 @@ func (db *Database) microJobFetch(args microArgs) (microResponse, error) {
 		return microPending(jobProgressFields(snap)...), nil
 	}
 }
+
+// microJobResults legge la finestra di risultati già prodotti senza consumare
+// il job. È deliberatamente separato da fetch: fetch è terminale e rende
+// l'aggregato, results è ripetibile e rende le righe, quindi un client può
+// consumarle a pagine mentre il lavoro avanza e chiudere comunque con fetch.
+func (db *Database) microJobResults(args microArgs) (microResponse, error) {
+	job, errResp := db.lookupJob(args)
+	if job == nil {
+		return errResp, nil
+	}
+	from := 0
+	if raw := args.get("from", "offset", "cursor"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			return microFail("invalid_from"), nil
+		}
+		from = parsed
+	}
+	limit := 0
+	if raw := args.get("limit", "count"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			return microFail("invalid_limit"), nil
+		}
+		limit = parsed
+	}
+	if limit <= 0 || limit > jobResultsMaxPage {
+		limit = jobResultsMaxPage
+	}
+
+	chunk, available := job.partialsFrom(from, limit)
+	snap := job.snapshot()
+	fields := []microField{
+		mf("job", snap.ID),
+		mf("kind", snap.Kind),
+		mf("state", snap.State.String()),
+		mfi("from", from),
+		mfi("count", len(chunk)),
+		mfi("next", from+len(chunk)),
+		mfi("available", available),
+		mfi("total", snap.Total),
+	}
+	if len(chunk) > 0 {
+		// Stesso contratto del payload di BATCH, di cui questa è la lettura a
+		// pagine: righe come stringhe JSON, e tutto in base64 con
+		// `results_encoding` quando una di esse non è UTF-8 valido.
+		lines := make([]interface{}, len(chunk))
+		for index, line := range chunk {
+			lines[index] = line
+		}
+		lines, encoding := batchEncodeResults(lines)
+		encoded, err := json.Marshal(lines)
+		if err != nil {
+			return microFail("cannot_encode_job_results"), nil
+		}
+		if encoding != "" {
+			fields = append(fields, mf("results_encoding", encoding))
+		}
+		fields = append(fields, mf("payload", base64.StdEncoding.EncodeToString(encoded)))
+	}
+	if snap.State == microJobFailed && snap.Err != nil {
+		fields = append(fields, mf("error", sanitizeJobError(snap.Err)))
+	}
+	return microOK(fields...), nil
+}
+
+// jobResultsMaxPage tiene una pagina dentro una riga di risposta ragionevole:
+// il protocollo è a riga singola e una pagina senza tetto renderebbe l'intero
+// batch in un colpo solo, che è esattamente ciò che `results` esiste per
+// evitare.
+const jobResultsMaxPage = 1000
 
 // sanitizeJobError toglie solo gli a capo: la riga di risposta è una sola, e un
 // messaggio d'errore che ne contenesse due desincronizzerebbe la connessione.

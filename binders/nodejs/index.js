@@ -8,6 +8,8 @@
 //   kv / graph  free functions over a connection: the two-step write, scans,
 //   records     nodes, edges, associative recall, multi-field rows
 //   jobs        detached commands: submit, poll, fetch once
+//   batch       BATCH — one command, N argument sets, one round trip (and the
+//               coalescer CheetahClient runs by itself)
 //   predict     prediction tables — PREDICT_*
 //   admin       the server and the registry of databases, not the data
 //   database    CheetahDatabase — the plumbing an application ends up writing
@@ -28,6 +30,7 @@
 //   }
 
 const admin = require('./lib/admin');
+const batch = require('./lib/batch');
 const client = require('./lib/client');
 const database = require('./lib/database');
 const graph = require('./lib/graph');
@@ -43,6 +46,7 @@ const vocabulary = require('./lib/vocabulary');
 module.exports = {
     // Submodules, for callers who want the free-function layers.
     admin,
+    batch,
     client,
     database,
     graph,

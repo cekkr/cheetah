@@ -14,6 +14,15 @@
 // only stops the client from waiting for each response before writing the next
 // line.
 //
+// On top of that, a connection **auto-batches**: when the same command is
+// issued often enough to look like bulk work, the commands a caller starts in
+// one turn of the event loop are folded into a single `BATCH` line (batch.js)
+// and their responses are handed back individually, so nothing above notices.
+// A caller that awaits each command in turn never has two outstanding and
+// therefore never batches — it is bursts, not volume, that the coalescing can
+// act on. `autoBatch: {enabled: false}` restores the exact pre-batching wire
+// behavior; every knob is in `AUTO_BATCH_DEFAULTS`.
+//
 // No dependency is used: the protocol is `net` and newlines.
 
 const net = require('net');
@@ -31,6 +40,9 @@ const DEFAULTS = Object.freeze({
     reconnectBaseMs: 100,
     reconnectMaxMs: 5000,
     maxReconnectAttempts: 5,
+    // Overrides layered over batch.js's AUTO_BATCH_DEFAULTS. `null` keeps the
+    // defaults; `{enabled: false}` turns coalescing off entirely.
+    autoBatch: null,
 });
 
 class CheetahError extends Error {
@@ -83,10 +95,19 @@ class CheetahClient extends EventEmitter {
         this.waiting = [];
         this.connecting = null;
         this.lastError = null;
+        // Required here rather than at module scope: batch.js reaches back for
+        // CheetahError, and two top-level requires would deadlock the cycle.
+        const { createAutoBatcher } = require('./batch');
+        this.batcher = createAutoBatcher((line) => this.sendDirect(line), this.options.autoBatch || {});
     }
 
     get pendingCount() {
         return this.inflight.length + this.waiting.length;
+    }
+
+    /** Coalescing counters: `{batched, batches, direct}`. */
+    get batchStats() {
+        return { ...this.batcher.stats };
     }
 
     async connect() {
@@ -249,18 +270,37 @@ class CheetahClient extends EventEmitter {
         });
     }
 
-    /** Send one raw command line and resolve with its parsed response. */
+    /**
+     * Send one raw command line and resolve with its parsed response.
+     *
+     * The line may be coalesced with others into a `BATCH` — see `autoBatch`.
+     * That is invisible to the caller (one line in, one parsed response out)
+     * and it preserves order: anything that cannot join the pending queue
+     * flushes it first, and the server applies a batch's items in order.
+     */
     async send(line) {
         if (this.closing) throw new CheetahError('cheetah client is closed', { command: line });
         if (String(line).includes('\n')) {
             throw new CheetahError('cheetah command must not contain a newline', { command: line });
         }
+        return this.batcher.submit(String(line));
+    }
+
+    /** `send` with auto-batching bypassed. The batcher itself writes through here. */
+    async sendDirect(line) {
+        if (this.closing) throw new CheetahError('cheetah client is closed', { command: line });
         if (!this.connected) await this.connect();
         return new Promise((resolve, reject) => {
             const entry = { line, resolve, reject, timer: null };
             if (this.inflight.length < this.options.maxInFlight) this.#dispatch(entry);
             else this.waiting.push(entry);
         });
+    }
+
+    /** Write any queued auto-batch right now. */
+    flush() {
+        this.batcher.flush();
+        return this;
     }
 
     /** `send` with positional-argument encoding (PAIR_* / KV dialect). */
@@ -282,6 +322,10 @@ class CheetahClient extends EventEmitter {
     }
 
     async close() {
+        // Ahead of `closing`: a queued item that is never written would leave
+        // its caller's promise pending forever. Flushed, it becomes an in-flight
+        // command and is rejected below with everything else.
+        this.batcher.flush();
         this.closing = true;
         const socket = this.socket;
         this.connected = false;
@@ -361,6 +405,12 @@ class CheetahPool {
             });
         }
         return response;
+    }
+
+    /** Write every connection's queued auto-batch right now. */
+    flush() {
+        for (const client of this.clients) client.flush();
+        return this;
     }
 
     async acquire() {

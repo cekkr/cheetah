@@ -27,7 +27,8 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `kv` | The two-step write and its reads: `put_value`/`get_value`, `put_json`/`get_json`, `put_bytes`/`get_bytes`, `put_values_batch` (`PAIR_PUT_BATCH`), `delete_pair`, `pair_purge`, `scan_page`/`scan_prefix`/`scan_all`, `pair_summary`. |
 | `graph` | The whole `GRAPH_*` surface: nodes, edges (single and batch), `neighbors`/`degree`/`neighbor_types`, `query`, `recall`/`recall_batched`, `similar`, `term_index`, and the ambiguity trio. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `set_row`, `get_row`, `scan`/`iter_rows`, `delete_row`, `drop_table`, plus `field_spec`. |
-| `jobs` | The `JOB` micro-command: `submit`, `status`, `fetch`, `await_job`, `supports_job_api`. |
+| `jobs` | The `JOB` micro-command: `submit`, `status`, `fetch`, `results`, `await_job`, `supports_job_api`. |
+| `batch` | `BATCH` — one command, N argument sets, one round trip: `build_batch`, `run_batch`, `run_batch_chunked`, `run_batch_async`, `batch`, `parse_batch_response`, plus `BatchCollector`/`AutoBatchPolicy`, the client-level coalescing. |
 | `predict` | Prediction tables: `set_value`, `query`, `train`, `context_adjust`, `inherit`, `inherit_batch`, `backend`, `bench`. |
 | `admin` | The server and the registry of databases, not the data: `create_database`, `list_databases`, `use_database`, `reset_database`, `system_stats`, `log_flush`, `file_checkpoint`, `cluster_*`, `fork_assign`. |
 | `keys` | Key-building primitives: fixed-width `hex_segment`/`unhex`, `sha1`, and integer `quantize`/`bucketize`/`bucket_sweep`. |
@@ -124,6 +125,75 @@ Values follow the same escaping rule as everywhere else: text holding a space or
 starting with `x` travels as `x<hex>`, and the binder does it for you. `bytes`
 fields read back padded to their declared width, because a fixed-width field has
 no length of its own.
+
+## Batching, and how automatic it is
+
+Cheetah is round-trip bound under bulk work, and `BATCH` is the server's general
+answer: one command name, any target command, one request.
+
+```python
+from cheetah_db import batch
+
+# Raw argument lines — whatever you would have written as single commands.
+result = batch.run_batch(conn, "PAIR_SET", [f"ctx:{i} {k}" for i, k in enumerate(keys)])
+result.applied, result.failed, result.results[0].ok
+result.raise_for_failures()      # a half-written batch is an index with holes
+
+# Object items take the key=value dialect, over modifiers shared by all of them.
+batch.run_batch(conn, "GRAPH_EDGE_SET", edges, shared={"type": "knows"})
+
+# Big enough to detach: submitted as a job, results delivered as produced.
+batch.run_batch_async(
+    conn, "PAIR_SET", millions_of_lines,
+    on_result=lambda response, index: ...,   # arrives while the job runs
+    on_progress=lambda snapshot: print(snapshot.progress),
+)
+```
+
+`BATCH` is **not** a transaction — items apply in order and independently — so
+the result carries `applied`/`failed`/`first_error` rather than raising, and
+`continue_on_error` (default `True` here) decides whether one bad item stops the
+rest. An item that never ran is `None` in `results`, positionally aligned.
+
+### Automatic batching
+
+The client watches for bulk work: once a command has been issued `threshold`
+times inside `window` seconds it is *hot*. What happens then is a setting,
+because a **synchronous** client can only coalesce by deferring the response,
+and that moves the moment an error surfaces:
+
+| `mode` | Behavior |
+| --- | --- |
+| `"advise"` | *(default)* logs once, per command, that batching would pay. Nothing about the wire, the ordering, or when an error surfaces changes. |
+| `"deferred"` | actually coalesces. A hot command is queued and the caller gets a `DeferredResponse` that resolves on first use — full saving for a loop that ignores its responses, at the price that an item's error surfaces at that first use (or, for a response nobody reads, only through `on_error`). |
+| `"off"` | never coalesce, and never look. |
+
+```python
+conn = CheetahClient(
+    "127.0.0.1", 4455, database="app",
+    auto_batch={"mode": "deferred", "threshold": 8, "window": 0.2,
+                "idle": 2.0, "max_size": 256, "commands": None,
+                "on_error": lambda command, exc: ...},
+)
+...
+conn.flush()          # a loop that just ends leaves its tail queued
+conn.batch_stats      # {"batched": …, "batches": …, "direct": …}
+```
+
+Where it is obviously the right trade, ask for it explicitly instead — same
+machinery, bounded to a block, flushed on exit:
+
+```python
+with conn.batching():
+    for key, abs_key in rows:
+        conn.execute("PAIR_SET", key, abs_key)     # -> DeferredResponse
+```
+
+Order is preserved either way: anything that cannot join the queue flushes it
+first, and the server applies a batch's items in order. Never batched are the
+connection-scoped commands, `BATCH`/`JOB` themselves, and the administrative
+ones (`SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, the `CLUSTER_*` family,
+`FORK_ASSIGN`) — see `AUTO_BATCH_EXCLUDED`.
 
 ## Databases of their own
 

@@ -207,6 +207,19 @@ that shape over a second copy in each loop.
   ([`registerDefaultMicroCommands`](src/micro_command.go)), legacy aliases
   ([`registerDefaultCommandAliases`](src/command_alias.go)) and the commands runnable inside `JOB`
   ([`registerDefaultJobCommands`](src/jobs.go)).
+- **Batching is one command, not one per family.** `BATCH <COMMAND> items=…`
+  ([`batch.go`](src/batch.go)) repeats *any* command the router can resolve: it builds one line per
+  item and hands it to `ExecuteCommand`, so it knows nothing about what it executes and needs no
+  edit when a command is added. Do **not** add a fourth `*_BATCH` name. The three that exist
+  (`PAIR_PUT_BATCH`, `GRAPH_EDGE_SET_BATCH`, `PREDICT_INHERIT_BATCH`) stay because their responses
+  are a wire contract — and `PAIR_PUT_BATCH` additionally does *two* commands per item, which `BATCH`
+  cannot express. `BATCH` refuses `BATCH`/`JOB` (recursion) and the three front-end-scoped names.
+- **A job may publish results before it finishes.** `microJob.appendPartial`
+  ([`jobs.go`](src/jobs.go)) and `JOB results id=… from=… limit=…`
+  ([`micro_job.go`](src/micro_job.go)) let a caller page through what a long job has already produced
+  without consuming it; `JOB fetch` stays terminal and stays the aggregate. `available=` appears in
+  `JOB status` **only** when partials exist — an always-present field would have broken the
+  byte-for-byte responses of `PAIR_REDUCE_STATUS` and `PREDICT_INHERIT_STATUS`.
 - **An alias reproduces its legacy response byte for byte.** Response field names (`purged=`,
   `matches=`, `degree=`, `count=`, `next_cursor=`, `job=`) are a wire contract — the Python adapter in
   the parent monorepo reads some of them positionally. A command decomposed into a micro-command
@@ -278,7 +291,7 @@ client ── TCP ──►  server.go (per-conn loop)                          
                   engine.go  ── GetDatabase(name) ──►  cheetah_data/<name>/  (lazy, cached)
                          ▼
               database.go : ExecuteCommand(line)   ← single command router
-                 │  resolves in order: micro_command.go (DEL, JOB) → command_alias.go
+                 │  resolves in order: micro_command.go (BATCH, DEL, JOB, RECORD) → command_alias.go
                  │  (every historical name) → its own switch (everything not yet decomposed)
                  │    └─ jobs.go        one job manager for every async family
                  ├─ commands.go        Insert/Read/Edit/Delete, PairSet/Get/Del/Purge
@@ -651,9 +664,11 @@ A `microJob` carries state, `completed`/`total`, named counters, submit-time met
 process-local and not persisted.
 
 - **Key symbols:** `microJobState`, `microJob` (`markRunning`/`markFailed`/`markCompleted`/
-  `setProgress`/`advance`/`snapshot`), `microJobSnapshot` (`progressPercent`, `counterFields`),
-  `microJobManager` (`newJob`/`getJob`/`deleteJob`), `jobTask`, `jobCommand`, `jobCommandRegistry`,
-  `registerDefaultJobCommands`, `Database.submitJob`.
+  `setProgress`/`advance`/`appendPartial`/`partialsFrom`/`snapshot`), `microJobSnapshot`
+  (`progressPercent`, `counterFields`, `Available`), `microJobManager`
+  (`newJob`/`getJob`/`deleteJob`), `jobTask`, `jobCommand`, `jobCommandRegistry`,
+  `registerDefaultJobCommands` (`PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`),
+  `Database.submitJob`.
 - **Common mistakes:** job ids stay `<kind>_<n>` with the sequence kept **per kind**
   (`reduce_1`, `predict_inherit_1`) — a shared counter would renumber ids a client may have stored.
   `jobTask.Counters` must list every counter an alias renders, or a poll arriving before the first
@@ -668,12 +683,38 @@ until the dispatcher boundary so an alias formatter can read it by name), `micro
 - **Key symbols:** `microField`/`mf`/`mfi`/`mfu`, `microResponse` (`Render`/`Get`/`Has`/`IsError`),
   `microOK`/`microFail`/`microFailf`/`microPending`/`microSilent`, `microHandler`, `microCall`,
   `microCommandRegistry`, `ensureCommandRegistries` (the one-time `sync.Once` that builds all three
-  package-level tables), `registerDefaultMicroCommands` (`DEL`, `JOB`, `RECORD`), `splitMicroArgs`,
+  package-level tables), `registerDefaultMicroCommands` (`BATCH`, `DEL`, `JOB`, `RECORD`), `splitMicroArgs`,
   `microParseBytes`/`microEncodeBytes`, `Database.executeMicroCommand`.
 - **Common mistakes:** `microSilent()` (empty `Status`) is the "only an error to propagate" case and
   renders as the empty string — do not confuse it with `microFail`. `microEncodeBytes` always emits
   `x<hex>`: the micro dialect splits tokens on whitespace, so a pair key containing a space or
   starting with `x` survives only in hex.
+
+#### [`src/batch.go`](src/batch.go)
+
+The `BATCH` micro-command: the general "run this command N times" envelope, and the only one that
+should exist. It builds one command line per item and passes each to `ExecuteCommand`, so it has no
+knowledge of the commands it runs and never needs editing when one is added.
+
+- **Key symbols:** `microBatch` (the verb), `parseBatchRequest` (the single parser, shared by the
+  inline and job paths), `batchRenderItem`/`batchRenderObjectItem`/`batchRenderArrayItem`/
+  `batchRenderScalar` (the three item shapes), `Database.runBatch`, `executeBatchLine`,
+  `batchResponseFields`, `batchEncodeResults`, `submitBatchJob`, `prepareBatchJob`;
+  `batchMaxItems` (10 000), `batchReservedParams`, `batchForbiddenTargets`.
+- **Item shapes:** a JSON string is a raw argument line, a JSON array is positional arguments joined
+  with a space, a JSON object is the `key=value` dialect layered over the *shared* modifiers (any
+  `key=value` on the `BATCH` line that is not one of its own). Only object items inherit the shared
+  ones — a raw line carries its own arguments and merging into it would be guesswork.
+- **Sequential on purpose.** The cost this command removes is the round trip, not the lock, and
+  running items in parallel would change the order two writes to one key are applied in.
+- **`results=1` is the default**, because a `BATCH` of reads is useless without them. The array is
+  positionally aligned with the items and holds `null` where an item never ran. A response line that
+  is not valid UTF-8 (only `READ` of a binary payload) would be corrupted by `encoding/json`, so
+  `batchEncodeResults` switches the whole array to base64 and declares `results_encoding=base64`;
+  `JOB results` uses the same helper for the same reason.
+- **Common mistakes:** `splitMicroArgs` lower-cases the target, so `parseBatchRequest` must upper it
+  back. `first_error` is `item_<n>:<reason>` with no space — `sanitizeResponseToken` would turn one
+  into an underscore.
 
 #### [`src/micro_del.go`](src/micro_del.go)
 
@@ -688,12 +729,12 @@ The `DEL` micro-command — one erasure verb with the scope in the arguments (`D
 
 #### [`src/micro_job.go`](src/micro_job.go)
 
-The `JOB` micro-command (`submit`/`status`/`fetch`) plus the two commands currently registered as
-runnable inside it.
+The `JOB` micro-command (`submit`/`status`/`fetch`/`results`) plus the two commands whose `Prepare`
+lives here (`BATCH`'s is in [`batch.go`](src/batch.go)).
 
-- **Key symbols:** `microJobCommand`, `microJobSubmit`/`microJobStatus`/`microJobFetch`,
-  `jobCommandLine`, `jobProgressFields`, `preparePairReduceJob`, `preparePredictInheritJob`,
-  `sanitizeJobError`, `microRawError`.
+- **Key symbols:** `microJobCommand`, `microJobSubmit`/`microJobStatus`/`microJobFetch`/
+  `microJobResults`, `jobResultsMaxPage`, `jobCommandLine`, `jobProgressFields`,
+  `preparePairReduceJob`, `preparePredictInheritJob`, `sanitizeJobError`, `microRawError`.
 - **Common mistakes:** `JOB status` must **not** fail on a failed job (it reports `state=failed` plus
   `error=`), because `PAIR_REDUCE_STATUS` answered `SUCCESS` there while `PREDICT_INHERIT_STATUS`
   answered `ERROR,job_failed:`; `JOB fetch` is the one that errors, which is what both legacy fetches
@@ -1456,7 +1497,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | --- | --- |
 | `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](src/main.go) `runCLI`, [`server.go`](src/server.go) `handleConnection`, [`engine.go`](src/engine.go) |
 | `DB_CREATE`, `DB_LIST` (engine-scoped) | [`engine.go`](src/engine.go) `engineControlCommand`, called by both front-ends |
-| `DEL`, `JOB`, `RECORD` (micro-commands) | [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
+| `BATCH`, `DEL`, `JOB`, `RECORD` (micro-commands) | [`batch.go`](src/batch.go), [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
 | `RECORD define/alter/compact/schema/tables/set/get/scan`, `DEL records` | [`micro_record.go`](src/micro_record.go), [`record_table.go`](src/record_table.go), [`record_schema.go`](src/record_schema.go) |
 | `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL`, `GRAPH_EDGE_DEL`, `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH` (aliases over the above) | [`command_alias.go`](src/command_alias.go) |
 | `INSERT`, `READ`, `EDIT` | [`commands.go`](src/commands.go) |

@@ -66,6 +66,66 @@ class FakeCheetahServer:
             return "ERROR,unknown_command"
         return handler(rest)
 
+    # -- batch ---------------------------------------------------------- #
+    def _do_batch(self, rest: str) -> str:
+        """``BATCH <COMMAND> items=…`` — the general repeat-a-command form.
+
+        Reproduced literally, including the parts a client gets wrong: the three
+        item shapes, the shared modifiers that only object items inherit, the
+        ``null`` left where an aborted item never ran, and an aggregate that
+        stays SUCCESS while reporting ``failed``.
+        """
+        target, _, modifiers = rest.strip().partition(" ")
+        target = target.upper()
+        if target in {"BATCH", "JOB", "DATABASE", "RESET_DB", "EXIT", "QUIT"}:
+            return f"ERROR,batch_cannot_target:{target}"
+        fields = _kv_args(modifiers)
+        if "items" not in fields:
+            return "ERROR,batch_requires_items"
+        items = json.loads(base64.b64decode(fields["items"]).decode("utf-8"))
+        if not items:
+            return "ERROR,batch_requires_nonempty_items"
+        shared = {
+            key: value
+            for key, value in fields.items()
+            if key not in {"items", "json", "continue_on_error", "results", "async", "target", "command"}
+        }
+        keep_going = fields.get("continue_on_error", "0") in {"1", "true", "yes", "on"}
+        with_results = fields.get("results", "1") in {"1", "true", "yes", "on"}
+
+        results: list[str | None] = [None] * len(items)
+        applied = failed = 0
+        first_error = ""
+        for index, item in enumerate(items):
+            if isinstance(item, dict):
+                merged = {**shared, **{k: v for k, v in item.items() if v not in (None, "")}}
+                args = " ".join(f"{key}={value}" for key, value in sorted(merged.items()))
+            elif isinstance(item, list):
+                args = " ".join(str(value) for value in item if value not in (None, ""))
+            else:
+                args = str(item)
+            response = self.execute(f"{target} {args}".strip())
+            results[index] = response
+            if response.startswith("ERROR"):
+                failed += 1
+                if not first_error:
+                    first_error = f"item_{index}:{response[len('ERROR,'):]}"
+                if not keep_going:
+                    break
+            else:
+                applied += 1
+
+        line = (
+            f"SUCCESS,command=BATCH,target={target},requested={len(items)},"
+            f"applied={applied},failed={failed}"
+        )
+        if first_error:
+            line += f",first_error={first_error.replace(' ', '_')}"
+        if with_results:
+            encoded = base64.b64encode(json.dumps(results).encode("utf-8")).decode("ascii")
+            line += f",payload={encoded}"
+        return line
+
     # -- values --------------------------------------------------------- #
     def _do_insert(self, command: str, rest: str) -> str:
         if not rest:

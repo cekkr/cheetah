@@ -56,6 +56,7 @@ type microJob struct {
 	counters  map[string]int
 	meta      []microField
 	result    []microField
+	partial   []string
 	err       error
 	createdAt time.Time
 	updatedAt time.Time
@@ -130,6 +131,42 @@ func (job *microJob) advance(steps int, counters map[string]int) {
 	job.mu.Unlock()
 }
 
+// appendPartial registra un risultato già prodotto. Un job che elabora una
+// lista ne conosce l'esito elemento per elemento molto prima di finire, e
+// tenerlo solo alla fine costringerebbe il chiamante ad aspettare l'ultimo per
+// vedere il primo: è ciò che `JOB results` legge mentre il job gira.
+func (job *microJob) appendPartial(values ...string) {
+	if len(values) == 0 {
+		return
+	}
+	job.mu.Lock()
+	job.partial = append(job.partial, values...)
+	job.updatedAt = time.Now()
+	job.mu.Unlock()
+}
+
+// partialsFrom rende una finestra dei risultati già prodotti più quanti ne
+// esistono in tutto: la coppia è ciò che permette al chiamante di riprendere da
+// dove si era fermato senza rileggere quello che ha già.
+//
+// limit ≤ 0 significa "tutto il resto".
+func (job *microJob) partialsFrom(from int, limit int) ([]string, int) {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	available := len(job.partial)
+	if from < 0 {
+		from = 0
+	}
+	if from >= available {
+		return nil, available
+	}
+	end := available
+	if limit > 0 && from+limit < end {
+		end = from + limit
+	}
+	return append([]string(nil), job.partial[from:end]...), available
+}
+
 type microJobSnapshot struct {
 	ID        string
 	Kind      string
@@ -140,6 +177,7 @@ type microJobSnapshot struct {
 	Counters  map[string]int
 	Meta      []microField
 	Result    []microField
+	Available int
 	Err       error
 }
 
@@ -160,6 +198,7 @@ func (job *microJob) snapshot() microJobSnapshot {
 		Counters:  counters,
 		Meta:      append([]microField(nil), job.meta...),
 		Result:    append([]microField(nil), job.result...),
+		Available: len(job.partial),
 		Err:       job.err,
 	}
 }
@@ -294,6 +333,14 @@ func registerDefaultJobCommands(registry *jobCommandRegistry) {
 		Name:    "PREDICT_INHERIT_BATCH",
 		Kind:    "predict_inherit",
 		Prepare: preparePredictInheritJob,
+	})
+	// BATCH è submittabile come gli altri: è ciò che rende `BATCH … async=1` e
+	// `JOB submit BATCH …` la stessa cosa, e ciò che dà a un batch di qualsiasi
+	// comando l'avanzamento e i risultati progressivi senza codice suo.
+	registry.Register(&jobCommand{
+		Name:    "BATCH",
+		Kind:    "batch",
+		Prepare: prepareBatchJob,
 	})
 }
 

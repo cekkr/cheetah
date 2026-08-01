@@ -7,8 +7,8 @@
 //
 // Three things a caller has to know:
 //
-//   - **Only registered commands are submittable** (today `PAIR_REDUCE` and
-//     `PREDICT_INHERIT_BATCH`); anything else answers
+//   - **Only registered commands are submittable** (today `PAIR_REDUCE`,
+//     `PREDICT_INHERIT_BATCH` and `BATCH`); anything else answers
 //     `ERROR,command_not_submittable`.
 //   - **The command line travels base64** in `command=`. The micro dialect
 //     splits on whitespace and a command line is full of it.
@@ -100,6 +100,42 @@ async function fetch(conn, jobId) {
 }
 
 /**
+ * Read the results a job has produced **so far**, without consuming it.
+ *
+ * The counterpart to `fetch`: fetch is terminal and answers with the command's
+ * aggregate, `results` is repeatable and answers with the individual response
+ * lines, so a caller can consume a long `BATCH` page by page while it is still
+ * running. `from` is the index to resume at — feed it the previous call's
+ * `next` — and a job whose command produces no per-item results simply always
+ * answers `count=0`.
+ */
+async function results(conn, jobId, { from = 0, limit = 0 } = {}) {
+    const line = buildKeyValueCommand('JOB results', { id: jobId, from, limit: limit || undefined });
+    const response = await conn.send(line);
+    if (!response.ok) {
+        throw new CheetahError(`cheetah JOB results ${jobId} failed: ${response.error || response.raw}`, {
+            command: line,
+            response,
+        });
+    }
+    // Required lazily: batch.js reaches for this module to stream a detached
+    // BATCH, and a top-level require in both directions would leave one of them
+    // holding a half-built module object.
+    const { decodeResultLines } = require('./batch');
+    return {
+        jobId: response.fields.job || jobId,
+        state: (response.fields.state || '').trim(),
+        from: numericField(response.fields, 'from', from),
+        count: numericField(response.fields, 'count', 0),
+        next: numericField(response.fields, 'next', from),
+        available: numericField(response.fields, 'available', 0),
+        total: numericField(response.fields, 'total', 0),
+        lines: decodeResultLines(response.fields),
+        response,
+    };
+}
+
+/**
  * Poll until the job finishes and resolve to its result.
  *
  * The interval is deliberately coarse: polling is a round trip that competes
@@ -145,6 +181,7 @@ module.exports = {
     buildStatus,
     buildSubmit,
     fetch,
+    results,
     status,
     submit,
     supportsJobApi,

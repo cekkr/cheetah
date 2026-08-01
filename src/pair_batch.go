@@ -99,7 +99,7 @@ func (db *Database) handlePairPutBatch(args string) (string, error) {
 	if firstError != "" {
 		// Senza spazi né virgole: la riga di risposta è tokenizzata su virgola
 		// e il chiamante la legge come `key=value`.
-		fields = append(fields, "first_error="+pairPutBatchSanitize(firstError))
+		fields = append(fields, "first_error="+sanitizeResponseToken(firstError))
 	}
 	if wantKeys {
 		// Le chiavi assolute restano opzionali: chi scrive righe write-once non
@@ -158,8 +158,11 @@ func pairPutBatchReason(errStr string) string {
 	return trimmed
 }
 
-// pairPutBatchSanitize rende un motivo trasportabile in un token `key=value`.
-func pairPutBatchSanitize(reason string) string {
+// sanitizeResponseToken rende un motivo trasportabile in un token `key=value`:
+// la riga di risposta è tokenizzata su virgola e separata su whitespace, quindi
+// un messaggio d'errore che ne contenga li perde entrambi. Condiviso con BATCH
+// (batch.go), che ha lo stesso `first_error=`.
+func sanitizeResponseToken(reason string) string {
 	replaced := strings.NewReplacer(",", ";", " ", "_", "\n", "_", "\r", "_").Replace(reason)
 	if len(replaced) > 120 {
 		return replaced[:120]

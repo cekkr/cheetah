@@ -7,8 +7,8 @@ because fetching consumes the job.
 
 Three things a caller has to know, all of them learned the hard way:
 
-  - **Only registered commands are submittable** (today ``PAIR_REDUCE`` and
-    ``PREDICT_INHERIT_BATCH``); anything else answers
+  - **Only registered commands are submittable** (today ``PAIR_REDUCE``,
+    ``PREDICT_INHERIT_BATCH`` and ``BATCH``); anything else answers
     ``ERROR,command_not_submittable``.
   - **The command line travels base64** in ``command=``. The micro dialect
     splits on whitespace and a command line is full of it.
@@ -32,9 +32,11 @@ from .client import CheetahError
 from .protocol import Response, build_key_value_command
 
 __all__ = [
+    "JobResultsPage",
     "JobSnapshot",
     "await_job",
     "fetch",
+    "results",
     "status",
     "submit",
     "supports_job_api",
@@ -89,6 +91,56 @@ def fetch(conn: Any, job_id: str) -> Response | None:
     if not response.ok:
         raise CheetahError(f"cheetah JOB fetch {job_id} failed: {response.reason}", response=response)
     return response
+
+
+@dataclass(frozen=True)
+class JobResultsPage:
+    """One page of the results a job has produced so far."""
+
+    job_id: str
+    state: str
+    from_index: int
+    count: int
+    next: int
+    available: int
+    total: int
+    lines: list[str | None]
+    response: Response
+
+
+def results(
+    conn: Any, job_id: str, *, from_index: int = 0, limit: int = 0
+) -> JobResultsPage:
+    """Read the results a job has produced **so far**, without consuming it.
+
+    The counterpart to :func:`fetch`: fetch is terminal and answers with the
+    command's aggregate, ``results`` is repeatable and answers with the
+    individual response lines, so a caller can consume a long ``BATCH`` page by
+    page while it is still running. ``from_index`` is where to resume — feed it
+    the previous page's ``next`` — and a job whose command produces no per-item
+    results simply always answers ``count=0``.
+    """
+    # Imported here: batch.py reaches for this module to stream a detached
+    # BATCH, and a module-level import in both directions would not resolve.
+    from .batch import decode_result_lines
+
+    fields = {"id": job_id, "from": from_index}
+    if limit:
+        fields["limit"] = limit
+    response = conn.send(build_key_value_command("JOB results", fields))
+    if not response.ok:
+        raise CheetahError(f"cheetah JOB results {job_id} failed: {response.reason}", response=response)
+    return JobResultsPage(
+        job_id=response.field_value("job", job_id) or job_id,
+        state=(response.field_value("state", "") or "").strip(),
+        from_index=int(response.int_field("from", from_index) or 0),
+        count=int(response.int_field("count", 0) or 0),
+        next=int(response.int_field("next", from_index) or 0),
+        available=int(response.int_field("available", 0) or 0),
+        total=int(response.int_field("total", 0) or 0),
+        lines=decode_result_lines(response.fields),
+        response=response,
+    )
 
 
 def _snapshot(response: Response, job_id: str) -> JobSnapshot:

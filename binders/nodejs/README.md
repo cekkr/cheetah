@@ -28,7 +28,8 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `kv` | The two-step write and its reads: `putValue`/`getValue`, `putJson`/`getJson`, `putJsonBatch`, `insert`, `editAbsoluteKey`, `readAbsoluteKey`, `pairSet` (with `hidden`), `deletePair`, `deleteValue`, `purgePrefix`, `pairSummary`, `scanPage`/`scanPrefix`/`scanAll`. |
 | `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `similar`, `termIndex`. Plus a pure `build*` for each command, for callers assembling their own batch. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `setRow`, `getRow`, `scanPage`/`scanRows`/`scanAll`, `deleteRow`, `dropTable`, plus `fieldSpec` and a pure `build*` for each command. |
-| `jobs` | Detached commands over the `JOB` envelope: `submit`, `status`, `fetch`, `awaitJob`, `supportsJobApi`. |
+| `jobs` | Detached commands over the `JOB` envelope: `submit`, `status`, `fetch`, `results`, `awaitJob`, `supportsJobApi`. |
+| `batch` | `BATCH` — one command, N argument sets, one round trip: `buildBatch`, `runBatch`, `runBatchChunked`, `runBatchAsync`, `batch`, `parseBatchResponse`, plus `CommandBatcher`, the coalescer `CheetahClient` runs by itself. |
 | `predict` | Prediction tables: `setValue`, `query`, `train`, `contextAdjust`, `inherit`, `inheritBatch`, `backend`, `bench`. |
 | `admin` | The server and the registry of databases, not the data: `createDatabase`, `listDatabases`, `useDatabase`, `resetDatabase`, `systemStats`, `logFlush`, `fileCheckpoint`, `clusterUpdate`/`clusterStatus`/`clusterMove`, `forkAssign`. |
 | `keys` | Key-building primitives: fixed-width `hex`/`unhex`, `sha1`, and integer `quantize`/`bucketize`/`bucketSweep`. |
@@ -129,6 +130,68 @@ Values follow the same escaping rule as everywhere else: text holding a space or
 starting with `x` travels as `x<hex>`, and the binder does it for you. `bytes`
 fields read back padded to their declared width, because a fixed-width field has
 no length of its own.
+
+## Batching, and the batching you do not have to ask for
+
+Cheetah is round-trip bound under bulk work, and `BATCH` is the server's general
+answer: one command name, any target command, one request.
+
+```js
+const { batch } = require('cheetah-db');
+
+// Raw argument lines — whatever you would have written as single commands.
+const bound = await batch.runBatch(pool, 'PAIR_SET', keys.map((k, i) => `ctx:${i} ${k}`));
+bound.applied; bound.failed; bound.results[0].ok;   // one parsed response per item
+
+// Object items take the key=value dialect, over modifiers shared by all of them.
+await batch.runBatch(pool, 'GRAPH_EDGE_SET', edges, { shared: { type: 'knows' } });
+
+// Big enough to detach: submitted as a job, results delivered as they are produced.
+await batch.runBatchAsync(pool, 'PAIR_SET', millionsOfLines, {
+    onResult: (response, index) => { /* arrives while the job runs */ },
+    onProgress: (snapshot) => console.log(snapshot.progress),
+});
+```
+
+`BATCH` is **not** a transaction — items apply in order and independently — so the
+result carries `applied`/`failed`/`firstError` rather than throwing, and
+`continueOnError` (default `true` here) decides whether one bad item stops the
+rest. An item that never ran is `null` in `results`, positionally aligned.
+
+**You usually do not have to call any of it.** `CheetahClient` watches for bulk
+work: once a command has been issued `threshold` times inside `windowMs` it is
+*hot*, and the calls a caller starts in one turn of the event loop are folded
+into a single `BATCH`, each getting its own response back. Nothing above
+notices. A caller that awaits every command in turn can never have two
+outstanding, so it never batches and pays nothing — it is bursts, not volume,
+that the coalescing can act on.
+
+```js
+const client = new CheetahClient({
+    autoBatch: {
+        enabled: true,      // false restores the exact pre-batching wire behavior
+        threshold: 8,       // calls of one command inside windowMs to go hot
+        windowMs: 200,
+        idleMs: 2000,       // silence that cools a command back down
+        maxSize: 256,       // flush at this many items…
+        maxBytes: 512 * 1024,   // …or this many bytes of line
+        minSize: 2,         // a queue smaller than this is sent as plain commands
+        flushMs: 0,         // 0 = end of tick; >0 holds the queue that long
+        commands: null,     // allowlist of command names, or null for all
+        exclude: [...],     // never batch these (see AUTO_BATCH_EXCLUDED)
+        onBatch: (info) => {},
+    },
+});
+client.batchStats;   // { batched, batches, direct }
+client.flush();      // write a queued batch right now
+```
+
+Order is preserved end to end: anything that cannot join the pending queue
+flushes it first, and the server applies a batch's items in order. Excluded by
+default are the connection-scoped commands, `BATCH`/`JOB` themselves, and the
+administrative ones (`SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, the
+`CLUSTER_*` family, `FORK_ASSIGN`) — batching those buys nothing and only makes
+a failure harder to read.
 
 ## Databases, jobs and the server
 

@@ -12,8 +12,17 @@ client between threads: every command waits for the previous one's response.
 :class:`ThreadLocalClientPool` gives each thread its own socket instead, which
 is how a pooled Cheetah client is normally built in Python.
 
-Two behaviors here exist because of how Cheetah is deployed rather than how it
-is coded:
+The client also watches for **bulk work**: when the same command is issued often
+enough to look like an ingest loop, it can fold those commands into a single
+``BATCH`` line (:mod:`cheetah_db.batch`) instead of paying a round trip each.
+Because a synchronous client has one command in flight at a time, coalescing
+means deferring the response, which moves the moment an error surfaces — so the
+default policy only *reports* the opportunity and ``auto_batch={"mode":
+"deferred"}`` opts into taking it. ``with client.batching():`` does the same
+thing explicitly, for a block where it is obviously the right trade.
+
+Two more behaviors here exist because of how Cheetah is deployed rather than how
+it is coded:
 
   - **Several destinations.** ``0.0.0.0`` is a listen address, not a
     destination, and a WSL client reaching a Windows-side server is not on its
@@ -33,8 +42,10 @@ import logging
 import socket
 import threading
 import time
-from typing import Any, Callable, Mapping
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Mapping
 
+from .batch import AutoBatchPolicy, BatchCollector, HotCommandWindow, split_command_line
 from .hosts import candidate_hosts
 from .protocol import Response, build_command, build_key_value_command, parse_response
 
@@ -86,6 +97,7 @@ class CheetahClient:
         database_options: Mapping[str, Any] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         idle_grace: float | None = None,
+        auto_batch: AutoBatchPolicy | Mapping[str, Any] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -101,6 +113,17 @@ class CheetahClient:
         self._last_errors: list[str] = []
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        self.auto_batch = (
+            auto_batch
+            if isinstance(auto_batch, AutoBatchPolicy)
+            else AutoBatchPolicy().with_overrides(auto_batch)
+        )
+        self._hot = HotCommandWindow(self.auto_batch)
+        self._batch_stats = {"batched": 0, "batches": 0, "direct": 0}
+        # The collector is per *thread*: a CheetahClient serializes its socket,
+        # but two threads sharing one client must not end up appending to each
+        # other's queue and receiving each other's responses.
+        self._batch_local = threading.local()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -136,6 +159,9 @@ class CheetahClient:
             return self._ensure_connection()
 
     def close(self) -> None:
+        # Ahead of the socket: a queued batch that is never written leaves every
+        # DeferredResponse it holds unresolvable.
+        self.flush()
         with self._lock:
             self._close_socket()
 
@@ -154,8 +180,104 @@ class CheetahClient:
         return self._command(text)
 
     def send(self, text: str) -> Response:
-        """Send one raw command line, return its parsed response."""
+        """Send one raw command line, return its parsed response.
+
+        The line may be queued into a ``BATCH`` instead of written immediately —
+        see :class:`~cheetah_db.batch.AutoBatchPolicy`. When it is, the return
+        value is a :class:`~cheetah_db.batch.DeferredResponse`, which behaves
+        like a :class:`Response` and resolves on first use.
+        """
+        command, _ = split_command_line(text)
+        collector = getattr(self._batch_local, "collector", None)
+        if collector is not None:
+            if self._hot.batchable(command):
+                return collector.add(text)  # type: ignore[return-value]
+            # Anything that cannot join the queue must not overtake it.
+            collector.flush()
+            return self.send_direct(text)
+
+        if self.auto_batch.mode == "off" or not self._hot.batchable(command):
+            return self.send_direct(text)
+        if not self._hot.observe(command):
+            return self.send_direct(text)
+        if self.auto_batch.mode == "deferred":
+            return self._open_collector().add(text)  # type: ignore[return-value]
+        self._hot.advise_once(command)
+        return self.send_direct(text)
+
+    def send_direct(self, text: str) -> Response:
+        """Send one raw command line now, bypassing any batching."""
         return parse_response(self._command(text))
+
+    # ------------------------------------------------------------------ #
+    # Batching
+    # ------------------------------------------------------------------ #
+    def _open_collector(
+        self, *, max_size: int | None = None, continue_on_error: bool | None = None
+    ) -> BatchCollector:
+        collector = BatchCollector(
+            self.send_direct,
+            max_size=self.auto_batch.max_size if max_size is None else max_size,
+            continue_on_error=(
+                self.auto_batch.continue_on_error if continue_on_error is None else continue_on_error
+            ),
+            on_error=self.auto_batch.on_error,
+            stats=self._batch_stats,
+        )
+        self._batch_local.collector = collector
+        return collector
+
+    @contextmanager
+    def batching(
+        self, *, max_size: int | None = None, continue_on_error: bool | None = None
+    ) -> Iterator[BatchCollector]:
+        """Collect the commands issued in this block into ``BATCH`` requests.
+
+        Every ``send``/``execute`` inside answers with a
+        :class:`~cheetah_db.batch.DeferredResponse` rather than a
+        :class:`Response`. The queue is written when the block ends, when it
+        reaches ``max_size``, and whenever a command arrives that cannot join it
+        — so ordering against the rest of the connection is preserved::
+
+            with client.batching():
+                for key, abs_key in rows:
+                    client.execute("PAIR_SET", key, abs_key)
+
+        Nested blocks reuse the outermost collector and leave the flush to it:
+        writing an inner queue early would put its items ahead of the outer
+        one's.
+        """
+        existing = getattr(self._batch_local, "collector", None)
+        if existing is not None:
+            yield existing
+            return
+        collector = self._open_collector(max_size=max_size, continue_on_error=continue_on_error)
+        try:
+            yield collector
+        finally:
+            self._batch_local.collector = None
+            collector.flush()
+
+    def flush(self) -> None:
+        """Write this thread's queued batch, if there is one.
+
+        In ``deferred`` mode a loop that simply ends leaves its tail queued —
+        nothing signals "the bulk work is over". Call this (or close the client)
+        to be sure the last page landed.
+        """
+        collector = getattr(self._batch_local, "collector", None)
+        if collector is not None:
+            collector.flush()
+
+    @property
+    def batch_stats(self) -> dict[str, int]:
+        """Coalescing counters since this client was built.
+
+        ``{batched, batches, direct}`` — how many commands were folded, into how
+        many requests, and how many went out on their own because a queue of one
+        is not worth a wrapper.
+        """
+        return dict(self._batch_stats)
 
     def execute(self, name: str, *args: Any) -> Response:
         """Send a positional-dialect command (``PAIR_*``, KV, ``LOG_FLUSH``, …)."""

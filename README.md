@@ -187,7 +187,7 @@ Three argument dialects coexist, which is why a command's family is easier to gu
 | Dialect | Used by | Example |
 | --- | --- | --- |
 | **positional** | the KV and `PAIR_*` families, `LOG_FLUSH`, `FORK_ASSIGN`, job polling | `PAIR_SCAN ctx: 64 x000104` |
-| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*`, the micro-commands (`DEL`, `JOB`, `RECORD`) | `GRAPH_DEGREE id=alice direction=both` |
+| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*`, the micro-commands (`BATCH`, `DEL`, `JOB`, `RECORD`) | `GRAPH_DEGREE id=alice direction=both` |
 | **clause language** | `GRAPH_QUERY` only | `MATCH (id='alice')-[:follows]->(*) HOPS 1..2 RETURN paths` |
 
 `FILE_CHECKPOINT` adds a fourth, smaller convention: bare uppercase flags (`DROP_CACHE`,
@@ -218,9 +218,11 @@ them, so nothing below replaces anything you already use.
 | `DEL records table=<t> key=<k>` | — | one row of a record table |
 | `DEL records table=<t> drop=1` | — | the whole record table: every row, every generation, and the schema |
 | `RECORD define \| alter \| compact \| schema \| tables \| set \| get \| scan` | — | multi-field tables, see [Record tables](#record-tables--one-thing-many-fields) |
-| `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`), anything else is `ERROR,command_not_submittable` |
-| `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS` | `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters |
+| `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`), anything else is `ERROR,command_not_submittable` |
+| `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS` | `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters; `available=` appears only for a job that produces results per item |
 | `JOB fetch id=<job>` | `PAIR_REDUCE_FETCH`, `PREDICT_INHERIT_FETCH` | the submitted command's own response under `job=<id>` while completed, `PENDING,…` while running, and it consumes the job |
+| `JOB results id=<job> [from=<n>] [limit=<n>]` | — | the results produced **so far**, without consuming the job: `from=`/`count=`/`next=`/`available=` plus `payload=<base64 json[]>`. Feed `next` back as `from` to page through a long `BATCH` while it runs. Page cap 1 000 |
+| `BATCH <COMMAND> items=<base64 json[]> [continue_on_error=1] [results=0] [async=1] [<shared>=<v>…]` | `PAIR_PUT_BATCH`, `GRAPH_EDGE_SET_BATCH`, `PREDICT_INHERIT_BATCH` (all three still work) | **run any command N times in one request** — see [BATCH](#batch--one-command-n-argument-sets) |
 
 Micro-commands take `key=value` only. A binary value is written `x<hex>` exactly as elsewhere, and
 must be when it contains spaces — the positional forms survive inside the alias rewriters, which
@@ -240,6 +242,78 @@ SUCCESS,job=reduce_1,kind=reduce,state=completed,progress=100.00,completed=2,tot
 SUCCESS,job=reduce_1,reducer=counts,count=2,items=…
 # the same line PAIR_REDUCE would have answered, under the job id
 ```
+
+### BATCH — one command, N argument sets
+
+```text
+BATCH <COMMAND> items=<base64 json[]> [continue_on_error=1] [results=0] [async=1] [<shared>=<v>…]
+```
+
+A bulk ingest is bound by the **round trip**, not by the disk: the server sits around a quarter of a
+core while the client waits on latency. The first answers to that were one dedicated command per
+family — `PAIR_PUT_BATCH`, `GRAPH_EDGE_SET_BATCH`, `PREDICT_INHERIT_BATCH` — each with its own
+`items=` parser, counters and response shape. Three names for one idea, and a fourth every time
+another command became hot.
+
+`BATCH` is that idea once. It takes **any** command the router can resolve (micro-commands, aliases
+and the historical switch alike), builds one line per item and runs them in order. It does not know
+what it is executing, so it does not need updating when a new command lands. The three older names
+still work and still answer exactly as they did — they are a wire contract — but nothing new should
+be added beside them.
+
+**Items** come in three shapes, because the protocol has two dialects and forcing them through one
+would make half the commands unreadable:
+
+| Item | Becomes | For |
+| --- | --- | --- |
+| `"ctx:BERLIN 42"` | `PAIR_SET ctx:BERLIN 42` | a raw argument line — whatever you would have typed |
+| `["ctx:BERLIN", 42]` | `PAIR_SET ctx:BERLIN 42` | positional arguments, joined with a space |
+| `{"from":"a","to":"b"}` | `GRAPH_EDGE_SET from=a to=b type=knows` | the `key=value` dialect, **over the shared modifiers** |
+
+Any `key=value` on the `BATCH` line that is not one of its own modifiers is *shared*: object items
+inherit it and may override it, so `type=knows` is written once instead of ten thousand times. Raw
+and positional items carry their own arguments and ignore it. A value may not contain whitespace —
+both dialects split on it — so encode it (`x<hex>` or base64) exactly as for a single command.
+
+**It is not a transaction.** Cheetah has none. Items are independent and applied in order, so the
+reply is a `SUCCESS` carrying `requested`/`applied`/`failed` (plus `first_error=item_<n>:<reason>`)
+rather than a bare `ERROR`. By default it stops at the first failure; `continue_on_error=1` keeps
+going. Cap: 10 000 items.
+
+`results=1` (**the default**) returns every item's own response line in `payload=<base64 json[]>`,
+positionally aligned with the items — an item that never ran is `null`. `results=0` leaves just the
+counters, which is what a caller writing tens of thousands of rows wants. A response line that is not
+valid UTF-8 (only `READ` of a binary payload does this) switches the whole array to base64 and says
+so in `results_encoding=base64`.
+
+`BATCH` refuses `BATCH` and `JOB` as targets — they would recurse — and `DATABASE`/`RESET_DB`/`EXIT`,
+which are front-end scoped and never reach the router at all.
+
+**Detached, and readable while it runs.** `async=1` hands the batch to the job manager and answers
+with a `job=<id>` instead of the aggregate; `JOB submit BATCH …` is the same path. From there
+`JOB status` measures progress, `JOB results` reads the response lines already produced *without*
+consuming the job, and `JOB fetch` closes with the aggregate. That is the whole point of the
+detached form: results arrive as they are produced, not at the end.
+
+```text
+[cheetah_data/notes]> BATCH PAIR_SET items=WyJjdHg6YSAxIiwiY3R4OmIgMiJd
+SUCCESS,command=BATCH,target=PAIR_SET,requested=2,applied=2,failed=0,payload=…
+
+[cheetah_data/notes]> BATCH GRAPH_EDGE_SET type=knows items=<base64 [{"from":"a","to":"b"}, …]>
+SUCCESS,command=BATCH,target=GRAPH_EDGE_SET,requested=2,applied=2,failed=0,payload=…
+
+[cheetah_data/notes]> BATCH PAIR_SET async=1 items=<base64 [… 5000 items …]>
+SUCCESS,command=BATCH,job=batch_1,kind=batch,state=queued,total=5000,target=PAIR_SET
+[cheetah_data/notes]> JOB results id=batch_1 from=0 limit=1000
+SUCCESS,job=batch_1,kind=batch,state=running,from=0,count=1000,next=1000,available=1240,total=5000,payload=…
+[cheetah_data/notes]> JOB fetch id=batch_1
+SUCCESS,job=batch_1,command=BATCH,target=PAIR_SET,requested=5000,applied=5000,failed=0,payload=…
+```
+
+Both binders wrap this, and the Node one turns it on by itself: a burst of the same command issued in
+one turn of the event loop is folded into a `BATCH` with no change to the calling code. See
+[`binders/nodejs/README.md`](binders/nodejs/README.md) and
+[`binders/python/README.md`](binders/python/README.md).
 
 #### What each alias runs
 
@@ -450,7 +524,7 @@ ERROR,key_not_found (deleted)
 | --- | --- |
 | `PAIR_SET <prefix> <abs_key>` | Bind a byte prefix to a value key. Upserts; the prefix may be any byte string (`x<HEX>` for binary), and a prefix of another prefix is legal — a trie node is terminal and a parent at the same time. Complete mutations are serialized, so concurrent writers sharing ancestors retain every acknowledged binding. |
 | `PAIR_SET_HIDDEN <prefix> <abs_key>` | The same binding with the hidden flag set: `PAIR_SCAN`/`PAIR_SUMMARY`/`PAIR_REDUCE` skip it unless they pass `include_hidden=1`. A **visibility bit on one entry**, not a separate namespace. |
-| `PAIR_PUT_BATCH items=<base64 json[]> [hidden=1] [keys=1] [continue_on_error=1]` | **Store and bind many pairs in one request.** Each item is `{"k":"<prefix>","v":"<value>"}`, both fields following the same `x<HEX>` rule as a positional argument. This is `INSERT` + `PAIR_SET` per item as **one request instead of 2N**. Note what that does and does not buy: the server-side work per record is unchanged, so a client that already pipelines its writes sees no throughput gain (measured 0.94× on 2 000 rows against 256-way concurrent single writes). It is worth reaching for when the client cannot pipeline, when the link has latency, or to keep request and parse overhead down — not as a throughput fix. Not a transaction: items are independent and applied in order, so the reply always carries `requested`/`applied`/`failed` (plus `first_error`) rather than a bare `ERROR`. By default it stops at the first bad item; `continue_on_error=1` skips and keeps going. Assigned keys are returned in `payload=` only with `keys=1` — write-once rows do not need them and a large batch should not pay for them. Cap: 10 000 items. |
+| `PAIR_PUT_BATCH items=<base64 json[]> [hidden=1] [keys=1] [continue_on_error=1]` | **Store and bind many pairs in one request.** (The general form is [`BATCH`](#batch--one-command-n-argument-sets); this one stays because it does *two* commands per item — `INSERT` then `PAIR_SET` — which `BATCH` cannot express, and because its response is a wire contract.) Each item is `{"k":"<prefix>","v":"<value>"}`, both fields following the same `x<HEX>` rule as a positional argument. This is `INSERT` + `PAIR_SET` per item as **one request instead of 2N**. Note what that does and does not buy: the server-side work per record is unchanged, so a client that already pipelines its writes sees no throughput gain (measured 0.94× on 2 000 rows against 256-way concurrent single writes). It is worth reaching for when the client cannot pipeline, when the link has latency, or to keep request and parse overhead down — not as a throughput fix. Not a transaction: items are independent and applied in order, so the reply always carries `requested`/`applied`/`failed` (plus `first_error`) rather than a bare `ERROR`. By default it stops at the first bad item; `continue_on_error=1` skips and keeps going. Assigned keys are returned in `payload=` only with `keys=1` — write-once rows do not need them and a large batch should not pay for them. Cap: 10 000 items. |
 | `PAIR_GET <prefix>` | Resolve exactly one name to its key. A point lookup, never a scan — a prefix with no terminal of its own answers `ERROR`, even when keys exist beneath it. |
 | `PAIR_DEL <prefix>` | Unbind one name. The value it pointed at survives; pair `DELETE` with it to reclaim the bytes. |
 | `PAIR_PURGE <prefix\|*> [batch]` | Unbind **and** delete the payloads of every name under a prefix, looping inside the server until the namespace is empty (`batch` sizes each page, default 4096). This is the bulk form of `PAIR_DEL` + `DELETE`, moved server-side so a namespace wipe is seconds instead of thousands of round trips. `*` empties the whole trie. Payloads are deleted in parallel, the trie entries one at a time — the concurrent-purge race that used to fail mid-way or leave entries behind is fixed (`TestPairPurgeSharedAncestors`). Use `RESET_DB` instead when the whole database is disposable: recreating the directory is cheaper than walking it. |
@@ -611,7 +685,7 @@ Full grammar in [Graph Command Language](#graph-command-language).
 | `GRAPH_NODE_SET id=<id> [labels=…] [props=…] [references=<base64-json[]>]` | Upsert an **entity**. `labels` are the kinds it belongs to (filterable, valueless); `props` are descriptive attributes you will not query on their own; `references` are bounded complete sentences with `id`, `text`, optional `source`, and `ordinal`. Omitting a field keeps the stored one; `references=-` clears the sentence list; `created_at` survives. |
 | `GRAPH_NODE_DEL id=<id> [cascade=1]` | Forget the entity. Without `cascade=1` its incident edges are left dangling — pass it whenever you mean "and everything that was said about it". |
 | `GRAPH_EDGE_SET from= to= [type=] [weight=] [directed=] [confidence=] [modality=] [ambiguity=] [props=] [autocreate=0]` | Upsert a **relation**, identified by the tuple `(from, to, type, directed)`. `weight` is traversal strength (cost `1/weight`); `confidence`/`modality` are how sure the claim is; `ambiguity` names the group of mutually exclusive readings it belongs to. Missing endpoint nodes are stubbed out unless `autocreate=0`. |
-| `GRAPH_EDGE_SET_BATCH items=<base64 json[]> [continue_on_error=1] [type=] [directed=] [weight=] [props=]` | The same upsert for many edges in one round-trip, with the top-level tokens acting as per-item defaults. Reports `requested/applied/created/updated/failed`. |
+| `GRAPH_EDGE_SET_BATCH items=<base64 json[]> [continue_on_error=1] [type=] [directed=] [weight=] [props=]` | The same upsert for many edges in one round-trip, with the top-level tokens acting as per-item defaults. Reports `requested/applied/created/updated/failed`. Kept for its response contract; `BATCH GRAPH_EDGE_SET type=… items=[…]` is the general form and reports `applied`/`failed` only. |
 | `GRAPH_EDGE_DEL from= to= [type=] [directed=]` | **Forget** the relation. Different from writing `confidence=ruled_out`, which keeps it on record as excluded and still answerable. |
 | `GRAPH_AMBIGUITY_SET from= group= options=<id>[=<share>][,…] [type=] [normalize=0]` | Write a whole set of **mutually exclusive readings** at once and normalize their shares to sum to 1. The engine has no `OR`, so a disjunction is stored as a group rather than expressed as a query. |
 | `GRAPH_AMBIGUITY_RESOLVE from= group= winner= [drop=1]` | Collapse the set: the winner becomes `certain`, the others `ruled_out` (or are deleted with `drop=1`), and the group dissolves. |
@@ -763,7 +837,7 @@ everywhere else.
 | `PREDICT_TRAIN key= target= [ctx=] [lr=] [negatives=<value>[,…]] [table=]` | Move the stored weights toward a target through the forward/backward loop, optionally down-weighting the listed negatives. **Persistent learning.** |
 | `PREDICT_CTX key= ctx= [mode=bias\|scale] [strength=] [table=]` | Apply a context adjustment **immediately, without training** — a nudge to this query, not a lesson. |
 | `PREDICT_INHERIT key= target= sources=<value>[,…] [merge=] [table=]` | Seed a new value by merging existing ones — how a composite token starts life with its parts' context weights. Every source must already exist under `key`, or the command answers `inherit_sources_missing`. |
-| `PREDICT_INHERIT_BATCH items=<base64 json> [key=] [merge=] [table=]` | The same merge for many targets in one call. |
+| `PREDICT_INHERIT_BATCH items=<base64 json> [key=] [merge=] [table=]` | The same merge for many targets in one call. Kept for its response contract and because it is submittable as a job; [`BATCH`](#batch--one-command-n-argument-sets) is the general form. |
 | `PREDICT_INHERIT_ASYNC items=<base64 json> [key=] [merge=] [table=]` | The same batch, detached: returns `job=<id>`. |
 | `PREDICT_INHERIT_STATUS <job_id>` | Progress of that job — merged/skipped/failed counters. |
 | `PREDICT_INHERIT_FETCH <job_id>` | `PENDING` while it runs, then the batch results. |
