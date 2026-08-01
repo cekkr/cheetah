@@ -2,9 +2,14 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -30,22 +35,36 @@ func NewEngine(cfg *Config, monitor *ResourceMonitor) (*Engine, error) {
 	}, nil
 }
 
+var errDatabaseExists = errors.New("database already exists")
+
 func (e *Engine) GetDatabase(name string) (*Database, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.getDatabaseLocked(name)
+}
 
+func (e *Engine) getDatabaseLocked(name string) (*Database, error) {
 	if db, exists := e.databases[name]; exists {
 		return db, nil
 	}
+	if err := validateDatabaseName(name); err != nil {
+		return nil, err
+	}
 
 	dbPath := filepath.Join(e.basePath, name)
-	settings := e.cfg.DatabaseDefaults
-	if override, ok := e.overrides[name]; ok {
-		settings = mergeDatabaseConfig(settings, override)
-	}
+	settings, persisted := e.resolveSettingsLocked(name)
 	db, err := NewDatabase(name, dbPath, e.monitor, settings, e.cfg.MaxPairTables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load database %s: %w", name, err)
+	}
+
+	// Gli override arrivati dal comando si scrivono accanto ai dati: è ciò che
+	// li fa sopravvivere al riavvio invece di valere per la sola sessione.
+	if override, ok := e.overrides[name]; ok && !override.isEmpty() {
+		merged := mergeDatabaseOverrides(persisted, override)
+		if err := saveDatabaseSettings(filepath.Join(dbPath, databaseSettingsFile), merged); err != nil {
+			logErrorf("failed to persist settings for database %s: %v", name, err)
+		}
 	}
 
 	e.databases[name] = db
@@ -53,7 +72,104 @@ func (e *Engine) GetDatabase(name string) (*Database, error) {
 	return db, nil
 }
 
+// resolveSettingsLocked compone le impostazioni efficaci di un database:
+// generali del server, poi il suo settings.ini, poi gli override della
+// sessione. Rende anche gli override già su disco, che servono a chi li deve
+// riscrivere fondendoli.
+func (e *Engine) resolveSettingsLocked(name string) (DatabaseConfig, DatabaseOverrides) {
+	settings := e.cfg.DatabaseDefaults
+	persisted, err := loadDatabaseSettings(filepath.Join(e.basePath, name, databaseSettingsFile))
+	if err != nil {
+		logErrorf("failed to read settings for database %s: %v", name, err)
+	} else if !persisted.isEmpty() {
+		settings = mergeDatabaseConfig(settings, persisted)
+	}
+	if override, ok := e.overrides[name]; ok {
+		settings = mergeDatabaseConfig(settings, override)
+	}
+	return settings, persisted
+}
+
+// EffectiveSettings rende le impostazioni con cui il database verrebbe aperto
+// adesso, senza aprirlo.
+func (e *Engine) EffectiveSettings(name string) DatabaseConfig {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	settings, _ := e.resolveSettingsLocked(name)
+	return settings
+}
+
+// CreateDatabase crea un database *nuovo*, opzionalmente con impostazioni
+// proprie che sovrascrivono quelle generali del server. A differenza di
+// DATABASE, che apre-o-crea, qui l'esistenza è un errore: chi crea vuole sapere
+// se stava per riusare una directory già popolata, e le impostazioni ad hoc
+// hanno effetto solo su una directory nuova.
+func (e *Engine) CreateDatabase(name string, overrides *DatabaseOverrides) (*Database, error) {
+	if err := validateDatabaseName(name); err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, loaded := e.databases[name]; loaded {
+		return nil, fmt.Errorf("%w: %s", errDatabaseExists, name)
+	}
+	if _, err := os.Stat(filepath.Join(e.basePath, name)); err == nil {
+		return nil, fmt.Errorf("%w: %s", errDatabaseExists, name)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	if overrides != nil && !overrides.isEmpty() {
+		e.overrides[name] = mergeDatabaseOverrides(e.overrides[name], *overrides)
+	}
+	return e.getDatabaseLocked(name)
+}
+
+// DatabaseInfo è la riga di DB_LIST.
+type DatabaseInfo struct {
+	Name     string         `json:"name"`
+	Path     string         `json:"path"`
+	Loaded   bool           `json:"loaded"`
+	AdHoc    bool           `json:"ad_hoc_settings"`
+	Settings map[string]any `json:"settings"`
+}
+
+// ListDatabases elenca le directory sotto data_dir con le impostazioni con cui
+// ciascuna verrebbe aperta. Elenca il disco, non il registro: un database mai
+// aperto in questo processo è comunque un database.
+func (e *Engine) ListDatabases() ([]DatabaseInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	entries, err := os.ReadDir(e.basePath)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]DatabaseInfo, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if validateDatabaseName(name) != nil {
+			continue
+		}
+		settings, persisted := e.resolveSettingsLocked(name)
+		_, loaded := e.databases[name]
+		infos = append(infos, DatabaseInfo{
+			Name:     name,
+			Path:     filepath.Join(e.basePath, name),
+			Loaded:   loaded,
+			AdHoc:    !persisted.isEmpty(),
+			Settings: databaseSettingMap(settings),
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
+	return infos, nil
+}
+
 func (e *Engine) ResetDatabase(name string) error {
+	if err := validateDatabaseName(name); err != nil {
+		return err
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -75,6 +191,57 @@ func (e *Engine) SetDatabaseOverrides(name string, overrides DatabaseOverrides) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.overrides[name] = overrides
+}
+
+// engineControlCommand gestisce i comandi di *scope engine*: parlano dei
+// database invece che dentro un database, quindi non possono stare in
+// ExecuteCommand (un Database non conosce l'Engine) e non mutano lo stato della
+// connessione come DATABASE/RESET_DB.
+//
+// Sta in una funzione sola, condivisa da CLI e TCP, proprio perché i due
+// front-end non devono poter divergere: è la stessa ragione per cui tutto il
+// resto del protocollo passa da ExecuteCommand.
+//
+//	DB_CREATE <nome> [key=value …]   crea un database nuovo con impostazioni proprie
+//	DB_LIST                          elenca i database e le loro impostazioni efficaci
+//
+// Rende (risposta, true) se il comando gli appartiene.
+func engineControlCommand(engine *Engine, command string, args string) (string, bool) {
+	switch command {
+	case "DB_CREATE":
+		target, overrides, err := parseDatabaseTarget(args)
+		if err != nil {
+			return fmt.Sprintf("ERROR,%v", err), true
+		}
+		if _, err := engine.CreateDatabase(target, overrides); err != nil {
+			if errors.Is(err, errDatabaseExists) {
+				return fmt.Sprintf("ERROR,database_exists:%s", target), true
+			}
+			return fmt.Sprintf("ERROR,cannot_create_db:%v", err), true
+		}
+		settings := engine.EffectiveSettings(target)
+		return fmt.Sprintf(
+			"SUCCESS,database_created=%s,%s",
+			target,
+			strings.Join(databaseSettingTokens(settings), ","),
+		), true
+	case "DB_LIST":
+		infos, err := engine.ListDatabases()
+		if err != nil {
+			return fmt.Sprintf("ERROR,cannot_list_databases:%v", err), true
+		}
+		encoded, err := json.Marshal(infos)
+		if err != nil {
+			return fmt.Sprintf("ERROR,cannot_encode_databases:%v", err), true
+		}
+		return fmt.Sprintf(
+			"SUCCESS,count=%d,default=%s,payload=%s",
+			len(infos),
+			engine.DefaultDatabaseName(),
+			base64.StdEncoding.EncodeToString(encoded),
+		), true
+	}
+	return "", false
 }
 
 func (e *Engine) DefaultDatabaseName() string {

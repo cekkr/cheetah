@@ -94,6 +94,20 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 		var response string
 		parts := strings.SplitN(line, " ", 2)
 		command := strings.ToUpper(parts[0])
+		controlArgs := ""
+		if len(parts) > 1 {
+			controlArgs = parts[1]
+		}
+		// I comandi di scope engine (DB_CREATE, DB_LIST) stanno in engine.go, in
+		// una funzione condivisa con la CLI: non toccano il database corrente,
+		// ma non possono nemmeno passare da ExecuteCommand.
+		if handled, ok := engineControlCommand(s.engine, command, controlArgs); ok {
+			if _, err := io.WriteString(conn, handled+"\n"); err != nil {
+				logErrorf("Writing to %s: %v", conn.RemoteAddr(), err)
+				break
+			}
+			continue
+		}
 		switch command {
 		case "DATABASE":
 			if len(parts) < 2 {

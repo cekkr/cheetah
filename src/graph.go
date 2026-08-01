@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -2479,72 +2478,19 @@ func (db *Database) graphEnsureNode(id string) error {
 	return db.graphSyncNodeTerms(nil, &record)
 }
 
+// Le tre funzioni qui sotto sono rimaste come nomi della famiglia graph, ma il
+// corpo è la composizione generica "nome + payload" di commands.go: la
+// condividono con le righe delle record table.
 func (db *Database) graphGetPayloadByPairKey(pairKey []byte) ([]byte, bool, error) {
-	absKey, err := db.getPairValue(pairKey)
-	if err != nil {
-		if errors.Is(err, errPairNotFound) {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	payload, err := db.readValuePayload(absKey)
-	if err != nil {
-		return nil, false, err
-	}
-	return payload, true, nil
+	return db.getPairPayload(pairKey)
 }
 
 func (db *Database) graphUpsertPairPayload(pairKey []byte, payload []byte, hidden bool) (uint64, error) {
-	if len(pairKey) == 0 {
-		return 0, fmt.Errorf("empty_pair_key")
-	}
-	if len(payload) == 0 {
-		return 0, fmt.Errorf("empty_payload")
-	}
-	absKey, err := db.getPairValue(pairKey)
-	if err == nil {
-		resp, editErr := db.Edit(absKey, payload)
-		if editErr != nil {
-			return 0, editErr
-		}
-		if !strings.HasPrefix(resp, "SUCCESS") {
-			return 0, fmt.Errorf("graph_upsert_edit_failed:%s", resp)
-		}
-		return absKey, nil
-	}
-	if !errors.Is(err, errPairNotFound) {
-		return 0, err
-	}
-	newKey, err := db.insertPayloadBytes(payload)
-	if err != nil {
-		return 0, err
-	}
-	if err := db.setPairValue(pairKey, newKey, hidden); err != nil {
-		_, _ = db.Delete(newKey)
-		return 0, err
-	}
-	return newKey, nil
+	return db.upsertPairPayload(pairKey, payload, hidden)
 }
 
 func (db *Database) graphDeletePairAndPayload(pairKey []byte) (bool, error) {
-	absKey, err := db.getPairValue(pairKey)
-	if err != nil {
-		if errors.Is(err, errPairNotFound) {
-			return false, nil
-		}
-		return false, err
-	}
-	if _, err := db.PairDel(pairKey); err != nil {
-		return false, err
-	}
-	resp, err := db.Delete(absKey)
-	if err != nil && !isDeleteResponseIgnorable(resp) {
-		return false, err
-	}
-	if !isDeleteResponseIgnorable(resp) {
-		return false, fmt.Errorf("delete_abs_key_failed:%s", resp)
-	}
-	return true, nil
+	return db.deletePairAndPayload(pairKey)
 }
 
 func (db *Database) graphScanAdjacency(

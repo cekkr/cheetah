@@ -367,6 +367,173 @@ func ptrInt(v int) *int       { return &v }
 func ptrInt64(v int64) *int64 { return &v }
 func ptrBool(v bool) *bool    { return &v }
 
+// --- impostazioni ad hoc per database ---------------------------------------
+//
+// Gli override di un database non vivono solo in memoria: vengono scritti in
+// <data_dir>/<nome>/settings.ini e riletti a ogni apertura. Senza questo, un
+// database creato con impostazioni proprie tornava alle impostazioni generali
+// del server al primo riavvio — cioè le "impostazioni ad hoc" duravano quanto
+// il processo. L'ordine di merge è: [database] del config.ini → settings.ini
+// del database → override passati nel comando.
+//
+// Nota che la geometria del trie resta comunque decisa alla creazione e pinnata
+// in pairs/format.dat (pair_format.go): quel marcatore vince su tutto in
+// riapertura, e cambiarlo richiede un RESET_DB.
+
+const databaseSettingsFile = "settings.ini"
+
+func (ov DatabaseOverrides) isEmpty() bool {
+	return ov.PairIndexBytes == nil &&
+		ov.PayloadCacheEntries == nil &&
+		ov.PayloadCacheBytes == nil &&
+		ov.AdaptivePairIndex == nil &&
+		ov.PairListMaxBytes == nil &&
+		ov.PairListMaxFillPct == nil
+}
+
+// mergeDatabaseOverrides sovrappone extra a base, campo per campo.
+func mergeDatabaseOverrides(base DatabaseOverrides, extra DatabaseOverrides) DatabaseOverrides {
+	result := base
+	if extra.PairIndexBytes != nil {
+		result.PairIndexBytes = extra.PairIndexBytes
+	}
+	if extra.PayloadCacheEntries != nil {
+		result.PayloadCacheEntries = extra.PayloadCacheEntries
+	}
+	if extra.PayloadCacheBytes != nil {
+		result.PayloadCacheBytes = extra.PayloadCacheBytes
+	}
+	if extra.AdaptivePairIndex != nil {
+		result.AdaptivePairIndex = extra.AdaptivePairIndex
+	}
+	if extra.PairListMaxBytes != nil {
+		result.PairListMaxBytes = extra.PairListMaxBytes
+	}
+	if extra.PairListMaxFillPct != nil {
+		result.PairListMaxFillPct = extra.PairListMaxFillPct
+	}
+	return result
+}
+
+// renderDatabaseOverrides rende gli override nella stessa forma che il comando
+// accetta, così il file è anche la documentazione di come riprodurlo.
+func renderDatabaseOverrides(ov DatabaseOverrides) []string {
+	var lines []string
+	if ov.PairIndexBytes != nil {
+		lines = append(lines, fmt.Sprintf("pair_index_bytes=%d", *ov.PairIndexBytes))
+	}
+	if ov.AdaptivePairIndex != nil {
+		lines = append(lines, fmt.Sprintf("adaptive_pair_index=%d", boolToInt(*ov.AdaptivePairIndex)))
+	}
+	if ov.PairListMaxBytes != nil {
+		lines = append(lines, fmt.Sprintf("pair_list_max_bytes=%d", *ov.PairListMaxBytes))
+	}
+	if ov.PairListMaxFillPct != nil {
+		lines = append(lines, fmt.Sprintf("pair_list_max_fill_percent=%d", *ov.PairListMaxFillPct))
+	}
+	if ov.PayloadCacheEntries != nil {
+		lines = append(lines, fmt.Sprintf("payload_cache_entries=%d", *ov.PayloadCacheEntries))
+	}
+	if ov.PayloadCacheBytes != nil {
+		lines = append(lines, fmt.Sprintf("payload_cache_bytes=%d", *ov.PayloadCacheBytes))
+	}
+	return lines
+}
+
+// loadDatabaseSettings legge il file di impostazioni di un database. Un file
+// assente non è un errore: significa "nessun override, valgono le generali".
+func loadDatabaseSettings(path string) (DatabaseOverrides, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return DatabaseOverrides{}, nil
+		}
+		return DatabaseOverrides{}, err
+	}
+	var tokens []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		tokens = append(tokens, line)
+	}
+	return parseDatabaseOverrideTokens(tokens)
+}
+
+func saveDatabaseSettings(path string, ov DatabaseOverrides) error {
+	lines := renderDatabaseOverrides(ov)
+	if len(lines) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	body := "# cheetah-db: impostazioni ad hoc di questo database.\n" +
+		"# Sovrascrivono la sezione [database] di config.ini a ogni apertura.\n" +
+		strings.Join(lines, "\n") + "\n"
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// databaseSettingTokens è la forma "k=v" ordinata delle impostazioni efficaci,
+// usata nelle risposte dei comandi di scope engine.
+func databaseSettingTokens(cfg DatabaseConfig) []string {
+	return []string{
+		fmt.Sprintf("pair_index_bytes=%d", cfg.PairIndexBytes),
+		fmt.Sprintf("adaptive_pair_index=%d", boolToInt(cfg.AdaptivePairIndex)),
+		fmt.Sprintf("pair_list_max_bytes=%d", cfg.PairListMaxBytes),
+		fmt.Sprintf("pair_list_max_fill_percent=%d", cfg.PairListMaxFillPercent),
+		fmt.Sprintf("payload_cache_entries=%d", cfg.PayloadCacheEntries),
+		fmt.Sprintf("payload_cache_bytes=%d", cfg.PayloadCacheBytes),
+	}
+}
+
+func databaseSettingMap(cfg DatabaseConfig) map[string]any {
+	return map[string]any{
+		"pair_index_bytes":           cfg.PairIndexBytes,
+		"adaptive_pair_index":        cfg.AdaptivePairIndex,
+		"pair_list_max_bytes":        cfg.PairListMaxBytes,
+		"pair_list_max_fill_percent": cfg.PairListMaxFillPercent,
+		"payload_cache_entries":      cfg.PayloadCacheEntries,
+		"payload_cache_bytes":        cfg.PayloadCacheBytes,
+	}
+}
+
+// validateDatabaseName tiene il nome dentro una singola cartella di data_dir.
+// Un nome è un pezzo di percorso: senza questo controllo "../../etc" apriva un
+// database fuori da data_dir.
+func validateDatabaseName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("missing database name")
+	}
+	if len(name) > maxDatabaseNameLen {
+		return fmt.Errorf("database name too long")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid database name %q", name)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '-' || r == '.':
+		default:
+			return fmt.Errorf("invalid database name %q", name)
+		}
+	}
+	return nil
+}
+
+const maxDatabaseNameLen = 64
+
 func parseDatabaseTarget(arg string) (string, *DatabaseOverrides, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
@@ -374,6 +541,9 @@ func parseDatabaseTarget(arg string) (string, *DatabaseOverrides, error) {
 	}
 	tokens := strings.Fields(arg)
 	name := tokens[0]
+	if err := validateDatabaseName(name); err != nil {
+		return "", nil, err
+	}
 	if len(tokens) == 1 {
 		return name, nil, nil
 	}

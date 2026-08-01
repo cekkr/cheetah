@@ -276,6 +276,87 @@ func (db *Database) PairDel(value []byte) (string, error) {
 	return "SUCCESS,pair_deleted", nil
 }
 
+// --- nome + payload in un colpo solo ---------------------------------------
+//
+// Le tre funzioni qui sotto sono la composizione "un nome del trie che punta a
+// un payload": la usano i record del grafo (graph.go) e le righe delle record
+// table (record_table.go), che di per sé non hanno un archivio proprio. Stanno
+// qui e non in una delle due famiglie perché non appartengono a nessuna: sono
+// il layer dei valori più il layer dei nomi tenuti allineati.
+
+// getPairPayload risolve un nome e ne legge il payload.
+func (db *Database) getPairPayload(pairKey []byte) ([]byte, bool, error) {
+	absKey, err := db.getPairValue(pairKey)
+	if err != nil {
+		if errors.Is(err, errPairNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	payload, err := db.readValuePayload(absKey)
+	if err != nil {
+		return nil, false, err
+	}
+	return payload, true, nil
+}
+
+// upsertPairPayload riscrive il payload di un nome esistente o ne crea uno
+// nuovo. La EDIT conserva la chiave assoluta anche quando la lunghezza cambia,
+// quindi chi ha annotato la chiave continua a leggere il record aggiornato.
+func (db *Database) upsertPairPayload(pairKey []byte, payload []byte, hidden bool) (uint64, error) {
+	if len(pairKey) == 0 {
+		return 0, fmt.Errorf("empty_pair_key")
+	}
+	if len(payload) == 0 {
+		return 0, fmt.Errorf("empty_payload")
+	}
+	absKey, err := db.getPairValue(pairKey)
+	if err == nil {
+		resp, editErr := db.Edit(absKey, payload)
+		if editErr != nil {
+			return 0, editErr
+		}
+		if !strings.HasPrefix(resp, "SUCCESS") {
+			return 0, fmt.Errorf("pair_payload_edit_failed:%s", resp)
+		}
+		return absKey, nil
+	}
+	if !errors.Is(err, errPairNotFound) {
+		return 0, err
+	}
+	newKey, err := db.insertPayloadBytes(payload)
+	if err != nil {
+		return 0, err
+	}
+	if err := db.setPairValue(pairKey, newKey, hidden); err != nil {
+		_, _ = db.Delete(newKey)
+		return 0, err
+	}
+	return newKey, nil
+}
+
+// deletePairAndPayload stacca il nome e cancella il valore che indicava.
+func (db *Database) deletePairAndPayload(pairKey []byte) (bool, error) {
+	absKey, err := db.getPairValue(pairKey)
+	if err != nil {
+		if errors.Is(err, errPairNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := db.PairDel(pairKey); err != nil {
+		return false, err
+	}
+	resp, err := db.Delete(absKey)
+	if err != nil && !isDeleteResponseIgnorable(resp) {
+		return false, err
+	}
+	if !isDeleteResponseIgnorable(resp) {
+		return false, fmt.Errorf("delete_abs_key_failed:%s", resp)
+	}
+	return true, nil
+}
+
 // PairPurge removes every pair entry beneath the provided prefix and deletes the
 // associated payload keys in bulk. It returns the number of entries cleared.
 func (db *Database) PairPurge(prefix []byte, limit int) (int, error) {

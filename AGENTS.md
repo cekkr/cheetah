@@ -127,6 +127,12 @@ handlers it calls), never in a front-end, so CLI and TCP never drift — **with 
 the connection-scoped `DATABASE` / `RESET_DB` / `EXIT` commands, which are handled in the front-ends
 because they mutate per-connection "current database" state.
 
+Between those two layers sits a third, smaller one: commands that address the **engine** rather than a
+database (`DB_CREATE`, `DB_LIST`). A `Database` cannot see the registry it belongs to, so they cannot
+live in `ExecuteCommand`; but they are not connection-scoped either, so they are implemented once in
+[`engine.go`](src/engine.go) (`engineControlCommand`) and merely *called* by both front-ends. Prefer
+that shape over a second copy in each loop.
+
 ---
 
 ## Critical implementation contracts
@@ -228,6 +234,35 @@ because they mutate per-connection "current database" state.
 - **Prediction tables persist as fixed-byte `CHPREDTB` files**, not JSON. JSON appears only on the
   CLI/TCP wire ([`prediction_table.go`](src/prediction_table.go)); legacy `.json` tables are auto-migrated
   on first open.
+- **Record-table field offsets are immutable; that is what makes ALTER free.** A `RECORD alter add=`
+  appends the new field at the current row width and a `drop=` leaves the retired field's bytes where
+  they are ([`record_schema.go`](src/record_schema.go)). Consequence: a row written under *any* past
+  schema decodes correctly under the current one, and a row shorter than `RowWidth` is a row that
+  predates an ADD — its missing tail fields read `nil`/`null`, never zero. Never reassign an offset
+  outside `compacted()`, and never make `dropField` shift the fields after it: doing either
+  reinterprets every stored row in silence.
+- **Record rows are keyed by generation, and the schema rename is the commit point.** Rows live at
+  `\x06rr:<table>/<generation>/<key>` ([`record_table.go`](src/record_table.go)). `recordCompact`
+  copies every row into generation+1, *then* renames the schema file into place, then purges the old
+  generation. Keep that order: writing the schema first would leave readers pointed at rows that do
+  not exist yet. It also purges the target prefix before copying, so the leftovers of an interrupted
+  compaction can never be mistaken for fresh rows.
+- **`RECORD set` is a read-modify-write and must stay serialized per row.** It patches only the named
+  fields, so two concurrent sets on one key would otherwise drop each other's fields; the stripe lock
+  is `recordRowLocks` ([`record_table.go`](src/record_table.go)). Row ops take the table's `RLock` and
+  then a row lock; schema mutations take the `Lock` and **never** a row lock — reversing that nests
+  the two in both orders.
+- **Reserved trie prefixes now run `\x01`…`\x06`.** `\x06rr:` belongs to record-table rows, alongside
+  the five graph prefixes. Never emit user keys under any of them.
+- **A database name is a single path component.** `validateDatabaseName` ([`config.go`](src/config.go))
+  gates `GetDatabase`/`CreateDatabase`/`ResetDatabase` and `parseDatabaseTarget`; without it
+  `RESET_DB ../..` resolved (and deleted) outside `data_dir`. Any new engine entry point taking a name
+  from the wire must call it.
+- **Per-database settings are persisted, and the pair format still wins.** `DB_CREATE`/`DATABASE`
+  overrides are written to `<db>/settings.ini` and re-read at every open, layered
+  defaults → file → session ([`config.go`](src/config.go), [`engine.go`](src/engine.go)). This does
+  **not** make trie geometry mutable: `pairs/format.dat` remains authoritative on reopen, so a changed
+  `pair_index_bytes` still needs a `RESET_DB`.
 
 ---
 
@@ -252,6 +287,7 @@ client ── TCP ──►  server.go (per-conn loop)                          
                  ├─ reducers.go        PAIR_REDUCE counts/probs/continuations + graph degree/triangle/pagerank
                  ├─ graph.go           GRAPH_* nodes/edges/adjacency/query
                  │    └─ graph_recall.go  GRAPH_RECALL/SIMILAR/TERM_INDEX (associative recall)
+                 ├─ record_*.go        RECORD multi-field tables (schema file + rows in the trie)
                  ├─ prediction_*.go    PREDICT_* tables + context matrices
                  └─ cluster_*.go       CLUSTER_*/FORK_ASSIGN topology, gossip
                          ▲
@@ -286,16 +322,21 @@ handling.
 
 - **Key functions:**
   - `main` — wiring order (config → monitor → engine → TCP goroutine → shutdown hook → CLI).
-  - `runCLI` — the interactive read/eval loop; owns `DATABASE`, `RESET_DB`, `EXIT`, and delegates
-    everything else to `currentDB.ExecuteCommand`.
+  - `runCLI` — the interactive read/eval loop; owns `DATABASE`, `RESET_DB`, `EXIT`, calls
+    `engineControlCommand` for the engine-scoped ones, and delegates everything else to
+    `currentDB.ExecuteCommand`.
   - `setupGracefulShutdown` — closes the engine + monitor on SIGINT/SIGTERM.
 - **Common mistakes:** A new connection-scoped command must be added to **both** `runCLI` here and
-  `handleConnection` in [`server.go`](src/server.go); adding it to only one silently diverges CLI and TCP.
+  `handleConnection` in [`server.go`](src/server.go); adding it to only one silently diverges CLI and
+  TCP. A command that is engine-scoped but *not* connection-scoped (`DB_CREATE`, `DB_LIST`) belongs in
+  `engineControlCommand` ([`engine.go`](src/engine.go)) instead, which both front-ends already call —
+  that is the only shape here that cannot drift.
 
 #### [`src/server.go`](src/server.go)
 
 The TCP front-end. Accepts connections, optionally enables OS keep-alives, reads newline-delimited
-commands, and routes them exactly like the CLI (`DATABASE`/`RESET_DB` locally, else `ExecuteCommand`).
+commands, and routes them exactly like the CLI (`DB_CREATE`/`DB_LIST` through
+`engineControlCommand`, `DATABASE`/`RESET_DB` locally, else `ExecuteCommand`).
 
 - **Key symbols:** `TCPServer`, `NewTCPServer`, `Start` (listener + keep-alive), `handleConnection`
   (per-connection current-DB state + command loop).
@@ -305,10 +346,18 @@ commands, and routes them exactly like the CLI (`DATABASE`/`RESET_DB` locally, e
 #### [`src/engine.go`](src/engine.go)
 
 Multi-tenant database registry. Lazily constructs and caches [`Database`](src/database.go) handles under
-`basePath/<name>`, applies per-name overrides, and closes all databases on shutdown.
+`basePath/<name>`, applies per-name overrides, and closes all databases on shutdown. It also owns the
+two engine-scoped commands, since a `Database` cannot see the registry it belongs to.
 
-- **Key symbols:** `Engine`, `GetDatabase` (lazy create + cache), `ResetDatabase` (close + `RemoveAll`
-  + drop from map), `SetDatabaseOverrides`, `DefaultDatabaseName`, `Close`.
+- **Key symbols:** `Engine`, `GetDatabase`/`getDatabaseLocked` (lazy create + cache),
+  `ResetDatabase` (close + `RemoveAll` + drop from map), `SetDatabaseOverrides`,
+  `resolveSettingsLocked`, `EffectiveSettings`, `CreateDatabase`, `ListDatabases`/`DatabaseInfo`,
+  `engineControlCommand`, `DefaultDatabaseName`, `Close`.
+- **Settings layering:** `resolveSettingsLocked` composes `cfg.DatabaseDefaults` →
+  `<db>/settings.ini` → the session overrides recorded by `SetDatabaseOverrides`. `getDatabaseLocked`
+  then writes the session overrides back to that file, which is what makes an ad-hoc setting outlive
+  the process. `CreateDatabase` differs from `GetDatabase` only in refusing an existing directory
+  (`errDatabaseExists`) — ad-hoc geometry has no effect on one that already exists.
 - **Shutdown is idempotent end to end.** `Engine.Close` empties the registry, so a second call does
   nothing and a later `GetDatabase` reopens instead of handing back a closed handle;
   `Database.Close` is guarded by a `sync.Once` (it returns the first call's error), and so are
@@ -326,11 +375,17 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
 
 - **Key symbols:** `Config`, `DatabaseConfig`, `DatabaseOverrides`; `defaultConfig`, `loadConfig`,
   `assignConfigValue` (`[server]`/`[database]`/`[tuning]` sections), `applyEnvOverrides`, `normalize`,
-  `mergeDatabaseConfig`, `parseDatabaseTarget`.
+  `mergeDatabaseConfig`, `mergeDatabaseOverrides`, `parseDatabaseTarget`, `validateDatabaseName`;
+  the per-database settings file (`databaseSettingsFile`, `loadDatabaseSettings`,
+  `saveDatabaseSettings`, `renderDatabaseOverrides`, `databaseSettingTokens`, `databaseSettingMap`).
 - **Config keys** (`config.ini`): `[server] listen_addr, data_dir, default_database,
   keepalive_seconds|tcp_keepalive_seconds`; `[database] pair_bytes|pair_index_bytes,
   payload_cache_entries, payload_cache_mb, payload_cache_bytes, adaptive_pair_index`;
   `[tuning] max_pair_tables, pair_list_max_bytes, pair_list_max_fill_percent`.
+- **`<data_dir>/<db>/settings.ini`** holds the same keys for one database, written in the dialect the
+  commands accept, and is applied on top of `[database]` at every open. It is deleted (not emptied)
+  when a database ends up with no overrides, and it disappears with the directory on `RESET_DB` — the
+  overrides recorded on the name are rewritten on the reopen that follows.
 - **Common mistakes:** `normalize` clamps `pair_index_bytes` into `[1,2]` but maps `≤0`→**2** (not the
   `defaultConfig` value of 1). All env keys are enumerated in [Configuration reference](#configuration-reference).
 
@@ -420,6 +475,12 @@ micro-command ([`micro_del.go`](src/micro_del.go)); the rest it calls directly.
   `PairSetHidden`, `PairGet`, `PairDel`, `PairPurge`/`PairPurgeWithOptions`/`purgePairEntries`
   (batched namespace wipe; the `WithOptions` form carries `DEL pairs … payloads=0`, which unlinks the
   names and leaves the values addressable by absolute key).
+- **The "name + payload" composition lives here:** `getPairPayload`, `upsertPairPayload`,
+  `deletePairAndPayload` — resolve/insert-or-edit/erase a trie name and the value behind it in one
+  call. Graph records ([`graph.go`](src/graph.go), whose `graph*PairPayload` helpers are now thin
+  wrappers) and record-table rows ([`record_table.go`](src/record_table.go)) both build on them; put a
+  third consumer here too rather than re-implementing the upsert, whose subtlety is that an `Edit`
+  keeps the absolute key even when the payload length changes.
 - **Depends on:** [`tables.go`](src/tables.go), [`helpers.go`](src/helpers.go), [`cache.go`](src/cache.go).
 - **Common mistakes:** `Insert` validates that a `INSERT:<n>` declared size matches the payload; the
   size partitions the value table, so a wrong size lands the payload in the wrong file.
@@ -607,8 +668,8 @@ until the dispatcher boundary so an alias formatter can read it by name), `micro
 - **Key symbols:** `microField`/`mf`/`mfi`/`mfu`, `microResponse` (`Render`/`Get`/`Has`/`IsError`),
   `microOK`/`microFail`/`microFailf`/`microPending`/`microSilent`, `microHandler`, `microCall`,
   `microCommandRegistry`, `ensureCommandRegistries` (the one-time `sync.Once` that builds all three
-  package-level tables), `registerDefaultMicroCommands`, `splitMicroArgs`, `microParseBytes`/
-  `microEncodeBytes`, `Database.executeMicroCommand`.
+  package-level tables), `registerDefaultMicroCommands` (`DEL`, `JOB`, `RECORD`), `splitMicroArgs`,
+  `microParseBytes`/`microEncodeBytes`, `Database.executeMicroCommand`.
 - **Common mistakes:** `microSilent()` (empty `Status`) is the "only an error to propagate" case and
   renders as the empty string — do not confuse it with `microFail`. `microEncodeBytes` always emits
   `x<hex>`: the micro dialect splits tokens on whitespace, so a pair key containing a space or
@@ -617,10 +678,10 @@ until the dispatcher boundary so an alias formatter can read it by name), `micro
 #### [`src/micro_del.go`](src/micro_del.go)
 
 The `DEL` micro-command — one erasure verb with the scope in the arguments (`DEL values key=`,
-`DEL pairs key=`/`prefix=`, `DEL graph node=`/`from=`+`to=`).
+`DEL pairs key=`/`prefix=`, `DEL graph node=`/`from=`+`to=`, `DEL records table=`+`key=`/`drop=1`).
 
 - **Key symbols:** `microDel`, `microDelValues`, `microDelPairs`, `microDelGraph`,
-  `microDelGraphNode`, `microDelGraphEdge`, `microRawResponse`.
+  `microDelGraphNode`, `microDelGraphEdge`, `microDelRecords`, `microRawResponse`.
 - **Common mistakes:** its error tokens are deliberately the *same words* the legacy commands used
   (`not_found`, `already_deleted`, `node_not_found`), which is what lets the aliases pass errors
   through unformatted. `RESET_DB` is not a `DEL` target — it is front-end scoped.
@@ -747,6 +808,65 @@ First-class uncertainty and ambiguity on edges: the modality scale (words ↔ nu
   relative and get normalized); a standalone `confidence=` may not. Groups are anchored to one node's
   adjacency — there is no global group index.
 
+### Record tables (multi-field rows)
+
+#### [`src/record_schema.go`](src/record_schema.go)
+
+The declared shape of a record table: field kinds, per-field byte widths, the value codec between the
+text protocol and the packed row, the `CHRS` schema file, and the per-database registry.
+
+- **Key symbols:** `recordFieldKind` (`uint`/`int`/`float`/`bool`/`bytes`/`string`) with
+  `recordKindAliases`/`recordDefaultWidths`/`validateRecordFieldWidth`; `RecordField`
+  (`encodeInto`/`decodeFrom`), `RecordSchema` (`addField`, `dropField`, `fieldByName`,
+  `refreshDerived`, `clone`, `compacted`, `encode`) and `decodeRecordSchema`; validation
+  (`validateRecordFieldName`, `validateRecordTableName`, `recordReservedNames`,
+  `parseRecordFieldSpec`/`parseRecordFieldSpecs`); `RecordTable` (schema + `sync.RWMutex` +
+  `persistLocked`) and `RecordManager` (`Get`/`Create`/`Drop`/`List`, lazy directory scan).
+- **On-disk format:** `records/<table>.schema` — `RecordHeaderSize` (24 B) header (`"CHRS"`, version,
+  field count, row width, generation) then `RecordFieldHeaderSize` (12 B) descriptors + names. Written
+  by `persistLocked` through a temp file and a rename, which is the commit point of a compaction.
+- **Common mistakes:** `addField` is append-only by design and `dropField` deliberately leaves a hole
+  — see [Critical contracts](#critical-implementation-contracts). Field names must stay distinct from
+  the `RECORD` modifiers (`recordReservedNames`), since in `RECORD set` a field *is* an argument; the
+  check belongs at definition time. `bytes` fields decode padded (a fixed field has no own length),
+  `string` fields trim trailing NULs.
+
+#### [`src/record_table.go`](src/record_table.go)
+
+The rows: pair keys, read-modify-write, scan, delete, drop and compaction. Rows are ordinary payloads
+under `\x06rr:<table>/<generation>/<key>`, so they inherit the payload cache, slot recycling and the
+paged trie walk.
+
+- **Key symbols:** `recordRowPrefix`, `recordTablePrefix`/`recordGenerationPrefix`/`recordRowPairKey`,
+  `recordRowLocks`/`recordRowLockFor`, `recordRowView`, `recordDecodeRow`; `Database` methods
+  `recordSetRow`, `recordGetRow`, `recordScanRows`, `recordDeleteRow`, `recordAlterTable`,
+  `recordCompact`, `recordDropTable`, `recordCountRows`.
+- **Depends on:** [`commands.go`](src/commands.go) (`getPairPayload`/`upsertPairPayload`/
+  `deletePairAndPayload`), [`database.go`](src/database.go) (`PairScanWithOptions`,
+  `PairSummaryWithOptions`, `PairPurgeWithOptions`). **Tests:** [`record_test.go`](src/record_test.go).
+- **Common mistakes:** `recordCompact` truncates a rewritten row at the last field the source row
+  actually had — padding it to the full width would turn "never written" into zero. It also holds the
+  table's write lock and must never take a row lock (lock order is row → schema everywhere else).
+  `recordSetRow` always writes the *current* row width, which is how a stale row catches up with an
+  ADD.
+
+#### [`src/micro_record.go`](src/micro_record.go)
+
+The `RECORD` micro-command: `define`, `alter`, `compact`, `schema`, `tables`, `set`, `get`, `scan`.
+Deletion is not here — `DEL records` ([`micro_del.go`](src/micro_del.go)) is, because `DEL` is the
+protocol's only erasure verb.
+
+- **Key symbols:** `microRecord` (target dispatch), `Database.recordResolveTable`,
+  `recordSchemaFields`, `recordPayloadField`, `recordValueParams`, `isRecordUserError`, and the
+  per-target handlers `microRecordDefine`/`Alter`/`Compact`/`Schema`/`Tables`/`Set`/`Get`/`Scan`.
+- **Common mistakes:** `recordValueParams` treats every non-reserved argument as a field value, so a
+  typo in a modifier name lands as `ERROR,unknown_field:<typo>` rather than being ignored — that is
+  intentional. `RECORD schema` reports `rows=` only with `rows=1`: the count is a full subtree walk
+  (`recordCountRows` → `PairSummaryWithOptions`), and a description of a table must not implicitly
+  cost what reading it costs. `isRecordUserError` decides which errors become an `ERROR,` line and which propagate as
+  Go errors; a new validation error must be recognisable by its token prefix or it surfaces as an
+  internal error.
+
 ### Cluster coordination
 
 #### [`src/cluster_scheduler.go`](src/cluster_scheduler.go)
@@ -865,6 +985,26 @@ protection of `ManagedFile.file`, `cached` without the per-`sectorEntry` `dataMu
 Shutdown lifecycle: `TestDatabaseCloseIsIdempotent` (three consecutive `Close` calls) and
 `TestEngineCloseIsIdempotent` (double `Engine.Close`, then a `GetDatabase` that must reopen and still
 read its data). Both panicked with "close of closed channel" before the stop channels were guarded.
+
+#### [`src/record_test.go`](src/record_test.go)
+
+The record-table contracts end to end through `ExecuteCommand`:
+`TestRecordTableMultiFieldLifecycle` (define/set/get, partial update, projection, the error
+wordings), `TestRecordTableAddAndDropField` (a stale row reads `null` for a field it predates and the
+drop leaves the survivors' offsets alone), `TestRecordTableCompactReclaimsHoles` (dead bytes
+recovered, values preserved, "never written" still `null`, the old generation purged),
+`TestRecordTableScanAndDelete` (prefix + cursor paging, `DEL records key=`/`drop=1`),
+`TestRecordConcurrentPartialUpdates` (eight writers, eight fields, one key — the stripe lock),
+`TestRecordSchemaSurvivesReopen`, `TestRecordFieldWidthsAndTypes` (every type at every declared
+width, round-tripped).
+
+#### [`src/engine_control_test.go`](src/engine_control_test.go)
+
+The engine-scoped commands and per-database settings: `TestDatabaseCreateWithAdHocSettings`
+(`DB_CREATE` overrides only that database, refuses an existing name, and survives a restart),
+`TestDatabaseOverridesFromDatabaseCommandPersist`, `TestDatabaseListReportsSettings`, and
+`TestDatabaseNameStaysInsideDataDir` — the traversal guard, which is the one that protects a
+`RESET_DB` from deleting outside `data_dir`.
 
 #### [`src/benchmark_test.go`](src/benchmark_test.go)
 
@@ -997,8 +1137,11 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   (free list of deleted key rows), `values_<size>_<id>.table`,
   `values_<size>.recycle.table` (free list of value slots; both carry the `"CHRL"` header),
   `pairs/<hexid>.table` + `pairs/next_id.dat` + `pairs/format.dat`,
-  `pair_jumps/{jumps.bin,index.bin,next_id.dat}`, `prediction_<name>.table`, `cluster_topology.json`.
-  Source of truth is the engine; these are outputs.
+  `pair_jumps/{jumps.bin,index.bin,next_id.dat}`, `prediction_<name>.table`,
+  `records/<table>.schema` (the `"CHRS"` record-table schemas; the rows themselves live in the trie),
+  `settings.ini` (this database's ad-hoc overrides), `cluster_topology.json`.
+  Source of truth is the engine; these are outputs — but note that `settings.ini` is the one an
+  operator may legitimately hand-edit, since it is the per-database half of the configuration.
 
 ---
 
@@ -1147,6 +1290,34 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   is normalized only when written through the `GRAPH_AMBIGUITY_*` commands and is anchored to one
   node's adjacency.
 
+### Record tables (multi-field rows) — Shipped
+
+- **Behavior:** `RECORD define/alter/compact/schema/tables/set/get/scan` plus `DEL records`. A table
+  declares named fields with per-field byte widths; a row packs them side by side in one payload under
+  `\x06rr:<table>/<generation>/<key>`. `alter add=`/`drop=` are schema-only — no row is rewritten —
+  and `compact` is the explicit rewrite that reclaims a dropped field's bytes.
+- **Owners:** [`record_schema.go`](src/record_schema.go) (shape + codec + `CHRS` file),
+  [`record_table.go`](src/record_table.go) (rows), [`micro_record.go`](src/micro_record.go) (protocol),
+  `microDelRecords` in [`micro_del.go`](src/micro_del.go).
+- **Why:** the same key repeated under `cnt:`, `prob:` and `meta:` was three entries, three payloads
+  and three round-trips describing one thing, with nothing keeping them consistent.
+- **Gaps:** no secondary index over field values (a `RECORD scan` filters by row-key prefix only, and
+  by-value selection is a client-side pass); no reducer mode reads fields directly; the binders
+  ([`binders/`](binders/)) do not wrap the family yet, so clients send the lines themselves; a
+  compaction doubles the table's disk footprint until the old generation is purged.
+
+### Per-database ad-hoc settings — Shipped
+
+- **Behavior:** `DB_CREATE <name> [key=value …]` creates a database with settings that override the
+  server's `[database]` defaults for that database alone, refusing an existing name; `DB_LIST` reports
+  every database with its effective settings. Overrides given to `DATABASE`/`RESET_DB` are recorded the
+  same way. They persist in `<data_dir>/<name>/settings.ini` and are re-read at every open.
+- **Owners:** [`engine.go`](src/engine.go) (`CreateDatabase`, `resolveSettingsLocked`,
+  `engineControlCommand`), [`config.go`](src/config.go) (file format, `validateDatabaseName`).
+- **Gaps:** changing a persisted setting on an existing database means editing the file (or reissuing
+  `DATABASE <name> key=value`) and reopening — there is no live re-tune command; trie geometry still
+  needs `RESET_DB` because `pairs/format.dat` is authoritative.
+
 ### Prediction tables + context matrices — Shipped (GPU path simulated)
 
 - **Behavior:** `PREDICT_SET/QUERY/TRAIN/CTX/INHERIT(+batch/async)/BACKEND/BENCH` over fixed-byte
@@ -1245,8 +1416,10 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 - **Symptom:** a connection-scoped command works over TCP but not the CLI (or vice-versa).
 - **Cause:** `DATABASE`/`RESET_DB` are duplicated in [`main.go`](src/main.go) `runCLI` and
   [`server.go`](src/server.go) `handleConnection`; everything else routes through `ExecuteCommand`.
-- **Safe pattern:** put new logic in `ExecuteCommand` whenever possible; if it must be
-  connection-scoped, edit both front-ends together.
+- **Safe pattern:** put new logic in `ExecuteCommand` whenever possible; if it needs the engine but
+  not the connection, put it in `engineControlCommand` ([`engine.go`](src/engine.go)) — both
+  front-ends call it, so there is one implementation (`DB_CREATE`, `DB_LIST`). Only a genuinely
+  connection-scoped command justifies editing both front-ends together.
 
 ---
 
@@ -1258,7 +1431,9 @@ plus the two front-end handlers. There is no generated API manifest.
 | Command(s) | Owner |
 | --- | --- |
 | `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](src/main.go) `runCLI`, [`server.go`](src/server.go) `handleConnection`, [`engine.go`](src/engine.go) |
-| `DEL`, `JOB` (micro-commands) | [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go) |
+| `DB_CREATE`, `DB_LIST` (engine-scoped) | [`engine.go`](src/engine.go) `engineControlCommand`, called by both front-ends |
+| `DEL`, `JOB`, `RECORD` (micro-commands) | [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
+| `RECORD define/alter/compact/schema/tables/set/get/scan`, `DEL records` | [`micro_record.go`](src/micro_record.go), [`record_table.go`](src/record_table.go), [`record_schema.go`](src/record_schema.go) |
 | `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL`, `GRAPH_EDGE_DEL`, `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH` (aliases over the above) | [`command_alias.go`](src/command_alias.go) |
 | `INSERT`, `READ`, `EDIT` | [`commands.go`](src/commands.go) |
 | `PAIR_SET(_HIDDEN)`, `PAIR_GET` | [`commands.go`](src/commands.go) |
@@ -1385,6 +1560,9 @@ single binary.
 ### Configuration reference
 
 Settings resolve as: `config.ini` (or `CHEETAH_CONFIG_PATH`) → environment overrides → normalize.
+Per **database**, one more layer follows: `[database]` defaults → `<data_dir>/<name>/settings.ini` →
+the overrides passed to `DB_CREATE`/`DATABASE`/`RESET_DB` (which are then written back to that file).
+There are no environment variables for a single database — the file *is* the per-database channel.
 
 Environment variables read by the server (all verified in-tree):
 
@@ -1457,6 +1635,17 @@ seen in old docs are **client-side**; the server does not read them.
 | Term index maintained on write, dropped with the node, rebuildable, switchable | [`TestGraphTermIndexLifecycle`](src/graph_recall_test.go) |
 | Complete node references round-trip, preserve/clear, and feed lexical lookup | [`TestGraphNodeReferencesRoundTripAndFeedTheTermIndex`](src/graph_recall_test.go) |
 | Recall hydrates bounded node sentences + episodic `edge.props.src` payloads | [`TestGraphRecallHydratesCompleteNodeAndEpisodeReferences`](src/graph_recall_test.go) |
+| Record tables: define/set/get, partial update, projection, error wordings | [`TestRecordTableMultiFieldLifecycle`](src/record_test.go) |
+| Schema evolution: a stale row reads `null` for a field it predates; a drop leaves the survivors' offsets alone | [`TestRecordTableAddAndDropField`](src/record_test.go) |
+| Compaction reclaims dead bytes, preserves values and `null`s, purges the old generation | [`TestRecordTableCompactReclaimsHoles`](src/record_test.go) |
+| Record row paging by key prefix + cursor; `DEL records key=`/`drop=1` | [`TestRecordTableScanAndDelete`](src/record_test.go) |
+| Concurrent partial updates on one row keep every field | [`TestRecordConcurrentPartialUpdates`](src/record_test.go) (`-race`) |
+| Record schema round-trips through the `CHRS` file across a reopen | [`TestRecordSchemaSurvivesReopen`](src/record_test.go) |
+| Every field type at every declared width, encode → decode | [`TestRecordFieldWidthsAndTypes`](src/record_test.go) |
+| `DB_CREATE` ad-hoc settings apply to one database and survive a restart | [`TestDatabaseCreateWithAdHocSettings`](src/engine_control_test.go) |
+| `DATABASE key=value` overrides persist next to the data | [`TestDatabaseOverridesFromDatabaseCommandPersist`](src/engine_control_test.go) |
+| `DB_LIST` reports effective settings + `ad_hoc_settings` | [`TestDatabaseListReportsSettings`](src/engine_control_test.go) |
+| A database name cannot escape `data_dir` | [`TestDatabaseNameStaysInsideDataDir`](src/engine_control_test.go) |
 | `LOG_FLUSH` answers on one line and leaves the next response aligned | [`TestLogFlush*`](src/logger_test.go) |
 | Edge-property secondary index | [`TestGraphPropertySecondaryIndexAndPredicate`](src/graph_test.go) |
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go) |
@@ -1490,13 +1679,19 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   `cheetah_data/*` and the binary are `.gitignore`d.
 - **On-disk compatibility:** the byte formats in [`types.go`](src/types.go) and the `CHPREDTB` prediction
   format are unversioned wire contracts. The pair-node container **is** versioned (`"CHPT"` header +
-  `PairFormatVersion`) and pinned per database by `pairs/format.dat` (`"CHPF"`). Legacy migrations
+  `PairFormatVersion`) and pinned per database by `pairs/format.dat` (`"CHPF"`). Record-table schemas
+  are versioned too (`"CHRS"` + `RecordFormatVersion`, [`record_schema.go`](src/record_schema.go)) and
+  refuse an unknown version rather than guessing a layout. Legacy migrations
   that *do* exist: per-file `.jump` → `pair_jumps/*.bin` ([`jump_store.go`](src/jump_store.go)), and
   prediction `.json` → binary ([`prediction_table.go`](src/prediction_table.go)). The pre-header pair
   format has **no** migration: such a directory is refused at open and must be rebuilt with
   `RESET_DB`. New format changes need an explicit version byte and a read-old/write-new path.
 - **Trust / validation:** the protocol is unauthenticated plaintext over TCP on `0.0.0.0:4455` by
   default. There is **no auth, TLS, or access control** — bind it to a trusted network or loopback.
+  The one place where wire input reaches the filesystem as a *path* is the database name, which
+  `validateDatabaseName` ([`config.go`](src/config.go)) keeps to a single component; record-table names
+  are constrained the same way (`validateRecordTableName`). Any new name-to-path mapping must
+  validate before joining.
   `CLUSTER_GOSSIP` accepts base64 JSON from peers and applies fork payloads; only enable clustering
   among trusted nodes.
 - **Secrets:** none are stored or expected. Do not add credentials to `config.ini` or this handbook.
@@ -1522,6 +1717,10 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - Associative recall: multi-seed `GRAPH_RECALL` with noisy-OR convergence, bounded complete node/
   episodic reference hydration, `GRAPH_SIMILAR`, and the `\x05gt:` lexical term index behind
   `GRAPH_TERM_INDEX`.
+- Multi-field record tables: declared per-field byte widths, rows packed into one payload, add/drop a
+  field on a live table without rewriting rows, explicit `RECORD compact` to reclaim dead space.
+- Per-database ad-hoc settings (`DB_CREATE`/`DB_LIST`, persisted in `<db>/settings.ini`) and a
+  database-name guard that keeps a name inside `data_dir`.
 - Prediction tables with context-matrix train/query/inherit and CPU merge path.
 - Managed-file layer, payload cache, resource monitor, `SYSTEM_STATS`/`LOG_FLUSH`/`FILE_CHECKPOINT`.
 - Cluster topology registration, fork assignment, gossip, and `CLUSTER_MOVE` payload transfer.

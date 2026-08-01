@@ -74,6 +74,16 @@ func runCLI(engine *Engine) {
 		var response string
 		parts := strings.SplitN(line, " ", 2)
 		command := strings.ToUpper(parts[0])
+		controlArgs := ""
+		if len(parts) > 1 {
+			controlArgs = parts[1]
+		}
+		// Stessi comandi di scope engine del front-end TCP, stessa funzione:
+		// vedi engineControlCommand in engine.go.
+		if handled, ok := engineControlCommand(engine, command, controlArgs); ok {
+			fmt.Println(handled)
+			continue
+		}
 		switch command {
 		case "DATABASE":
 			if len(parts) < 2 {

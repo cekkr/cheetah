@@ -66,6 +66,7 @@ type Database struct {
 	jumpLegacyFiles  bool // la cartella conteneva jump nel vecchio formato a file singolo
 	forkScheduler    *ForkScheduler
 	predictStore     *PredictionManager
+	recordStore      *RecordManager
 	clusterMessenger *ClusterMessenger
 	jobs             *microJobManager
 	reducers         *ReducerRegistry
@@ -460,6 +461,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		reducers:           newReducerRegistry(),
 	}
 	db.predictStore = newPredictionManager(path)
+	db.recordStore = newRecordManager(filepath.Join(path, "records"))
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
 	db.registerDefaultReducers()
 

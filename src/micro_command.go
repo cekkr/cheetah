@@ -218,6 +218,7 @@ func resolveJobCommand(name string) *jobCommand {
 func registerDefaultMicroCommands(registry *microCommandRegistry) {
 	registry.Register("DEL", microDel)
 	registry.Register("JOB", microJobCommand)
+	registry.Register("RECORD", microRecord)
 }
 
 // splitMicroArgs separa il bersaglio dai modificatori. Il bersaglio è il primo

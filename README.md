@@ -20,6 +20,13 @@ other dense analytical slices must be served with predictable latency.
   allocate full tables, and **adaptive node indexing** keeps a sparse node as a compact
   binary-searched list instead of reserving its whole branch array — so the wide stride no longer
   costs ~707 KB per node.
+- **Multi-field record tables.** `RECORD` declares a table whose rows carry several fixed-width
+  fields — `cnt:uint:4,prob:float:4,label:string:12` — so one thing is described by *one* row instead
+  of the same key repeated under `cnt:`, `prob:` and `meta:`. Byte widths are per field and declared,
+  which keeps the row arithmetic; a field can be **added or removed on a live table** without
+  rewriting a single row, because offsets never move and a row shorter than the current schema simply
+  reads `null` for what it predates. `RECORD compact` reclaims the space a removal left behind, when
+  you want it back.
 - **Associative recall.** `GRAPH_RECALL` takes several terms at once and spreads activation from all
   of them, returning everything they co-activate above a requested precision — each hit with the
   seeds that reached it, its distance, the edges that justify it, and a novelty score. Because the
@@ -59,8 +66,13 @@ holds documentation, `config.example.ini`, `build.sh`, and the two standalone bu
     compaction pauses.
   - `PairTable` nodes store child pointers and terminal flags independently, unlocking
     prefix-sharing namespaces such as `ctx:`, `ctxv:`, `prob:`, or `meta:`.
+- `src/record_schema.go` and `src/record_table.go` implement multi-field **record tables**: a
+  fixed-byte schema file per table (`records/<name>.schema`) plus rows stored as ordinary payloads
+  under a reserved trie prefix, with fields addressable by declared offset and width.
 - `src/server.go` accepts newline-delimited commands (`INSERT`, `READ`, `PAIR_SCAN`, `PAIR_REDUCE`, …)
-  over TCP so external adapters can talk to the engine without embedding Go code.
+  over TCP so external adapters can talk to the engine without embedding Go code. `DB_CREATE` and
+  `DB_LIST` are answered one level up, by `engineControlCommand` in `src/engine.go`, because they
+  address the registry of databases rather than one database.
 
 ## Heavy Statistical Workloads
 
@@ -175,7 +187,7 @@ Three argument dialects coexist, which is why a command's family is easier to gu
 | Dialect | Used by | Example |
 | --- | --- | --- |
 | **positional** | the KV and `PAIR_*` families, `LOG_FLUSH`, `FORK_ASSIGN`, job polling | `PAIR_SCAN ctx: 64 x000104` |
-| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*` | `GRAPH_DEGREE id=alice direction=both` |
+| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*`, the micro-commands (`DEL`, `JOB`, `RECORD`) | `GRAPH_DEGREE id=alice direction=both` |
 | **clause language** | `GRAPH_QUERY` only | `MATCH (id='alice')-[:follows]->(*) HOPS 1..2 RETURN paths` |
 
 `FILE_CHECKPOINT` adds a fourth, smaller convention: bare uppercase flags (`DROP_CACHE`,
@@ -203,6 +215,9 @@ them, so nothing below replaces anything you already use.
 | `DEL pairs prefix=<p> [limit=<n>] [payloads=0\|1]` | `PAIR_PURGE` | a namespace; `payloads=0` unlinks the names and leaves the values readable by key — the one thing `PAIR_PURGE` could not say. `prefix=*` is the whole trie |
 | `DEL graph node=<id> [cascade=1]` | `GRAPH_NODE_DEL` | a node, optionally with its edges |
 | `DEL graph from=<a> to=<b> [type=] [directed=]` | `GRAPH_EDGE_DEL` | one edge |
+| `DEL records table=<t> key=<k>` | — | one row of a record table |
+| `DEL records table=<t> drop=1` | — | the whole record table: every row, every generation, and the schema |
+| `RECORD define \| alter \| compact \| schema \| tables \| set \| get \| scan` | — | multi-field tables, see [Record tables](#record-tables--one-thing-many-fields) |
 | `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`), anything else is `ERROR,command_not_submittable` |
 | `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS` | `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters |
 | `JOB fetch id=<job>` | `PAIR_REDUCE_FETCH`, `PREDICT_INHERIT_FETCH` | the submitted command's own response under `job=<id>` while completed, `PENDING,…` while running, and it consumes the job |
@@ -344,9 +359,11 @@ value layer   INSERT / READ / EDIT / DELETE      bytes, addressed by a numeric k
 name  layer   PAIR_SET / PAIR_GET / PAIR_DEL …   byte prefixes in a trie → numeric keys
   ├─ views over one walk  PAIR_SCAN (names) · PAIR_SUMMARY (statistics) · PAIR_REDUCE (payloads)
   ├─ graph records        GRAPH_* — nodes/edges/adjacency under reserved \x01..\x05 prefixes
+  ├─ record tables        RECORD — declared multi-field rows under the reserved \x06 prefix
   └─ recall               GRAPH_RECALL / GRAPH_SIMILAR / GRAPH_TERM_INDEX
 side tables   PREDICT_*                          prediction_<name>.table files, not the trie
-control       DATABASE / RESET_DB · CLUSTER_* / FORK_ASSIGN · SYSTEM_STATS / LOG_FLUSH / FILE_CHECKPOINT
+control       DATABASE / RESET_DB / DB_CREATE / DB_LIST · CLUSTER_* / FORK_ASSIGN
+              SYSTEM_STATS / LOG_FLUSH / FILE_CHECKPOINT
 ```
 
 A value and a name are independent on purpose: `INSERT` returns a key, `PAIR_SET` binds a name to
@@ -355,28 +372,45 @@ why four different commands delete four different things.
 
 ### Session and database scope
 
-Handled in the front-ends ([`src/main.go`](src/main.go), [`src/server.go`](src/server.go)), not in
-the dispatcher, because they mutate per-connection state.
+Handled in the front-ends ([`src/main.go`](src/main.go), [`src/server.go`](src/server.go)) rather
+than in the dispatcher, for two different reasons: `DATABASE`/`RESET_DB`/`EXIT` mutate per-connection
+state, while `DB_CREATE`/`DB_LIST` address the *engine* — the registry of databases — which a single
+`Database` handle knows nothing about. The latter two are implemented once in
+[`src/engine.go`](src/engine.go) (`engineControlCommand`) and called from both front-ends, so CLI and
+TCP cannot drift.
 
 | Command | What it means |
 | --- | --- |
-| `DATABASE <name> [key=value …]` | Point **this connection** at another logical database (`cheetah_data/<name>`), creating it on first use. Overrides are remembered for that name: `pair_bytes=`/`pair_index_bytes=`, `adaptive_pair_index=`, `pair_list_max_bytes=`, `pair_list_max_fill_percent=`, `payload_cache_entries=`, `payload_cache_mb=`, `payload_cache_bytes=`. The trie-geometry ones only bite when the directory is *created*. |
+| `DB_CREATE <name> [key=value …]` | **Create a new database with settings of its own**, without pointing the connection at it. The `key=value` tokens override, *for this database only*, the `[database]` section the server was started with; they are written to `cheetah_data/<name>/settings.ini` and re-read at every open, so they outlive the process. Refuses an existing name (`ERROR,database_exists:<name>`) — that refusal is the difference from `DATABASE`, which opens-or-creates and would silently adopt a populated directory. Answers with the settings the database was actually created with. |
+| `DB_LIST` | Every database directory under `data_dir`, with the settings each one would open with and whether it carries its own `settings.ini` (`ad_hoc_settings`). Reads the disk, not the registry: a database never opened in this process is still listed. Records travel in `payload=<base64 json>`. |
+| `DATABASE <name> [key=value …]` | Point **this connection** at another logical database (`cheetah_data/<name>`), creating it on first use. Overrides are remembered for that name and persisted next to its data exactly as with `DB_CREATE`: `pair_bytes=`/`pair_index_bytes=`, `adaptive_pair_index=`, `pair_list_max_bytes=`, `pair_list_max_fill_percent=`, `payload_cache_entries=`, `payload_cache_mb=`, `payload_cache_bytes=`. The trie-geometry ones only bite when the directory is *created*. |
 | `RESET_DB [name] [key=value …]` | Close the database, delete `cheetah_data/<name>` on disk, reopen it empty. The only way to adopt a new trie geometry, since `pairs/format.dat` wins on every ordinary open. Omitting the name resets whichever database the connection currently holds. |
 | `EXIT` | CLI only: leave the interactive loop. A TCP client just closes the socket. |
 
-**In context** — you keep each experiment in its own database, and a benchmark run needs the wide
-stride, which only a rebuild can adopt:
+A database name is a single path component: letters, digits, `_`, `-` and `.`, at most 64 characters.
+Anything else — a `/`, a `..` — is refused rather than resolved against `data_dir`.
+
+**In context** — a benchmark database is created over the wire with its own geometry and cache
+budget, and the settings survive a restart because they live beside the data:
 
 ```text
-[cheetah_data/default]> DATABASE notes
-SUCCESS,database_changed_to_notes
-[cheetah_data/notes]> DATABASE bench pair_bytes=2 payload_cache_entries=0
+[cheetah_data/default]> DB_CREATE bench pair_bytes=2 payload_cache_mb=256
+SUCCESS,database_created=bench,pair_index_bytes=2,adaptive_pair_index=1,pair_list_max_bytes=4096,pair_list_max_fill_percent=0,payload_cache_entries=16384,payload_cache_bytes=268435456
+[cheetah_data/default]> DB_CREATE bench
+ERROR,database_exists:bench
+[cheetah_data/default]> DB_LIST
+SUCCESS,count=2,default=default,payload=W3sibmFtZSI6ImJlbmNoIiwicGF0aCI6…
+# payload decodes to: [{"name":"bench","path":"cheetah_data/bench","loaded":true,"ad_hoc_settings":true,
+#                       "settings":{"pair_index_bytes":2,"payload_cache_bytes":268435456,…}},
+#                      {"name":"default",…,"ad_hoc_settings":false,"settings":{"pair_index_bytes":1,…}}]
+[cheetah_data/default]> DATABASE bench
 SUCCESS,database_changed_to_bench
-[cheetah_data/bench]> RESET_DB bench
-SUCCESS,database_reset_to_bench
-# the overrides were recorded on the name, so the rebuilt directory is the one that adopts them
-[cheetah_data/bench]> DATABASE notes
+[cheetah_data/bench]> DATABASE notes payload_cache_entries=0
 SUCCESS,database_changed_to_notes
+# same overrides, opened-or-created instead of refused; `notes` keeps them too
+[cheetah_data/notes]> RESET_DB notes
+SUCCESS,database_reset_to_notes
+# the overrides were recorded on the name, so the rebuilt directory is the one that adopts them
 ```
 
 ### Value layer — the bytes
@@ -480,6 +514,92 @@ SUCCESS,reducer=counts,job=reduce_1,state=queued
 SUCCESS,job=reduce_1,state=running,progress=0.00
 [cheetah_data/notes]> PAIR_REDUCE_FETCH reduce_1
 SUCCESS,reducer=counts,count=5,items=6374783a4245524c494e:1:Y3R4OkJFUkxJTnxDT05URVhUfHYy;…
+```
+
+### Record tables — one thing, many fields
+
+A pair name maps to exactly one payload, so describing one thing with several quantities used to mean
+several names: `cnt:berlin`, `prob:berlin`, `meta:berlin` — three trie entries, three payloads, three
+round-trips, and nothing keeping them consistent with each other. A **record table** declares those
+quantities once as fixed-width fields and stores them side by side in a single row.
+
+Rows are ordinary payloads under the reserved `\x06rr:` prefix, so they inherit the payload cache,
+slot recycling and paged scanning unchanged; what the table adds is a declared shape. The schema
+itself is a fixed-byte file, `records/<table>.schema` inside the database directory.
+
+| Command | What it means |
+| --- | --- |
+| `RECORD define table=<t> fields=<spec> [if_not_exists=1]` | Create the table. `<spec>` is `name:type[:bytes]` items separated by commas — `cnt:uint:4,prob:float:4,label:string:12`. Refuses an existing table unless `if_not_exists=1`, which answers with the stored schema and `created=0`. |
+| `RECORD alter table=<t> [add=<spec>] [drop=<name,…>] [compact=1]` | **Add or remove fields on a live table.** Neither touches a single row (see below); `compact=1` chains the rewrite when you want the space back immediately. |
+| `RECORD compact table=<t>` | Reclaim the bytes dropped fields left behind: offsets are reassigned with no holes and every row is rewritten. Reports `rewritten=<rows>` and the new `width`/`dead_bytes`/`generation`. |
+| `RECORD schema table=<t> [rows=1]` | The shape: field count, row width, dead bytes, generation, and the full field list (name/type/bytes/offset) in `payload=`. `rows=1` adds the live row count — opt-in because counting walks the whole subtree, and describing a table should not cost what reading it does. |
+| `RECORD tables` | Every record table in this database with its schema, in `payload=`. |
+| `RECORD set table=<t> key=<k> <field>=<value> …` | Upsert a row, writing **only the fields named** — the others keep the bytes they had. Answers `created=1` the first time, `written=<n>`, and the row's absolute key. |
+| `RECORD get table=<t> key=<k> [fields=<name,…>]` | One row as a JSON object in `payload=`. `fields=` projects; a field the row predates reads `null`. |
+| `RECORD scan table=<t> [prefix=<p>] [limit=<n>] [cursor=<c>] [fields=<name,…>]` | A page of rows — `{"key":"x<hex>","abs_key":<n>,"fields":{…}}` — with `next_cursor` when more remain. `prefix=` filters on the row key, exactly like `PAIR_SCAN` on a namespace. |
+| `DEL records table=<t> key=<k>` | Delete one row (name *and* payload). |
+| `DEL records table=<t> drop=1` | Delete the table: every row of every generation, then the schema file. |
+
+**Types and byte widths.** The width is per field and part of the declaration, because it is what
+keeps a row's addressing arithmetic:
+
+| Type | Widths | Wire form | Notes |
+| --- | --- | --- | --- |
+| `uint` | 1–8 (default 8) | decimal | big-endian; out-of-range is `ERROR,value_out_of_range:<field>` |
+| `int` | 1–8 (default 8) | decimal | two's complement, big-endian |
+| `float` | 4 or 8 (default 8) | decimal | 4 bytes is IEEE single — `0.9` reads back as `0.8999999761581421` |
+| `bool` | 1 | `1`/`0`/`true`/`false`/`yes`/`no` | |
+| `bytes` | 1–4096, **required** | `x<hex>` | zero-padded to the width and returned padded: a fixed field has no length of its own |
+| `string` | 1–4096, **required** | text, or `x<hex>` when it contains spaces | NUL-padded; trailing NULs are trimmed on read |
+
+Field names are lowercase `[a-z][a-z0-9_]*`, at most 48 characters, and may not be one of the
+command's own modifiers (`table`, `key`, `fields`, `prefix`, `limit`, `cursor`, `add`, `drop`,
+`type`, `bytes`, `width`, `name`, `id`, …) — in `RECORD set` a field *is* an argument, so the two
+must stay distinguishable. That is checked at `define`/`alter` time, not on writes.
+
+**What changing the schema does to existing rows.** This is the part worth internalising:
+
+- **`add=` never rewrites a row.** A new field is appended at the current row width, so no existing
+  field moves. Rows written earlier are *shorter* than the new width and read `null` for the new
+  field — not `0`, which would be a value nobody wrote. The next `RECORD set` on that row rewrites it
+  at full width, and the field becomes real.
+- **`drop=` never rewrites a row either.** The field disappears from the schema and its bytes stay
+  where they are, as dead space; the surviving fields keep their offsets and every stored row stays
+  readable. `width` therefore does not shrink on a drop — `dead_bytes` grows.
+- **`compact` is the only operation that touches rows**, which is why it is explicit. It copies every
+  row into the next generation under a new key prefix and only then swaps in the new schema, so an
+  interrupted compaction leaves the old layout intact rather than a half-converted table. Rows that
+  were still short stay short: what a row never had stays `null`.
+
+**In context** — one row per n-gram context instead of three namespaces, then a field added, one
+dropped, and the space reclaimed:
+
+```text
+[cheetah_data/notes]> RECORD define table=ngram fields=cnt:uint:4,prob:float:4,label:string:12
+SUCCESS,table=ngram,fields=3,width=20,dead_bytes=0,generation=1,created=1
+[cheetah_data/notes]> RECORD set table=ngram key=berlin cnt=42 prob=0.25 label=city
+SUCCESS,table=ngram,key=x6265726c696e,created=1,written=3,abs_key=1
+[cheetah_data/notes]> RECORD set table=ngram key=berlin cnt=43
+SUCCESS,table=ngram,key=x6265726c696e,created=0,written=1,abs_key=1
+# one field written; prob and label keep their bytes
+[cheetah_data/notes]> RECORD get table=ngram key=berlin
+SUCCESS,table=ngram,key=x6265726c696e,abs_key=1,fields=3,payload=eyJjbnQiOjQzLCJsYWJlbCI6ImNpdHkiLCJwcm9iIjowLjI1fQ==
+# payload decodes to: {"cnt":43,"label":"city","prob":0.25}
+
+[cheetah_data/notes]> RECORD alter table=ngram add=novelty:float:4 drop=label
+SUCCESS,table=ngram,fields=3,width=24,dead_bytes=12,generation=1,added=1,dropped=1
+[cheetah_data/notes]> RECORD get table=ngram key=berlin
+SUCCESS,…,payload=eyJjbnQiOjQzLCJub3ZlbHR5IjpudWxsLCJwcm9iIjowLjI1fQ==
+# payload decodes to: {"cnt":43,"novelty":null,"prob":0.25}
+# the row predates `novelty`, and `label`'s 12 bytes are still there — as dead space, not as a field
+
+[cheetah_data/notes]> RECORD compact table=ngram
+SUCCESS,table=ngram,fields=3,width=12,dead_bytes=0,generation=2,rewritten=1
+[cheetah_data/notes]> RECORD scan table=ngram limit=8
+SUCCESS,table=ngram,count=1,payload=W3sia2V5IjoieDYyNjU3MjZjNjk2ZSIsImFic19rZXkiOjMsImZpZWxkcyI6…
+# payload decodes to: [{"key":"x6265726c696e","abs_key":3,"fields":{"cnt":43,"novelty":null,"prob":0.25}}]
+[cheetah_data/notes]> DEL records table=ngram key=berlin
+SUCCESS,deleted=1,table=ngram,key=x6265726c696e
 ```
 
 ### Graph — writing what is the case
@@ -775,6 +895,13 @@ price. The distinctions that actually matter:
   magnitude, not correctness.
 - **`PAIR_SET` vs `PAIR_SET_HIDDEN`** — one flag bit on one entry, not a second namespace. Every
   reader can opt back in with `include_hidden=1`.
+- **`PAIR_SET` vs `RECORD set` vs `GRAPH_NODE_SET`** — one name → one payload, one key → several
+  declared fixed-width fields, one entity → labels, free-form props and its relations. Reach for a
+  record table when the same key would otherwise be repeated under several namespaces; reach for the
+  graph when what matters is what the thing is *connected to*.
+- **`RECORD alter drop=` vs `RECORD compact`** — retiring a field vs reclaiming its bytes. The first
+  is a schema edit that no row notices; the second is the rewrite, and the only one that costs
+  anything.
 - **synchronous vs `_ASYNC` + `_STATUS`/`_FETCH`** — identical work, different envelope. Both
   families (`PAIR_REDUCE_*`, `PREDICT_INHERIT_*`) now run on the single `JOB` envelope and keep their
   own response fields only in their alias formatters, so a job id, a progress percentage and a
@@ -812,6 +939,10 @@ price. The distinctions that actually matter:
   `GRAPH_NEIGHBORS`/`GRAPH_QUERY` always execute as prefix scans over an adjacency index. The full
   `GRAPH_QUERY` grammar — patterns, predicates, `HOPS`/`BRANCH_LIMIT`/`COST_LIMIT`, `RETURN` modes —
   is in [Pattern queries](#pattern-queries--graph_query).
+- `RECORD scan` pages the same way with named arguments instead of positional ones —
+  `limit=`/`cursor=`, the cursor being the `x<hex>` token the previous page returned — and each row
+  arrives already decoded into its declared fields, so a scan of a record table costs one request,
+  not one `READ` per row.
 - Every paging command uses the same convention: `next_cursor=*` (or absent) means the scan is
   exhausted, and `*` as an *input* cursor or prefix means "start from the beginning / no prefix".
 

@@ -11,6 +11,8 @@
 //	DEL pairs  prefix=<p> [limit=<n>] [payloads=0|1]
 //	DEL graph  node=<id> [cascade=1]
 //	DEL graph  from=<a> to=<b> [type=<t>] [directed=0|1]
+//	DEL records table=<t> key=<k>
+//	DEL records table=<t> drop=1
 //
 // RESET_DB resta fuori: vive nel front-end perché muta lo stato "database
 // corrente" della connessione, non il contenuto di un database (vedi
@@ -30,6 +32,8 @@ func microDel(db *Database, args microArgs) (microResponse, error) {
 		return db.microDelPairs(args)
 	case "graph":
 		return db.microDelGraph(args)
+	case "records", "record":
+		return db.microDelRecords(args)
 	case "":
 		return microFail("del_requires_target"), nil
 	default:
@@ -96,6 +100,42 @@ func (db *Database) microDelPairs(args microArgs) (microResponse, error) {
 		return microSilent(), err
 	}
 	return microOK(mfi("deleted", removed)), nil
+}
+
+// microDelRecords cancella una riga di una record table oppure, con drop=1, la
+// tabella intera: righe di ogni generazione più il file di schema. Il selettore
+// resta negli argomenti, come per gli altri bersagli — "una chiave" e "tutto"
+// non sono due verbi diversi.
+func (db *Database) microDelRecords(args microArgs) (microResponse, error) {
+	table, failure, ok := db.recordResolveTable(args)
+	if !ok {
+		return failure, nil
+	}
+	if args.flag("drop", false) {
+		removed, dropped, err := db.recordDropTable(table.name)
+		if err != nil {
+			return microSilent(), err
+		}
+		if !dropped {
+			return microFailf("record_table_not_found:%s", table.name), nil
+		}
+		return microOK(mfi("deleted", removed), mf("table", table.name), mfi("dropped", 1)), nil
+	}
+	key, parseErr := microParseBytes(args.get("key"))
+	if parseErr != nil {
+		return microRawResponse(parseErr.Error()), nil
+	}
+	if len(key) == 0 {
+		return microFail("del_records_requires_key_or_drop"), nil
+	}
+	deleted, err := db.recordDeleteRow(table, key)
+	if err != nil {
+		return microSilent(), err
+	}
+	if !deleted {
+		return microFail("not_found"), nil
+	}
+	return microOK(mfi("deleted", 1), mf("table", table.name), mf("key", microEncodeBytes(key))), nil
 }
 
 func (db *Database) microDelGraph(args microArgs) (microResponse, error) {
