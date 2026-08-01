@@ -6,7 +6,10 @@
 //   protocol    pure codec — build a command line, parse a response line
 //   client      one socket (CheetahClient) or several (CheetahPool)
 //   kv / graph  free functions over a connection: the two-step write, scans,
-//               nodes, edges, associative recall
+//   records     nodes, edges, associative recall, multi-field rows
+//   jobs        detached commands: submit, poll, fetch once
+//   predict     prediction tables — PREDICT_*
+//   admin       the server and the registry of databases, not the data
 //   database    CheetahDatabase — the plumbing an application ends up writing
 //               around all of the above, meant to be subclassed
 //
@@ -24,23 +27,31 @@
 //       }
 //   }
 
+const admin = require('./lib/admin');
 const client = require('./lib/client');
 const database = require('./lib/database');
 const graph = require('./lib/graph');
+const jobs = require('./lib/jobs');
 const keys = require('./lib/keys');
 const kv = require('./lib/kv');
+const predict = require('./lib/predict');
 const protocol = require('./lib/protocol');
+const records = require('./lib/records');
 const server = require('./lib/server');
 const vocabulary = require('./lib/vocabulary');
 
 module.exports = {
     // Submodules, for callers who want the free-function layers.
+    admin,
     client,
     database,
     graph,
+    jobs,
     keys,
     kv,
+    predict,
     protocol,
+    records,
     server,
     vocabulary,
 

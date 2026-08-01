@@ -46,6 +46,12 @@ class FakeCheetahServer:
         self.jobs: dict[str, str] = {}
         self.commands: list[str] = []
         self.database = "default"
+        # Record tables: the schema, and rows keyed by (table, generation, key).
+        # A row remembers the row width it was written at, which is what makes
+        # "a field added later reads null" reproducible without packing bytes.
+        self.record_tables: dict[str, dict[str, Any]] = {}
+        self.record_rows: dict[tuple[str, int, bytes], dict[str, Any]] = {}
+        self.databases: dict[str, dict[str, Any]] = {"default": {}}
         self._next_key = 1
 
     # -- dispatch ------------------------------------------------------- #
@@ -213,6 +219,21 @@ class FakeCheetahServer:
             if self.pairs.pop(key_bytes, None) is None:
                 return "ERROR,not_found"
             return "SUCCESS,deleted=1"
+        if target in {"records", "record"}:
+            table = fields.get("table", "")
+            if table not in self.record_tables:
+                return f"ERROR,record_table_not_found:{table}"
+            if fields.get("drop") == "1":
+                doomed = [row for row in self.record_rows if row[0] == table]
+                for row in doomed:
+                    del self.record_rows[row]
+                del self.record_tables[table]
+                return f"SUCCESS,deleted={len(doomed)},table={table},dropped=1"
+            key = _parse_value(fields.get("key", ""))
+            generation = self.record_tables[table]["generation"]
+            if self.record_rows.pop((table, generation, key), None) is None:
+                return "ERROR,not_found"
+            return f"SUCCESS,deleted=1,table={table},key=x{key.hex()}"
         if target == "graph":
             node = fields.get("node")
             if node is not None:
@@ -321,7 +342,277 @@ class FakeCheetahServer:
             return inner.replace("SUCCESS,", f"SUCCESS,job={job_id},", 1)
         return "ERROR,unknown_job_action"
 
+    # -- record tables -------------------------------------------------- #
+    #
+    # Enough of the real semantics to be worth testing against: offsets are
+    # append-only, a drop leaves a hole, a row shorter than the current width
+    # reads null for the fields it predates, and compaction bumps a generation.
+    _RECORD_DEFAULT_WIDTHS = {"uint": 8, "int": 8, "float": 8, "bool": 1}
+
+    def _record_parse_fields(self, spec: str) -> list[dict[str, Any]]:
+        parsed: list[dict[str, Any]] = []
+        for entry in spec.split(","):
+            if not entry.strip():
+                continue
+            parts = entry.split(":")
+            name, kind = parts[0], parts[1]
+            width = int(parts[2]) if len(parts) > 2 else self._RECORD_DEFAULT_WIDTHS[kind]
+            parsed.append({"name": name, "type": kind, "bytes": width})
+        return parsed
+
+    def _record_schema_line(self, table: str, *extra: str, payload: bool = False) -> str:
+        schema = self.record_tables[table]
+        live = sum(field["bytes"] for field in schema["fields"])
+        line = (
+            f"SUCCESS,table={table},fields={len(schema['fields'])},width={schema['width']},"
+            f"dead_bytes={schema['width'] - live},generation={schema['generation']}"
+        )
+        for token in extra:
+            line += f",{token}"
+        if payload:
+            body = {
+                "table": table,
+                "fields": schema["fields"],
+                "width": schema["width"],
+                "dead_bytes": schema["width"] - live,
+                "generation": schema["generation"],
+            }
+            line += ",payload=" + base64.b64encode(
+                json.dumps(body).encode("utf-8")
+            ).decode("ascii")
+        return line
+
+    def _record_decode(self, field: dict[str, Any], token: str | None) -> Any:
+        if token is None:
+            zero = {"uint": 0, "int": 0, "float": 0.0, "bool": False, "string": ""}
+            return zero.get(field["type"], "x" + "00" * field["bytes"])
+        if field["type"] in {"uint", "int"}:
+            return int(token)
+        if field["type"] == "float":
+            return float(token)
+        if field["type"] == "bool":
+            return token.lower() in {"1", "true", "yes", "on"}
+        raw = _parse_value(token)
+        if field["type"] == "bytes":
+            return "x" + raw.ljust(field["bytes"], b"\0").hex()
+        return raw.decode("utf-8", "replace")
+
+    def _record_row_view(self, table: str, row: dict[str, Any], only: set[str] | None) -> dict[str, Any]:
+        schema = self.record_tables[table]
+        view: dict[str, Any] = {}
+        for field in schema["fields"]:
+            if only is not None and field["name"] not in only:
+                continue
+            if field["offset"] + field["bytes"] > row["width"]:
+                view[field["name"]] = None  # written before the field existed
+            else:
+                view[field["name"]] = self._record_decode(field, row["values"].get(field["name"]))
+        return view
+
+    def _do_record(self, rest: str) -> str:
+        action, _, options = rest.partition(" ")
+        fields = _kv_args(options)
+        table = fields.get("table", "")
+        if action in {"tables", "list"}:
+            bodies = []
+            for name in sorted(self.record_tables):
+                schema = self.record_tables[name]
+                live = sum(field["bytes"] for field in schema["fields"])
+                bodies.append(
+                    {
+                        "table": name,
+                        "fields": schema["fields"],
+                        "width": schema["width"],
+                        "dead_bytes": schema["width"] - live,
+                        "generation": schema["generation"],
+                    }
+                )
+            payload = base64.b64encode(json.dumps(bodies).encode("utf-8")).decode("ascii")
+            return f"SUCCESS,count={len(bodies)},payload={payload}"
+        if action in {"define", "create"}:
+            if table in self.record_tables:
+                if fields.get("if_not_exists") == "1":
+                    return self._record_schema_line(table, "created=0")
+                return f"ERROR,record_table_exists:{table}"
+            schema: dict[str, Any] = {"fields": [], "width": 0, "generation": 1}
+            self.record_tables[table] = schema
+            for field in self._record_parse_fields(fields.get("fields", "")):
+                field["offset"] = schema["width"]
+                schema["width"] += field["bytes"]
+                schema["fields"].append(field)
+            return self._record_schema_line(table, "created=1")
+        if table not in self.record_tables:
+            return f"ERROR,record_table_not_found:{table}"
+        schema = self.record_tables[table]
+        if action == "alter":
+            dropped = 0
+            for name in (fields.get("drop") or "").split(","):
+                if not name:
+                    continue
+                before = len(schema["fields"])
+                schema["fields"] = [f for f in schema["fields"] if f["name"] != name]
+                if len(schema["fields"]) == before:
+                    return f"ERROR,unknown_field:{name}"
+                dropped += 1
+            added = 0
+            for field in self._record_parse_fields(fields.get("add", "")):
+                field["offset"] = schema["width"]
+                schema["width"] += field["bytes"]
+                schema["fields"].append(field)
+                added += 1
+            extra = [f"added={added}", f"dropped={dropped}"]
+            if fields.get("compact") == "1":
+                extra.append(f"rewritten={self._record_compact(table)}")
+            return self._record_schema_line(table, *extra)
+        if action == "compact":
+            rewritten = self._record_compact(table)
+            return self._record_schema_line(table, f"rewritten={rewritten}")
+        if action in {"schema", "info", "describe"}:
+            extra = []
+            if fields.get("rows") == "1":
+                extra.append(f"rows={self._record_row_count(table)}")
+            return self._record_schema_line(table, *extra, payload=True)
+        if action in {"set", "put"}:
+            key = _parse_value(fields.get("key", ""))
+            row_key = (table, schema["generation"], key)
+            row = self.record_rows.get(row_key)
+            created = row is None
+            if row is None:
+                row = {"width": 0, "values": {}, "abs_key": self._next_key}
+                self._next_key += 1
+            written = 0
+            for name, token in fields.items():
+                if name in {"table", "key"}:
+                    continue
+                if not any(field["name"] == name for field in schema["fields"]):
+                    return f"ERROR,unknown_field:{name}"
+                row["values"][name] = token
+                written += 1
+            row["width"] = schema["width"]  # a write brings the row up to date
+            self.record_rows[row_key] = row
+            return (
+                f"SUCCESS,table={table},key=x{key.hex()},created={1 if created else 0},"
+                f"written={written},abs_key={row['abs_key']}"
+            )
+        if action in {"get", "read"}:
+            key = _parse_value(fields.get("key", ""))
+            row = self.record_rows.get((table, schema["generation"], key))
+            if row is None:
+                return "ERROR,not_found"
+            only = set(filter(None, (fields.get("fields") or "").split(","))) or None
+            view = self._record_row_view(table, row, only)
+            payload = base64.b64encode(json.dumps(view).encode("utf-8")).decode("ascii")
+            return (
+                f"SUCCESS,table={table},key=x{key.hex()},abs_key={row['abs_key']},"
+                f"fields={len(view)},payload={payload}"
+            )
+        if action == "scan":
+            prefix = _parse_value(fields["prefix"]) if fields.get("prefix") else b""
+            cursor = _parse_value(fields["cursor"]) if fields.get("cursor") else b""
+            limit = int(fields.get("limit") or 500)
+            only = set(filter(None, (fields.get("fields") or "").split(","))) or None
+            keys = sorted(
+                key
+                for (name, generation, key) in self.record_rows
+                if name == table and generation == schema["generation"]
+                and key.startswith(prefix) and key > cursor
+            )
+            page = keys[:limit]
+            rows = []
+            for key in page:
+                row = self.record_rows[(table, schema["generation"], key)]
+                rows.append(
+                    {
+                        "key": "x" + key.hex(),
+                        "abs_key": row["abs_key"],
+                        "fields": self._record_row_view(table, row, only),
+                    }
+                )
+            payload = base64.b64encode(json.dumps(rows).encode("utf-8")).decode("ascii")
+            line = f"SUCCESS,table={table},count={len(rows)}"
+            if len(keys) > limit:
+                line += f",next_cursor=x{page[-1].hex()}"
+            return line + f",payload={payload}"
+        return "ERROR,unknown_record_target"
+
+    def _record_row_count(self, table: str) -> int:
+        generation = self.record_tables[table]["generation"]
+        return sum(
+            1
+            for (name, gen, _key) in self.record_rows
+            if name == table and gen == generation
+        )
+
+    def _record_compact(self, table: str) -> int:
+        schema = self.record_tables[table]
+        old_generation = schema["generation"]
+        old_fields = list(schema["fields"])
+        new_fields: list[dict[str, Any]] = []
+        width = 0
+        for field in old_fields:
+            moved = dict(field)
+            moved["offset"] = width
+            width += moved["bytes"]
+            new_fields.append(moved)
+        rewritten = 0
+        moved_rows: dict[tuple[str, int, bytes], dict[str, Any]] = {}
+        for (name, generation, key), row in list(self.record_rows.items()):
+            if name != table or generation != old_generation:
+                continue
+            new_width = 0
+            values: dict[str, Any] = {}
+            for old, new in zip(old_fields, new_fields):
+                if old["offset"] + old["bytes"] > row["width"]:
+                    continue  # the row predates this field; it stays absent
+                if old["name"] in row["values"]:
+                    values[old["name"]] = row["values"][old["name"]]
+                new_width = new["offset"] + new["bytes"]
+            moved_rows[(table, old_generation + 1, key)] = {
+                "width": new_width,
+                "values": values,
+                "abs_key": row["abs_key"],
+            }
+            del self.record_rows[(name, generation, key)]
+            rewritten += 1
+        self.record_rows.update(moved_rows)
+        schema["fields"] = new_fields
+        schema["width"] = width
+        schema["generation"] = old_generation + 1
+        return rewritten
+
     # -- session -------------------------------------------------------- #
+    def _do_db_create(self, rest: str) -> str:
+        parts = rest.split()
+        name = parts[0] if parts else ""
+        if name in self.databases:
+            return f"ERROR,database_exists:{name}"
+        settings = _kv_args(" ".join(parts[1:]))
+        self.databases[name] = settings
+        effective = {
+            "pair_index_bytes": settings.get("pair_bytes", settings.get("pair_index_bytes", "1")),
+            "adaptive_pair_index": settings.get("adaptive_pair_index", "1"),
+            "pair_list_max_bytes": settings.get("pair_list_max_bytes", "4096"),
+            "pair_list_max_fill_percent": settings.get("pair_list_max_fill_percent", "0"),
+            "payload_cache_entries": settings.get("payload_cache_entries", "16384"),
+            "payload_cache_bytes": settings.get("payload_cache_bytes", "67108864"),
+        }
+        rendered = ",".join(f"{key}={value}" for key, value in effective.items())
+        return f"SUCCESS,database_created={name},{rendered}"
+
+    def _do_db_list(self, rest: str) -> str:
+        infos = [
+            {
+                "name": name,
+                "path": f"cheetah_data/{name}",
+                "loaded": name == self.database,
+                "ad_hoc_settings": bool(settings),
+                "settings": {"pair_index_bytes": int(settings.get("pair_bytes", 1))},
+            }
+            for name, settings in sorted(self.databases.items())
+        ]
+        payload = base64.b64encode(json.dumps(infos).encode("utf-8")).decode("ascii")
+        return f"SUCCESS,count={len(infos)},default=default,payload={payload}"
+
     def _do_database(self, rest: str) -> str:
         self.database = rest.split()[0] if rest.strip() else self.database
         return f"SUCCESS,database={self.database}"

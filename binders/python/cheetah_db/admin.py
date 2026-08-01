@@ -15,16 +15,39 @@ from .client import CheetahError
 from .protocol import Response, build_command, build_key_value_command, numeric_field
 
 __all__ = [
+    "DATABASE_SETTINGS",
+    "DatabaseInfo",
     "SystemStats",
     "cluster_gossip",
     "cluster_move",
     "cluster_status",
     "cluster_update",
+    "create_database",
     "file_checkpoint",
     "fork_assign",
+    "list_databases",
     "log_flush",
+    "reset_database",
     "system_stats",
+    "use_database",
 ]
+
+#: The per-database settings ``DB_CREATE``/``DATABASE``/``RESET_DB`` accept.
+#: They override the server's own ``[database]`` section for that database
+#: alone and are persisted next to its data (``<db>/settings.ini``), so they
+#: survive a restart. The trie-geometry ones only bite when the directory is
+#: *created*: ``pairs/format.dat`` wins on every ordinary open, which is why
+#: adopting a new stride means :func:`reset_database`.
+DATABASE_SETTINGS = (
+    "pair_bytes",
+    "pair_index_bytes",
+    "adaptive_pair_index",
+    "pair_list_max_bytes",
+    "pair_list_max_fill_percent",
+    "payload_cache_entries",
+    "payload_cache_mb",
+    "payload_cache_bytes",
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +75,133 @@ class SystemStats:
         if hits is None or misses is None or (hits + misses) == 0:
             return None
         return hits / (hits + misses)
+
+
+# --------------------------------------------------------------------------- #
+# Databases — the engine, not one database
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class DatabaseInfo:
+    """One row of ``DB_LIST``.
+
+    ``ad_hoc`` says the database carries a ``settings.ini`` of its own, which is
+    the difference between "these are the server's settings" and "these are
+    this database's settings".
+    """
+
+    name: str
+    path: str
+    loaded: bool
+    ad_hoc: bool
+    settings: dict[str, Any]
+
+
+def _settings_fields(settings: Mapping[str, Any] | None, **kwargs: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(settings or {})
+    merged.update({key: value for key, value in kwargs.items() if value is not None})
+    unknown = [key for key in merged if key not in DATABASE_SETTINGS]
+    if unknown:
+        raise CheetahError(
+            f"cheetah database settings not understood: {', '.join(sorted(unknown))}; "
+            f"expected one of {', '.join(DATABASE_SETTINGS)}"
+        )
+    rendered: dict[str, Any] = {}
+    for key, value in merged.items():
+        rendered[key] = (1 if value else 0) if isinstance(value, bool) else value
+    return rendered
+
+
+def create_database(
+    conn: Any, name: str, settings: Mapping[str, Any] | None = None, **kwargs: Any
+) -> dict[str, Any]:
+    """``DB_CREATE`` — a **new** database, optionally with settings of its own.
+
+    Unlike :func:`use_database`, which opens-or-creates, this refuses a name
+    that already exists (``ERROR,database_exists:<name>``): a creation that
+    silently adopted a populated directory would also silently ignore the
+    settings you passed, since trie geometry is decided when the directory is
+    made. It does not point the connection at the new database — call
+    :func:`use_database` for that.
+
+    Returns the settings the database was actually created with.
+    """
+    parts = ["DB_CREATE", str(name)]
+    for key, value in _settings_fields(settings, **kwargs).items():
+        parts.append(f"{key}={value}")
+    response = conn.send(" ".join(parts))
+    if not response.ok:
+        raise CheetahError(f"cheetah DB_CREATE {name} failed: {response.reason}", response=response)
+    created = dict(response.fields)
+    created.pop("database_created", None)
+    return {
+        "name": response.field_value("database_created", name),
+        "settings": created,
+        "response": response,
+    }
+
+
+def list_databases(conn: Any) -> list[DatabaseInfo]:
+    """``DB_LIST`` — every database under ``data_dir`` and how it would open.
+
+    Reads the disk rather than the registry, so a database never opened in this
+    process is still listed.
+    """
+    response = conn.send("DB_LIST")
+    if not response.ok:
+        raise CheetahError(f"cheetah DB_LIST failed: {response.reason}", response=response)
+    payload = response.payload() or []
+    return [
+        DatabaseInfo(
+            name=str(entry.get("name", "")),
+            path=str(entry.get("path", "")),
+            loaded=bool(entry.get("loaded")),
+            ad_hoc=bool(entry.get("ad_hoc_settings")),
+            settings=dict(entry.get("settings") or {}),
+        )
+        for entry in payload
+    ]
+
+
+def use_database(
+    conn: Any, name: str, settings: Mapping[str, Any] | None = None, **kwargs: Any
+) -> Response:
+    """``DATABASE`` — point **this connection** at a database, creating it if new.
+
+    Connection-scoped: it changes what this socket is talking to and nothing
+    else, so a pool must be told database by database (which is what the
+    client's own ``database=`` option does at connect time). Settings given here
+    are recorded and persisted for that name exactly as with
+    :func:`create_database`.
+    """
+    parts = ["DATABASE", str(name)]
+    for key, value in _settings_fields(settings, **kwargs).items():
+        parts.append(f"{key}={value}")
+    response = conn.send(" ".join(parts))
+    if not response.ok:
+        raise CheetahError(f"cheetah DATABASE {name} failed: {response.reason}", response=response)
+    return response
+
+
+def reset_database(
+    conn: Any, name: str | None = None, settings: Mapping[str, Any] | None = None, **kwargs: Any
+) -> Response:
+    """``RESET_DB`` — delete the directory and reopen it empty.
+
+    The only way to adopt a new trie geometry, since ``pairs/format.dat`` is
+    authoritative on every ordinary open. Destructive and not confirmable:
+    everything in that database is gone.
+    """
+    parts = ["RESET_DB"]
+    if name:
+        parts.append(str(name))
+    for key, value in _settings_fields(settings, **kwargs).items():
+        if not name:
+            raise CheetahError("cheetah RESET_DB needs an explicit database name to carry settings")
+        parts.append(f"{key}={value}")
+    response = conn.send(" ".join(parts))
+    if not response.ok:
+        raise CheetahError(f"cheetah RESET_DB failed: {response.reason}", response=response)
+    return response
 
 
 def system_stats(conn: Any) -> SystemStats:

@@ -1055,13 +1055,21 @@ Its handbook is [`binders/nodejs/README.md`](binders/nodejs/README.md).
 Four layers, each usable alone: [`lib/protocol.js`](binders/nodejs/lib/protocol.js) (pure codec —
 `buildCommand`, `parseResponse`, `parseItems`, `parseCursor`, `encodeArgument`, `rawArgument`),
 [`lib/client.js`](binders/nodejs/lib/client.js) (`CheetahClient`, one socket with FIFO response
-matching and bounded pipelining; `CheetahPool`, which spreads, leases and broadcasts),
-[`lib/kv.js`](binders/nodejs/lib/kv.js) + [`lib/graph.js`](binders/nodejs/lib/graph.js) (free
-functions over a connection; `graph.js` covers the whole `GRAPH_*` surface — nodes with
+matching and bounded pipelining; `CheetahPool`, which spreads, leases and broadcasts), the
+free-function command layers — [`lib/kv.js`](binders/nodejs/lib/kv.js) (the two-step write,
+`pairSet`/`pairSummary`/`purgePrefix`/`deleteValue`, batches, scans),
+[`lib/graph.js`](binders/nodejs/lib/graph.js) (the whole `GRAPH_*` surface — nodes with
 `references`, edges single and batched, `neighbors`/`neighborsAll`/`neighborTypes`/`degree`,
-`query`, `recall`/`recallBatched`, `similar`, `termIndex` — and exports a pure `build*` for each,
-so a caller that writes several commands to a connection as one batch shares the binder's encoding
-instead of re-deriving base64 and `x<hex>`), and [`lib/database.js`](binders/nodejs/lib/database.js)
+`query`, `recall`/`recallBatched`, `similar`, `termIndex`, and the `GRAPH_AMBIGUITY_*` trio),
+[`lib/records.js`](binders/nodejs/lib/records.js) (the `RECORD` family plus `DEL records`, with
+`fieldSpec` validating a field declaration — reserved names included — before the wire),
+[`lib/jobs.js`](binders/nodejs/lib/jobs.js) (`JOB` submit/status/fetch plus `awaitJob`),
+[`lib/predict.js`](binders/nodejs/lib/predict.js) (`PREDICT_*`) and
+[`lib/admin.js`](binders/nodejs/lib/admin.js) (`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
+`SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, `CLUSTER_*`, `FORK_ASSIGN`); each of these exports a
+pure `build*` for its commands, so a caller that writes several commands to a connection as one batch
+shares the binder's encoding instead of re-deriving base64 and `x<hex>` — and finally
+[`lib/database.js`](binders/nodejs/lib/database.js)
 (`CheetahDatabase` — a subclassable handle holding the plumbing every application otherwise
 rewrites: pool construction, a layout-version guard on connect, a `close` that only closes a pool it
 owns, a per-key mutation chain, collision-checked id allocation, namespace payload accounting). Plus
@@ -1079,12 +1087,20 @@ it if missing).
   distinction between an omitted field (preserve), `-` (clear) and an empty list, and flags that must
   be `1`/`0` rather than a stringified `false`. **Any change to those on the Go side is a change here
   too**, and the binder's tests are where a client would first notice.
-- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — codec, key
-  primitives, the `GRAPH_*` command spellings
-  ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), and `CheetahDatabase` against an
-  in-memory stand-in that speaks the same line protocol. `CHEETAH_INTEGRATION=1` additionally builds the server and round-trips against it
-  ([`test/integration.test.js`](binders/nodejs/test/integration.test.js)). These are **not** part of
+- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 99 unit tests:
+  codec, key primitives, the `GRAPH_*` command spellings
+  ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), the `RECORD` ones
+  ([`test/records.test.js`](binders/nodejs/test/records.test.js)), the job/prediction/admin ones
+  ([`test/admin.test.js`](binders/nodejs/test/admin.test.js)), and `CheetahDatabase` against an
+  in-memory stand-in that speaks the same line protocol. `CHEETAH_INTEGRATION=1` additionally builds
+  the server and round-trips against it (19 subtests,
+  [`test/integration.test.js`](binders/nodejs/test/integration.test.js)). These are **not** part of
   `go test ./src`; run them when you change a command's response shape.
+- **A stale root binary silently tests an old protocol.** `ensureServerBinary`
+  ([`lib/server.js`](binders/nodejs/lib/server.js)) builds only when `cheetah-server` is *missing*,
+  and the same is true of the Python launcher. An integration run answering `ERROR,unknown_command`
+  for a command that exists means the binary predates it — rebuild with
+  `go build -o cheetah-server ./src` rather than hunting the binder.
 
 #### [`binders/python/`](binders/python/)
 
@@ -1104,10 +1120,12 @@ lock-serialized send+receive, reconnect and an *inactivity* grace so a long redu
 for a dead socket; `ThreadLocalClientPool`, one socket per thread), the free-function layers
 [`kv.py`](binders/python/cheetah_db/kv.py) (including `PAIR_PUT_BATCH`),
 [`graph.py`](binders/python/cheetah_db/graph.py) (the whole `GRAPH_*` surface),
+[`records.py`](binders/python/cheetah_db/records.py) (the `RECORD` family plus `DEL records`, with
+`field_spec` validating a field declaration — reserved names included — before the wire),
 [`jobs.py`](binders/python/cheetah_db/jobs.py) (`JOB` submit/status/fetch plus a poll loop),
 [`predict.py`](binders/python/cheetah_db/predict.py) and
-[`admin.py`](binders/python/cheetah_db/admin.py) (`SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`,
-`CLUSTER_*`, `FORK_ASSIGN`), and
+[`admin.py`](binders/python/cheetah_db/admin.py) (`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
+`SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, `CLUSTER_*`, `FORK_ASSIGN`), and
 [`database.py`](binders/python/cheetah_db/database.py) (`CheetahDatabase`, the subclassable handle).
 Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 [`vocabulary.py`](binders/python/cheetah_db/vocabulary.py) and
@@ -1123,12 +1141,14 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   adds — an item value beginning with `x` is re-read as hex unless escaped, and `PAIR_PUT_BATCH` is
   not a transaction, so `applied`/`failed` must be checked rather than the status word alone.
 - **Tests:** `python3 -m unittest discover -s tests -t .` from
-  [`binders/python/`](binders/python/) — codec, key primitives, KV/graph/job call shapes and
-  `CheetahDatabase` against an in-memory stand-in ([`tests/fakes.py`](binders/python/tests/fakes.py)).
-  `CHEETAH_INTEGRATION=1` additionally builds the server, boots it on a free port in a temporary
-  data directory and round-trips against it
-  ([`tests/test_integration.py`](binders/python/tests/test_integration.py)). Not part of
-  `go test ./src`.
+  [`binders/python/`](binders/python/) — 124 unit tests: codec, key primitives, KV/graph/record/job
+  and database-operation call shapes, and `CheetahDatabase` against an in-memory stand-in
+  ([`tests/fakes.py`](binders/python/tests/fakes.py), which reproduces enough record-table semantics
+  to be worth asserting against: append-only offsets, a drop that leaves a hole, a short row reading
+  null, and a compaction that bumps a generation). `CHEETAH_INTEGRATION=1` additionally builds the
+  server, boots it on a free port in a temporary data directory and round-trips against it
+  (11 tests, [`tests/test_integration.py`](binders/python/tests/test_integration.py)). Not part of
+  `go test ./src`. The stale-binary trap noted for the Node binder applies here too.
 
 ### Runtime / generated (never edited or committed)
 
@@ -1301,10 +1321,12 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   `microDelRecords` in [`micro_del.go`](src/micro_del.go).
 - **Why:** the same key repeated under `cnt:`, `prob:` and `meta:` was three entries, three payloads
   and three round-trips describing one thing, with nothing keeping them consistent.
+- **Clients:** wrapped by both binders — [`records.js`](binders/nodejs/lib/records.js) and
+  [`records.py`](binders/python/cheetah_db/records.py) — including the client-side validation of a
+  field declaration (type, width, reserved name) so a bad schema fails before the wire.
 - **Gaps:** no secondary index over field values (a `RECORD scan` filters by row-key prefix only, and
-  by-value selection is a client-side pass); no reducer mode reads fields directly; the binders
-  ([`binders/`](binders/)) do not wrap the family yet, so clients send the lines themselves; a
-  compaction doubles the table's disk footprint until the old generation is purged.
+  by-value selection is a client-side pass); no reducer mode reads fields directly; a compaction
+  doubles the table's disk footprint until the old generation is purged.
 
 ### Per-database ad-hoc settings — Shipped
 
@@ -1314,6 +1336,8 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   same way. They persist in `<data_dir>/<name>/settings.ini` and are re-read at every open.
 - **Owners:** [`engine.go`](src/engine.go) (`CreateDatabase`, `resolveSettingsLocked`,
   `engineControlCommand`), [`config.go`](src/config.go) (file format, `validateDatabaseName`).
+- **Clients:** `admin.createDatabase`/`listDatabases`/`useDatabase`/`resetDatabase` in both binders,
+  which also refuse a setting name the server does not know before sending it.
 - **Gaps:** changing a persisted setting on an existing database means editing the file (or reissuing
   `DATABASE <name> key=value`) and reopening — there is no live re-tune command; trie geometry still
   needs `RESET_DB` because `pairs/format.dat` is authoritative.
@@ -1725,19 +1749,23 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - Managed-file layer, payload cache, resource monitor, `SYSTEM_STATS`/`LOG_FLUSH`/`FILE_CHECKPOINT`.
 - Cluster topology registration, fork assignment, gossip, and `CLUSTER_MOVE` payload transfer.
 - **Node.js binder** ([`binders/nodejs/`](binders/nodejs/)) — dependency-free client: codec, pooled
-  TCP client, KV/graph helpers, key primitives, token vocabulary, subclassable `CheetahDatabase`,
-  and a test-server launcher. Verified by its own suite (42 unit tests) plus a live round-trip
-  against a spawned server (`CHEETAH_INTEGRATION=1`, 15 subtests: KV, UTF-8 payloads, batch writes,
-  cursor paging, the `continuations` reducer, vocabulary allocation, `GRAPH_RECALL` convergence,
-  subclass lifecycle, layout-mismatch refusal, `RESET_DB` across a pool, pipelining).
+  TCP client, KV/graph/record/job/prediction/admin helpers, key primitives, token vocabulary,
+  subclassable `CheetahDatabase`, and a test-server launcher. Verified by its own suite (99 unit
+  tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
+  UTF-8 payloads, batch writes, cursor paging, the `continuations` reducer, vocabulary allocation,
+  `GRAPH_RECALL` convergence, a record table through define/partial-write/add/drop/compact/drop,
+  `DB_CREATE` with its own settings, a detached `JOB` reduce, server gauges, subclass lifecycle,
+  layout-mismatch refusal, `RESET_DB` across a pool, pipelining).
 - **Python binder** ([`binders/python/`](binders/python/)) — standard-library-only client covering
-  the same ground plus the commands the Node binder does not spell (`JOB`, `PREDICT_*`,
-  `SYSTEM_STATS`/`LOG_FLUSH`/`FILE_CHECKPOINT`, `CLUSTER_*`, the graph read and ambiguity families).
-  Verified by its own suite (95 unit tests against an in-memory stand-in) plus a live round-trip
-  against a spawned server (`CHEETAH_INTEGRATION=1`, 9 tests: UTF-8 and binary payloads,
-  `PAIR_PUT_BATCH`, hidden pairs, cursor paging, the `continuations` reducer, graph write/degree/
-  recall, a detached `JOB` reduce, `SYSTEM_STATS`/`FILE_CHECKPOINT`, vocabulary allocation, layout
-  guard and `RESET_DB`).
+  the same surface, with the differences that follow from a synchronous host (no pipelining; one
+  socket per thread; binary payloads base64 rather than latin1). Verified by its own suite (124 unit
+  tests against an in-memory stand-in) plus a live round-trip against a spawned server
+  (`CHEETAH_INTEGRATION=1`, 11 tests: UTF-8 and binary payloads, `PAIR_PUT_BATCH`, hidden pairs,
+  cursor paging, the `continuations` reducer, graph write/degree/recall, record-table lifecycle and
+  schema evolution, `DB_CREATE` settings, a detached `JOB` reduce,
+  `SYSTEM_STATS`/`FILE_CHECKPOINT`, vocabulary allocation, layout guard and `RESET_DB`).
+- **Both binders wrap the same command inventory.** A command added on the Go side is not finished
+  until both spell it: that parity is the point of keeping them in this repository.
 
 ### Experimental / scaffold
 

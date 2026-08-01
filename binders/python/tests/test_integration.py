@@ -14,7 +14,7 @@ import socket
 import tempfile
 import unittest
 
-from cheetah_db import admin, graph, jobs, kv
+from cheetah_db import admin, graph, jobs, kv, records
 from cheetah_db.client import CheetahClient
 from cheetah_db.database import CheetahDatabase
 from cheetah_db.server import start_server
@@ -91,6 +91,50 @@ class LiveServerTests(unittest.TestCase):
         job_id = jobs.submit(self.conn, "PAIR_REDUCE continuations j: 256")
         result = jobs.await_job(self.conn, job_id, poll_interval=0.2, timeout=30)
         self.assertEqual(len(result.items()), 5)
+
+    def test_record_table_round_trip_and_schema_evolution(self) -> None:
+        records.define(
+            self.conn, "ngram", "cnt:uint:4,prob:float:8,label:string:12", if_not_exists=True
+        )
+        records.set_row(self.conn, "ngram", "berlin", {"cnt": 42, "prob": 0.25, "label": "city"})
+        records.set_row(self.conn, "ngram", "lisbon", {"cnt": 7})
+        self.assertEqual(
+            records.get_row(self.conn, "ngram", "berlin"),
+            {"cnt": 42, "prob": 0.25, "label": "city"},
+        )
+        # A partial write leaves the other fields alone.
+        records.set_row(self.conn, "ngram", "berlin", {"cnt": 43})
+        self.assertEqual(records.get_row(self.conn, "ngram", "berlin")["label"], "city")
+
+        # A field added later reads null on the rows that predate it.
+        records.alter(self.conn, "ngram", add="novelty:float:8", drop="label")
+        self.assertIsNone(records.get_row(self.conn, "ngram", "berlin")["novelty"])
+        schema = records.schema(self.conn, "ngram", rows=True)
+        self.assertEqual(schema.dead_bytes, 12)
+        self.assertEqual(schema.rows, 2)
+
+        compacted, rewritten = records.compact(self.conn, "ngram")
+        self.assertEqual(rewritten, 2)
+        self.assertEqual(compacted.dead_bytes, 0)
+        self.assertEqual(records.get_row(self.conn, "ngram", "berlin")["cnt"], 43)
+
+        rows = list(records.iter_rows(self.conn, "ngram", limit=1))
+        self.assertEqual({row.text for row in rows}, {"berlin", "lisbon"})
+        self.assertTrue(records.delete_row(self.conn, "ngram", "berlin"))
+        self.assertEqual(records.drop_table(self.conn, "ngram"), 1)
+        self.assertIsNone(records.schema(self.conn, "ngram"))
+
+    def test_database_creation_carries_its_own_settings(self) -> None:
+        name = "binder_adhoc"
+        created = admin.create_database(self.conn, name, payload_cache_mb=8)
+        self.assertEqual(created["name"], name)
+        self.assertEqual(created["settings"]["payload_cache_bytes"], str(8 << 20))
+        with self.assertRaises(Exception):
+            admin.create_database(self.conn, name)
+        listed = {info.name: info for info in admin.list_databases(self.conn)}
+        self.assertIn(name, listed)
+        self.assertTrue(listed[name].ad_hoc)
+        self.assertEqual(listed[name].settings["payload_cache_bytes"], 8 << 20)
 
     def test_server_gauges_are_readable(self) -> None:
         stats = admin.system_stats(self.conn)

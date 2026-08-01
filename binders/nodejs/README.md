@@ -25,8 +25,12 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | --- | --- |
 | `protocol` | Pure codec. `buildCommand`, `buildKeyValueCommand`, `parseResponse`, `parseItems`, `parseCursor`, `decodePayload`, `encodeArgument`, `rawArgument`. No socket, no state. |
 | `client` | `CheetahClient` (one socket, FIFO response matching, pipelining, reconnect) and `CheetahPool` (spread, lease, broadcast). |
-| `kv` | The two-step write and its reads: `putValue`/`getValue`, `putJson`/`getJson`, `putJsonBatch`, `deletePair`, `scanPage`/`scanPrefix`/`scanAll`. |
+| `kv` | The two-step write and its reads: `putValue`/`getValue`, `putJson`/`getJson`, `putJsonBatch`, `insert`, `editAbsoluteKey`, `readAbsoluteKey`, `pairSet` (with `hidden`), `deletePair`, `deleteValue`, `purgePrefix`, `pairSummary`, `scanPage`/`scanPrefix`/`scanAll`. |
 | `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `similar`, `termIndex`. Plus a pure `build*` for each command, for callers assembling their own batch. |
+| `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `setRow`, `getRow`, `scanPage`/`scanRows`/`scanAll`, `deleteRow`, `dropTable`, plus `fieldSpec` and a pure `build*` for each command. |
+| `jobs` | Detached commands over the `JOB` envelope: `submit`, `status`, `fetch`, `awaitJob`, `supportsJobApi`. |
+| `predict` | Prediction tables: `setValue`, `query`, `train`, `contextAdjust`, `inherit`, `inheritBatch`, `backend`, `bench`. |
+| `admin` | The server and the registry of databases, not the data: `createDatabase`, `listDatabases`, `useDatabase`, `resetDatabase`, `systemStats`, `logFlush`, `fileCheckpoint`, `clusterUpdate`/`clusterStatus`/`clusterMove`, `forkAssign`. |
 | `keys` | Key-building primitives: fixed-width `hex`/`unhex`, `sha1`, and integer `quantize`/`bucketize`/`bucketSweep`. |
 | `vocabulary` | `TokenVocabulary` — a persisted string → uint32 allocator, both directions. |
 | `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it. |
@@ -82,6 +86,71 @@ to prevent.
   `keys.bucketize`. In floats, `(v - tol) / width` lands on `224.99999999999997`
   where exact arithmetic gives `225`, which silently widens a tolerance sweep
   from two buckets to three.
+
+## Record tables — several fields, one row
+
+A pair name maps to exactly one payload, so describing one thing with several
+quantities used to mean several names (`cnt:<k>`, `prob:<k>`, `meta:<k>`): three
+trie entries, three payloads, three round trips, and nothing keeping them
+consistent. A record table declares those quantities once, with a byte width
+each, and packs them into one row.
+
+```js
+const { records } = require('cheetah-db');
+
+await records.define(pool, 'ngram', 'cnt:uint:4,prob:float:4,label:string:12');
+await records.setRow(pool, 'ngram', 'berlin', { cnt: 42, prob: 0.25, label: 'city' });
+
+// A write patches only the fields it names; the others keep their bytes.
+await records.setRow(pool, 'ngram', 'berlin', { cnt: 43 });
+await records.getRow(pool, 'ngram', 'berlin');   // { cnt: 43, prob: 0.25, label: 'city' }
+
+for await (const row of records.scanRows(pool, 'ngram', { prefix: 'be', limit: 500 })) {
+    console.log(row.key, row.fields);
+}
+```
+
+Three properties of the family are worth internalising, because they decide how
+you use it:
+
+- **`alter` never rewrites a row.** Field offsets never move: an added field is
+  appended, a dropped field's bytes stay as dead space. A row written before an
+  `add` therefore reads `null` for the new field — *not* `0`, which nobody wrote
+  — until the next `setRow` brings it up to the current width.
+- **`compact` is the only call that touches rows.** It reclaims what a drop left
+  behind, and it is explicit for that reason. It bumps the table's generation and
+  briefly doubles its footprint while copying.
+- **A field name is an argument.** `RECORD set table=t key=k <field>=<value>` puts
+  field names in the same namespace as the command's own modifiers, so `table`,
+  `key`, `fields`, `limit`, `cursor` and friends are refused — by this binder at
+  `define`/`setRow` time, before the wire.
+
+Values follow the same escaping rule as everywhere else: text holding a space or
+starting with `x` travels as `x<hex>`, and the binder does it for you. `bytes`
+fields read back padded to their declared width, because a fixed-width field has
+no length of its own.
+
+## Databases, jobs and the server
+
+```js
+const { admin, jobs } = require('cheetah-db');
+
+// A database of its own, with settings that override the server's [database]
+// section for this database alone and persist next to its data.
+await admin.createDatabase(pool, 'bench', { pair_bytes: 2, payload_cache_mb: 256 });
+await admin.listDatabases(pool);        // name, path, loaded, adHoc, settings
+
+// A sweep too long for one round trip.
+const jobId = await jobs.submit(pool, 'PAIR_REDUCE counts ctx: 4096');
+const result = await jobs.awaitJob(pool, jobId, { pollIntervalMs: 2000 });
+
+await admin.systemStats(pool);          // gauges; `NA` reads as null, never 0
+```
+
+`createDatabase` refuses a name that already exists — that refusal is the whole
+difference from `useDatabase`, which opens-or-creates and would silently adopt a
+populated directory *and* ignore the settings you passed, since trie geometry is
+decided when the directory is made.
 
 ## `CheetahDatabase`
 
@@ -163,6 +232,16 @@ node --test test/*.test.js
 ```
 
 No dev dependency: the runner is Node's own. The suite covers the protocol
-codec, the key primitives, and `CheetahDatabase` against an in-memory stand-in
-that speaks the same line protocol. It does not prove the server answers that
-way — the Go suite (`go test ./src`) does.
+codec, the key primitives, the `GRAPH_*`/`RECORD`/`JOB`/`PREDICT_*`/admin command
+spellings, and `CheetahDatabase` against an in-memory stand-in that speaks the
+same line protocol. It does not prove the server answers that way — the Go suite
+(`go test ./src`) does, and so does the live round-trip:
+
+```bash
+CHEETAH_INTEGRATION=1 node --test test/integration.test.js
+```
+
+That one builds the server **only if the binary is missing**, so a stale
+`cheetah-server` at the repository root silently tests an old protocol: rebuild
+it (`go build -o cheetah-server ./src`) when a command answers
+`ERROR,unknown_command` there.

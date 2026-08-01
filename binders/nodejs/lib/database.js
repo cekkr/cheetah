@@ -26,6 +26,7 @@ const { CheetahError, CheetahPool } = require('./client');
 const { decodeItemPayload, numericField } = require('./protocol');
 const graph = require('./graph');
 const kv = require('./kv');
+const records = require('./records');
 
 const DEFAULT_SCAN_LIMIT = 500;
 const DEFAULT_WRITE_BATCH_SIZE = 256;
@@ -363,6 +364,32 @@ class CheetahDatabase {
 
     recall(options) {
         return graph.recallBatched(this.pool, options);
+    }
+
+    // -- record tables ------------------------------------------------------
+    //
+    // Thin delegations, like the graph ones above: a subclass that keeps a
+    // declared table usually wants `defineRecordTable` once in `onConnect` and
+    // the row calls everywhere else.
+
+    defineRecordTable(table, fields, options = { ifNotExists: true }) {
+        return records.define(this.pool, table, fields, options);
+    }
+
+    setRecord(table, key, values) {
+        return records.setRow(this.pool, table, key, values);
+    }
+
+    getRecord(table, key, options) {
+        return records.getRow(this.pool, table, key, options);
+    }
+
+    scanRecords(table, options) {
+        return records.scanRows(this.pool, table, options);
+    }
+
+    recordSchema(table, options) {
+        return records.schema(this.pool, table, options);
     }
 }
 

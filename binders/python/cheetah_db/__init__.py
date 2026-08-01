@@ -7,8 +7,9 @@ any particular schema. Layers, each usable on its own::
     hosts               where a client should actually dial (0.0.0.0, WSL)
     client              CheetahClient (one socket) + ThreadLocalClientPool
     kv / graph / jobs   free functions over a connection: the two-step write,
-    predict / admin     batches, scans, nodes, edges, recall, detached jobs,
-                        prediction tables, server operations
+    records / predict   batches, scans, nodes, edges, recall, multi-field rows,
+    admin               detached jobs, prediction tables, server and database
+                        operations
     database            CheetahDatabase — the plumbing an application ends up
                         writing around all of the above, meant to be subclassed
 
@@ -27,7 +28,7 @@ Requires Python 3.10+ and nothing else.
 
 from __future__ import annotations
 
-from . import admin, graph, hosts, jobs, keys, kv, predict, protocol, server, vocabulary
+from . import admin, graph, hosts, jobs, keys, kv, predict, protocol, records, server, vocabulary
 from .client import (
     CheetahClient,
     CheetahConnectionError,
@@ -60,6 +61,7 @@ __all__ = [
     "parse_response",
     "predict",
     "protocol",
+    "records",
     "server",
     "vocabulary",
 ]

@@ -33,6 +33,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from . import graph as graph_ops
 from . import kv
+from . import records as record_ops
 from .client import CheetahClient, CheetahError, ThreadLocalClientPool
 from .protocol import ScanItem, decode_item_payload
 
@@ -303,3 +304,24 @@ class CheetahDatabase:
 
     def recall(self, seeds: Sequence[str], **options: Any) -> list[dict[str, Any]]:
         return graph_ops.recall_batched(self.conn, seeds, **options)
+
+    # -- record tables --------------------------------------------------- #
+    #
+    # Thin delegations, like the graph ones above: a subclass that keeps a
+    # declared table usually wants ``define_record_table`` once in
+    # ``on_connect`` and the row calls everywhere else.
+    def define_record_table(self, table: str, fields: Any, **options: Any) -> Any:
+        options.setdefault("if_not_exists", True)
+        return record_ops.define(self.conn, table, fields, **options)
+
+    def set_record(self, table: str, key: str | bytes, values: Mapping[str, Any]) -> Any:
+        return record_ops.set_row(self.conn, table, key, values)
+
+    def get_record(self, table: str, key: str | bytes, **options: Any) -> Any:
+        return record_ops.get_row(self.conn, table, key, **options)
+
+    def scan_records(self, table: str, **options: Any) -> Iterator[Any]:
+        return record_ops.iter_rows(self.conn, table, **options)
+
+    def record_schema(self, table: str, **options: Any) -> Any:
+        return record_ops.schema(self.conn, table, **options)

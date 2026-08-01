@@ -26,9 +26,10 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `client` | `CheetahClient` (one socket, lock-serialized request/response, reconnect, inactivity grace) and `ThreadLocalClientPool` (one socket per thread). |
 | `kv` | The two-step write and its reads: `put_value`/`get_value`, `put_json`/`get_json`, `put_bytes`/`get_bytes`, `put_values_batch` (`PAIR_PUT_BATCH`), `delete_pair`, `pair_purge`, `scan_page`/`scan_prefix`/`scan_all`, `pair_summary`. |
 | `graph` | The whole `GRAPH_*` surface: nodes, edges (single and batch), `neighbors`/`degree`/`neighbor_types`, `query`, `recall`/`recall_batched`, `similar`, `term_index`, and the ambiguity trio. |
+| `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `set_row`, `get_row`, `scan`/`iter_rows`, `delete_row`, `drop_table`, plus `field_spec`. |
 | `jobs` | The `JOB` micro-command: `submit`, `status`, `fetch`, `await_job`, `supports_job_api`. |
 | `predict` | Prediction tables: `set_value`, `query`, `train`, `context_adjust`, `inherit`, `inherit_batch`, `backend`, `bench`. |
-| `admin` | Server operations and placement: `system_stats`, `log_flush`, `file_checkpoint`, `cluster_*`, `fork_assign`. |
+| `admin` | The server and the registry of databases, not the data: `create_database`, `list_databases`, `use_database`, `reset_database`, `system_stats`, `log_flush`, `file_checkpoint`, `cluster_*`, `fork_assign`. |
 | `keys` | Key-building primitives: fixed-width `hex_segment`/`unhex`, `sha1`, and integer `quantize`/`bucketize`/`bucket_sweep`. |
 | `vocabulary` | `TokenVocabulary` — a persisted string → uint32 allocator, both directions. |
 | `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it. |
@@ -81,6 +82,64 @@ to prevent.
   from two buckets to three.
 - **Jobs live in memory.** `JOB fetch` consumes the job and a restart loses it,
   so treat `job_not_found` as terminal rather than retrying.
+
+## Record tables — several fields, one row
+
+A pair name maps to exactly one payload, so describing one thing with several
+quantities used to mean several names (`cnt:<k>`, `prob:<k>`, `meta:<k>`): three
+trie entries, three payloads, three round trips, and nothing keeping them
+consistent. A record table declares those quantities once, with a byte width
+each, and packs them into one row.
+
+```python
+from cheetah_db import records
+
+records.define(conn, "ngram", "cnt:uint:4,prob:float:4,label:string:12")
+records.set_row(conn, "ngram", "berlin", {"cnt": 42, "prob": 0.25, "label": "city"})
+
+# A write patches only the fields it names; the others keep their bytes.
+records.set_row(conn, "ngram", "berlin", {"cnt": 43})
+records.get_row(conn, "ngram", "berlin")   # {'cnt': 43, 'prob': 0.25, 'label': 'city'}
+
+for row in records.iter_rows(conn, "ngram", prefix="be"):
+    print(row.text, row.fields)
+```
+
+Three properties of the family are worth internalising, because they decide how
+you use it:
+
+- **`alter` never rewrites a row.** Field offsets never move: an added field is
+  appended, a dropped field's bytes stay as dead space. A row written before an
+  `add` therefore reads `None` for the new field — *not* `0`, which nobody wrote
+  — until the next `set_row` brings it up to the current width.
+- **`compact` is the only call that touches rows.** It reclaims what a drop left
+  behind, and it is explicit for that reason. It bumps the table's generation and
+  briefly doubles its footprint while copying.
+- **A field name is an argument.** ``RECORD set table=t key=k <field>=<value>``
+  puts field names in the same namespace as the command's own modifiers, so
+  `table`, `key`, `fields`, `limit`, `cursor` and friends are refused — by this
+  binder at `define`/`set_row` time, before the wire.
+
+Values follow the same escaping rule as everywhere else: text holding a space or
+starting with `x` travels as `x<hex>`, and the binder does it for you. `bytes`
+fields read back padded to their declared width, because a fixed-width field has
+no length of its own.
+
+## Databases of their own
+
+```python
+from cheetah_db import admin
+
+# Settings that override the server's [database] section for this database
+# alone, persisted next to its data so they survive a restart.
+admin.create_database(conn, "bench", pair_bytes=2, payload_cache_mb=256)
+admin.list_databases(conn)      # name, path, loaded, ad_hoc, settings
+```
+
+`create_database` refuses a name that already exists — that refusal is the whole
+difference from `use_database`, which opens-or-creates and would silently adopt a
+populated directory *and* ignore the settings passed, since trie geometry is
+decided when the directory is made.
 
 ## Concurrency
 
@@ -174,8 +233,8 @@ cd binders/python && python3 -m unittest discover -s tests -t .
 ```
 
 No dev dependency: the runner is the standard library's. The suite covers the
-protocol codec, the key primitives, the KV/graph/job call shapes and
-`CheetahDatabase` against an in-memory stand-in that speaks the same line
+protocol codec, the key primitives, the KV/graph/record/job/database call shapes
+and `CheetahDatabase` against an in-memory stand-in that speaks the same line
 protocol. That stand-in does not prove the server answers that way — the Go
 suite (`go test ./src`) and the gated integration test do:
 
@@ -184,4 +243,7 @@ cd binders/python && CHEETAH_INTEGRATION=1 python3 -m unittest discover -s tests
 ```
 
 which builds and boots a real server on a free port in a temporary data
-directory.
+directory — note that it builds only when the binary is **missing**, so a stale
+`cheetah-server` at the repository root silently tests an old protocol. Rebuild
+it (`go build -o cheetah-server ./src`) when a command there answers
+`ERROR,unknown_command`.

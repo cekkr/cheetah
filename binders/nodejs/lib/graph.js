@@ -568,9 +568,86 @@ async function termIndex(conn, options = {}) {
     return { fields: response.fields, nextCursor: parseCursor(response.fields) };
 }
 
+// ---------------------------------------------------------------------------
+// Ambiguity — several readings that exclude each other
+// ---------------------------------------------------------------------------
+
+/**
+ * `GRAPH_AMBIGUITY_SET` — write a whole set of mutually exclusive readings at
+ * once and normalize their shares to sum to 1.
+ *
+ * The engine has no `OR`: a disjunction is *stored* as a group rather than
+ * expressed as a query. `options` is either a list of ids (equal shares) or a
+ * map of id → share.
+ */
+function buildAmbiguitySet({ from, group, options, type = null, normalize = true }) {
+    const rendered = Array.isArray(options)
+        ? options.map((option) => String(option).trim()).filter(Boolean).join(',')
+        : Object.entries(options || {})
+            .map(([id, share]) => `${String(id).trim()}=${share}`)
+            .join(',');
+    if (!rendered) throw new CheetahError('cheetah GRAPH_AMBIGUITY_SET requires options');
+    return buildKeyValueCommand('GRAPH_AMBIGUITY_SET', {
+        from,
+        group,
+        options: rendered,
+        type,
+        normalize: flag(normalize),
+    });
+}
+
+function buildAmbiguityGet({ from, group, direction = null, limit = null }) {
+    return buildKeyValueCommand('GRAPH_AMBIGUITY_GET', { from, group, direction, limit });
+}
+
+/**
+ * `GRAPH_AMBIGUITY_RESOLVE` — collapse the set: the winner becomes `certain`,
+ * the others `ruled_out` (or are deleted with `drop`), and the group dissolves.
+ */
+function buildAmbiguityResolve({ from, group, winner, drop = false }) {
+    return buildKeyValueCommand('GRAPH_AMBIGUITY_RESOLVE', { from, group, winner, drop: flag(drop) });
+}
+
+async function ambiguitySet(conn, options) {
+    return commandOrThrow(conn, buildAmbiguitySet(options), 'GRAPH_AMBIGUITY_SET');
+}
+
+/** One alternative group read back, strongest reading first. */
+async function ambiguityGet(conn, options) {
+    const line = buildAmbiguityGet(options);
+    const response = await conn.send(line);
+    if (!response.ok) {
+        if (isNotFound(response)) {
+            return { count: 0, alternatives: [], top: null, confidenceSum: 0 };
+        }
+        throw new CheetahError(`cheetah GRAPH_AMBIGUITY_GET failed: ${response.error || response.raw}`, {
+            command: line,
+            response,
+        });
+    }
+    return {
+        count: numericField(response.fields, 'count', 0),
+        confidenceSum: numericField(response.fields, 'confidence_sum', 0),
+        top: response.fields.top || null,
+        topModality: response.fields.top_modality || null,
+        alternatives: decodePayload(response.fields) || [],
+        response,
+    };
+}
+
+async function ambiguityResolve(conn, options) {
+    return commandOrThrow(conn, buildAmbiguityResolve(options), 'GRAPH_AMBIGUITY_RESOLVE');
+}
+
 module.exports = {
     MAX_NODE_REFERENCES,
     MAX_RECALL_SEEDS,
+    ambiguityGet,
+    ambiguityResolve,
+    ambiguitySet,
+    buildAmbiguityGet,
+    buildAmbiguityResolve,
+    buildAmbiguitySet,
     buildDegree,
     buildEdgeDel,
     buildEdgeGet,

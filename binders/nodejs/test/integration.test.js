@@ -20,6 +20,9 @@ const ENABLED = process.env.CHEETAH_INTEGRATION === '1';
 const { CheetahClient, CheetahDatabase, CheetahPool, TokenVocabulary, startServer } = require('..');
 const kv = require('../lib/kv');
 const graph = require('../lib/graph');
+const records = require('../lib/records');
+const admin = require('../lib/admin');
+const jobs = require('../lib/jobs');
 const { hex } = require('../lib/keys');
 
 /** An ephemeral port the OS just told us is free. */
@@ -164,6 +167,68 @@ test('cheetah binder round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRA
         const ranked = hits.filter((hit) => hit.id.startsWith('mdoc'));
         assert.equal(ranked[0].id, 'mdoc1', 'the document both seeds reach ranks first');
         assert.equal(ranked[0].sourceCount, 2);
+    });
+
+    await t.test('a record table round-trips and survives a schema change', async () => {
+        await records.define(pool, 'ngram', 'cnt:uint:4,prob:float:8,label:string:12', {
+            ifNotExists: true,
+        });
+        await records.setRow(pool, 'ngram', 'berlin', { cnt: 42, prob: 0.25, label: 'city' });
+        await records.setRow(pool, 'ngram', 'lisbon', { cnt: 7 });
+        assert.deepEqual(await records.getRow(pool, 'ngram', 'berlin'), {
+            cnt: 42,
+            prob: 0.25,
+            label: 'city',
+        });
+
+        // A partial write leaves the other fields alone.
+        await records.setRow(pool, 'ngram', 'berlin', { cnt: 43 });
+        assert.equal((await records.getRow(pool, 'ngram', 'berlin')).label, 'city');
+
+        // A field added later reads null on the rows that predate it.
+        await records.alter(pool, 'ngram', { add: 'novelty:float:8', drop: 'label' });
+        assert.equal((await records.getRow(pool, 'ngram', 'berlin')).novelty, null);
+        const schema = await records.schema(pool, 'ngram', { rows: true });
+        assert.equal(schema.deadBytes, 12);
+        assert.equal(schema.rows, 2);
+
+        const compacted = await records.compact(pool, 'ngram');
+        assert.equal(compacted.rewritten, 2);
+        assert.equal(compacted.deadBytes, 0);
+        assert.equal((await records.getRow(pool, 'ngram', 'berlin')).cnt, 43);
+
+        const rows = await records.scanAll(pool, 'ngram', { limit: 1 });
+        assert.deepEqual(rows.map((row) => row.key).sort(), ['berlin', 'lisbon']);
+        assert.equal(await records.deleteRow(pool, 'ngram', 'berlin'), true);
+        assert.equal(await records.dropTable(pool, 'ngram'), 1);
+        assert.equal(await records.schema(pool, 'ngram'), null);
+    });
+
+    await t.test('a database can be created with settings of its own', async () => {
+        const created = await admin.createDatabase(pool, 'binder_adhoc', { payload_cache_mb: 8 });
+        assert.equal(created.name, 'binder_adhoc');
+        assert.equal(created.settings.payload_cache_bytes, String(8 * 1024 * 1024));
+        // Creating it twice is an error, not a silent adoption of the directory.
+        await assert.rejects(() => admin.createDatabase(pool, 'binder_adhoc'), /database_exists/);
+        const listed = await admin.listDatabases(pool);
+        const adhoc = listed.find((entry) => entry.name === 'binder_adhoc');
+        assert.ok(adhoc, 'DB_LIST reports the database that was just created');
+        assert.equal(adhoc.adHoc, true);
+        assert.equal(adhoc.settings.payload_cache_bytes, 8 * 1024 * 1024);
+    });
+
+    await t.test('a detached reduce runs through the JOB envelope', async () => {
+        assert.equal(await jobs.supportsJobApi(pool), true);
+        const jobId = await jobs.submit(pool, 'PAIR_REDUCE continuations b: 256');
+        const result = await jobs.awaitJob(pool, jobId, { pollIntervalMs: 100, timeoutMs: 30000 });
+        assert.equal(Number(result.fields.count), 64);
+    });
+
+    await t.test('the server gauges and the log ring are readable', async () => {
+        const stats = await admin.systemStats(pool);
+        assert.ok((stats.logicalCores || 0) >= 1);
+        assert.ok(Array.isArray(await admin.logFlush(pool)));
+        assert.ok((await admin.fileCheckpoint(pool)) >= 0);
     });
 
     await t.test('a subclass inherits connect, ids and accounting', async () => {

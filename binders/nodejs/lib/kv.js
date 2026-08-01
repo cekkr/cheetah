@@ -17,6 +17,8 @@
 const {
     buildCommand,
     encodeArgument,
+    numericField,
+    parseBranches,
     parseCursor,
     parseItems,
     rawArgument,
@@ -206,6 +208,110 @@ async function deletePair(conn, key) {
 }
 
 /**
+ * Store bytes and return their absolute key, without binding a name to it.
+ *
+ * The half of the two-step write that `putValue` hides. Reach for it when the
+ * name is decided later, or when several names should share one payload.
+ */
+async function insert(conn, payload) {
+    const wire = assertSingleLine(toWire(payload));
+    const response = await conn.send(`INSERT ${wire}`);
+    if (!response.ok) {
+        throw new CheetahError(`cheetah INSERT failed: ${response.error || response.raw}`, { response });
+    }
+    const absKey = Number.parseInt(response.fields.key, 10);
+    if (!Number.isFinite(absKey)) {
+        throw new CheetahError(`cheetah INSERT returned no key: ${response.raw}`, { response });
+    }
+    return absKey;
+}
+
+/** Overwrite the value under an existing key; the key stays valid. */
+async function editAbsoluteKey(conn, absKey, payload) {
+    const wire = assertSingleLine(toWire(payload));
+    const response = await conn.send(`EDIT ${absKey} ${wire}`);
+    if (!response.ok) {
+        throw new CheetahError(`cheetah EDIT ${absKey} failed: ${response.error || response.raw}`, {
+            response,
+        });
+    }
+}
+
+/**
+ * Bind a name to a key. `hidden` sets the visibility bit — one flag on one
+ * entry, not a separate namespace: every reader can opt back in with
+ * `includeHidden`.
+ */
+async function pairSet(conn, key, absKey, { hidden = false } = {}) {
+    await conn.commandOrThrow(hidden ? 'PAIR_SET_HIDDEN' : 'PAIR_SET', key, absKey);
+}
+
+/**
+ * Tombstone a value. Any pair name still pointing at it is **not** removed —
+ * the two layers are independent on purpose.
+ */
+async function deleteValue(conn, absKey) {
+    const response = await conn.send(`DEL values key=${Number(absKey)}`);
+    if (response.ok) return true;
+    if (response.error && /(not_found|already_deleted)/.test(response.error)) return false;
+    throw new CheetahError(`cheetah DEL values ${absKey} failed: ${response.error || response.raw}`, {
+        response,
+    });
+}
+
+/**
+ * Unbind a whole namespace, deleting its payloads unless `payloads: false`.
+ *
+ * `prefix` null means the whole trie. The loop runs inside the server, so a
+ * namespace wipe is seconds rather than thousands of round trips; prefer
+ * `RESET_DB` when the entire database is disposable.
+ */
+async function purgePrefix(conn, prefix = null, { limit = 0, payloads = true } = {}) {
+    const target = prefix === null || prefix === '' || prefix === '*' ? '*' : encodeArgument(prefix);
+    const parts = [`DEL pairs prefix=${target}`];
+    if (limit > 0) parts.push(`limit=${Number(limit)}`);
+    if (!payloads) parts.push('payloads=0');
+    const response = await conn.send(parts.join(' '));
+    if (!response.ok) {
+        throw new CheetahError(`cheetah DEL pairs prefix=${target} failed: ${response.error || response.raw}`, {
+            response,
+        });
+    }
+    const deleted = Number.parseInt(response.fields.deleted, 10);
+    return Number.isFinite(deleted) ? deleted : 0;
+}
+
+/**
+ * `PAIR_SUMMARY` — the shape of a namespace without hydrating a byte: how many
+ * terminals it holds, how many bytes they occupy, and where the fan-out is. The
+ * "is this worth scanning?" probe you run *before* committing to a sweep.
+ */
+async function pairSummary(conn, prefix = null, { depth = 1, branchLimit = null, includeHidden = false } = {}) {
+    const target = prefix === null || prefix === '' ? '*' : prefix;
+    const response = await conn.command(
+        'PAIR_SUMMARY',
+        target,
+        depth,
+        branchLimit === null ? undefined : branchLimit,
+        includeHidden ? 'include_hidden=1' : undefined
+    );
+    if (!response.ok) {
+        throw new CheetahError(`cheetah PAIR_SUMMARY ${target} failed: ${response.error || response.raw}`, {
+            response,
+        });
+    }
+    return {
+        count: numericField(response.fields, 'count', 0),
+        payloadBytes: numericField(response.fields, 'total_payload_bytes', 0),
+        minPayloadBytes: numericField(response.fields, 'min_payload_bytes', null),
+        maxPayloadBytes: numericField(response.fields, 'max_payload_bytes', null),
+        maxDepth: numericField(response.fields, 'max_depth', null),
+        branches: parseBranches(response.fields.branches),
+        response,
+    };
+}
+
+/**
  * One page of a `PAIR_SCAN` (or `PAIR_REDUCE`, with `reducer`).
  *
  * The cursor is handed back **verbatim** through `rawArgument`. Encoding it
@@ -258,10 +364,16 @@ async function scanAll(conn, prefix, options) {
 
 module.exports = {
     deletePair,
+    deleteValue,
+    editAbsoluteKey,
     fromWire,
+    insert,
     getAbsoluteKey,
     getJson,
     getValue,
+    pairSet,
+    pairSummary,
+    purgePrefix,
     putJson,
     putJsonBatch,
     putValue,
