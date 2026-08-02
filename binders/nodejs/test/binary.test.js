@@ -215,6 +215,16 @@ test('transcoding is lossless for the lines every command layer builds', () => {
     }
 });
 
+test('transcoding preserves UTF-8 payload bytes represented by the latin1 command line', () => {
+    const session = testSession();
+    const payload = 'clichés-café.jpg';
+    const wire = Buffer.from(payload, 'utf8').toString('latin1');
+    assert.strictEqual(
+        decodeRequestLine(binary.encodeCommandLine(`INSERT ${wire}`, session), session),
+        `INSERT ${payload}`
+    );
+});
+
 test('hex arguments travel as real bytes and come back spelled the same', () => {
     const session = testSession();
     const frame = binary.encodeCommandLine('RECORD get table=t key=x6265726c696e', session);

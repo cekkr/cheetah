@@ -322,7 +322,10 @@ function encodeValue(spec, widths = DEFAULT_WIDTHS) {
     const declared = spec.width || 0;
     switch (spec.type) {
         case 'string':
-            return encodeLengthPrefixed(KIND.STRING, Buffer.from(String(spec.value), 'utf8'));
+            return encodeLengthPrefixed(
+                KIND.STRING,
+                Buffer.from(String(spec.value), spec.encoding === 'latin1' ? 'latin1' : 'utf8')
+            );
         case 'bytes':
             return encodeLengthPrefixed(
                 KIND.BYTES,
@@ -470,7 +473,7 @@ function minimalWidth(type, value) {
  * arbitrary line addresses, so it cannot predict what the server would resolve
  * a width-0 tag to — and the nibble that states it is free.
  */
-function typeToken(token) {
+function typeToken(token, { stringEncoding = 'utf8' } = {}) {
     if (/^x([0-9a-fA-F]{2})+$/.test(token)) {
         return { type: 'bytes', value: Buffer.from(token.slice(1), 'hex') };
     }
@@ -479,7 +482,9 @@ function typeToken(token) {
         if (numeric.type === 'float') return { ...numeric, width: 8 };
         return { ...numeric, width: minimalWidth(numeric.type, numeric.value) };
     }
-    return { type: 'string', value: token };
+    return stringEncoding === 'utf8'
+        ? { type: 'string', value: token }
+        : { type: 'string', value: token, encoding: stringEncoding };
 }
 
 /**
@@ -512,8 +517,11 @@ function encodeCommandLine(line, session = null) {
         for (const token of rest.split(' ')) {
             const equals = token.indexOf('=');
             const key = equals > 0 ? token.slice(0, equals) : '';
-            if (!ARGUMENT_NAME.test(key)) args.push(typeToken(token));
-            else args.push({ key, ...typeToken(token.slice(equals + 1)) });
+            if (!ARGUMENT_NAME.test(key)) {
+                args.push(typeToken(token, { stringEncoding: 'latin1' }));
+            } else {
+                args.push({ key, ...typeToken(token.slice(equals + 1), { stringEncoding: 'latin1' }) });
+            }
         }
     }
     return encodeRequest({ command, suffix, args }, session);

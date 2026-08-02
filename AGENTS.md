@@ -1253,7 +1253,7 @@ actually spawnable).
   while the server defaults to stopping, so `continue_on_error=1` must travel explicitly. **Any
   change to those on the Go side is a change here too**, and the binder's tests are where a client
   would first notice.
-- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 136 tests (135 passing + 1 opt-in integration test skipped by default):
+- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 137 tests (136 passing + 1 opt-in integration test skipped by default):
   codec, key primitives, the `GRAPH_*` command spellings
   ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), the `RECORD` ones
   ([`test/records.test.js`](binders/nodejs/test/records.test.js)), the job/prediction/admin ones
@@ -1557,7 +1557,9 @@ float written 8 bytes wide but tagged "resolve it" is read at the session's 4 an
 `1.625`; a transcoder cannot know which table an arbitrary line addresses. Width 0 is only for a
 caller that has loaded the table's profile. A second one, found the same way: an `INSERT` payload
 carrying base64 padding must not be cut at its `=` — both binders gate that on an argument-name
-pattern.
+pattern. A third: the Node command layers represent UTF-8 payload bytes as latin1 code units for the
+text socket. `encodeCommandLine` must preserve that byte spelling when it builds a binary string
+value; encoding those code units as UTF-8 a second time turns `é` into `Ã©` after `fromWire`.
 
 ### Prediction tables + context matrices — Shipped (GPU path simulated)
 
@@ -1900,7 +1902,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Graph reducers (degree/triangle/pagerank_seed) | [`TestGraphReducersDegreeTriangleAndPageRankSeed`](src/graph_test.go) |
 | Graph-NELL demo eval/loader math (AUC/AP/P@K, models, split, loader) | [`TestRankingMetrics`/`TestBuildModels`/`TestLoadNELLEdges`/…](demo/graph-nell/main_test.go) |
 | End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
-| Node binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors | [`binders/nodejs/test/protocol.test.js`](binders/nodejs/test/protocol.test.js) (`node --test`) |
+| Node binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors; binary transcoding preserves latin1-spelled UTF-8 payload bytes | [`binders/nodejs/test/protocol.test.js`](binders/nodejs/test/protocol.test.js), [`binders/nodejs/test/binary.test.js`](binders/nodejs/test/binary.test.js) (`node --test`) |
 | Node binder: fixed-width hex ordering, integer bucketing and tolerance sweeps | [`binders/nodejs/test/keys.test.js`](binders/nodejs/test/keys.test.js) |
 | Node binder: `CheetahDatabase` layout guard, owned-pool binary transport forwarding, mutation chain, id allocation, accounting | [`binders/nodejs/test/database.test.js`](binders/nodejs/test/database.test.js) |
 | Node/Python server launchers select `cheetah-server.exe` on Windows | [`binders/nodejs/test/server.test.js`](binders/nodejs/test/server.test.js), [`binders/python/tests/test_server.py`](binders/python/tests/test_server.py) |
@@ -1983,7 +1985,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - **Node.js binder** ([`binders/nodejs/`](binders/nodejs/)) — dependency-free client: codec, pooled
   TCP client, KV/graph/record/job/prediction/admin helpers, key primitives, token vocabulary,
   subclassable `CheetahDatabase`, the binary transport and the `ALIAS` discovery layer, and a
-  test-server launcher. Verified by its own suite (135 unit tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
+  test-server launcher. Verified by its own suite (136 unit tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
   UTF-8 payloads, batch writes, cursor paging, the `continuations` reducer, vocabulary allocation,
   `GRAPH_RECALL` convergence, a record table through define/partial-write/add/drop/compact/drop,
   `DB_CREATE` with its own settings, a detached `JOB` reduce, server gauges, subclass lifecycle,

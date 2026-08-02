@@ -129,9 +129,12 @@ to prevent.
   `setEdgeBatch` returns that accounting rather than a boolean, and its optional
   `chunkSize` is off by default because splitting a list changes what a partial
   failure leaves behind.
-- **The socket speaks latin1** for byte transparency, so UTF-8 payloads are
-  transcoded at both edges (`kv.toWire`/`kv.fromWire`). Skipping that mangles
-  any non-ASCII string you store.
+- **The canonical command line is a latin1 byte spelling** for byte
+  transparency, so UTF-8 payloads are transcoded at both edges
+  (`kv.toWire`/`kv.fromWire`). Text sockets write that spelling directly;
+  binary sockets preserve those same bytes while framing it. Skipping that —
+  or re-encoding the latin1 spelling as UTF-8 in a transcoder — mangles any
+  non-ASCII string you store.
 - **Keys are an index, not a label.** In a pair trie the key bytes *are* the
   index, so changing a key layout means rebuilding the database. Use fixed-width
   lowercase hex for numeric segments (`keys.hex`) — a scan is byte-ordered, and
