@@ -36,7 +36,7 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `admin` | The server and the registry of databases, not the data: `createDatabase`, `listDatabases`, `useDatabase`, `resetDatabase`, `systemStats`, `logFlush`, `fileCheckpoint`, `clusterUpdate`/`clusterStatus`/`clusterMove`, `forkAssign`. |
 | `keys` | Key-building primitives: fixed-width `hex`/`unhex`, `sha1`, and integer `quantize`/`bucketize`/`bucketSweep`. |
 | `vocabulary` | `TokenVocabulary` — a persisted string → uint32 allocator, both directions. |
-| `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it. |
+| `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it; its owned pool accepts the same `binary` transport option as `CheetahClient`/`CheetahPool`. |
 | `server` | `startServer`/`ensureServerBinary` — spawn a server for development and tests. |
 
 ## Speaking bytes instead of text

@@ -1231,7 +1231,7 @@ pure `build*` for its commands, so a caller that writes several commands to a co
 shares the binder's encoding instead of re-deriving base64 and `x<hex>` — and finally
 [`lib/database.js`](binders/nodejs/lib/database.js)
 (`CheetahDatabase` — a subclassable handle holding the plumbing every application otherwise
-rewrites: pool construction, a layout-version guard on connect, a `close` that only closes a pool it
+rewrites: pool construction (including the `binary` transport option), a layout-version guard on connect, a `close` that only closes a pool it
 owns, a per-key mutation chain, collision-checked id allocation, namespace payload accounting). Beside them sits [`lib/binary.js`](binders/nodejs/lib/binary.js), the byte-wise transport: frames,
 type tags, the negotiated `BinarySession`, and `encodeCommandLine`/`decodeResponse` — a *transcoder*
 over the lines the layers above already build, which is why `new CheetahClient({binary: true})`
@@ -1253,7 +1253,7 @@ actually spawnable).
   while the server defaults to stopping, so `continue_on_error=1` must travel explicitly. **Any
   change to those on the Go side is a change here too**, and the binder's tests are where a client
   would first notice.
-- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 135 tests (134 passing + 1 opt-in integration test skipped by default):
+- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 136 tests (135 passing + 1 opt-in integration test skipped by default):
   codec, key primitives, the `GRAPH_*` command spellings
   ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), the `RECORD` ones
   ([`test/records.test.js`](binders/nodejs/test/records.test.js)), the job/prediction/admin ones
@@ -1902,7 +1902,7 @@ seen in old docs are **client-side**; the server does not read them.
 | End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
 | Node binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors | [`binders/nodejs/test/protocol.test.js`](binders/nodejs/test/protocol.test.js) (`node --test`) |
 | Node binder: fixed-width hex ordering, integer bucketing and tolerance sweeps | [`binders/nodejs/test/keys.test.js`](binders/nodejs/test/keys.test.js) |
-| Node binder: `CheetahDatabase` layout guard, mutation chain, id allocation, accounting | [`binders/nodejs/test/database.test.js`](binders/nodejs/test/database.test.js) |
+| Node binder: `CheetahDatabase` layout guard, owned-pool binary transport forwarding, mutation chain, id allocation, accounting | [`binders/nodejs/test/database.test.js`](binders/nodejs/test/database.test.js) |
 | Node/Python server launchers select `cheetah-server.exe` on Windows | [`binders/nodejs/test/server.test.js`](binders/nodejs/test/server.test.js), [`binders/python/tests/test_server.py`](binders/python/tests/test_server.py) |
 | Node binder against a live server (KV, batch, scan paging, recall, reset, pipelining) | [`binders/nodejs/test/integration.test.js`](binders/nodejs/test/integration.test.js) (`CHEETAH_INTEGRATION=1`) |
 | Python binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors | [`binders/python/tests/test_protocol.py`](binders/python/tests/test_protocol.py) (`python3 -m unittest`) |
@@ -1983,7 +1983,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - **Node.js binder** ([`binders/nodejs/`](binders/nodejs/)) — dependency-free client: codec, pooled
   TCP client, KV/graph/record/job/prediction/admin helpers, key primitives, token vocabulary,
   subclassable `CheetahDatabase`, the binary transport and the `ALIAS` discovery layer, and a
-  test-server launcher. Verified by its own suite (134 unit tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
+  test-server launcher. Verified by its own suite (135 unit tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
   UTF-8 payloads, batch writes, cursor paging, the `continuations` reducer, vocabulary allocation,
   `GRAPH_RECALL` convergence, a record table through define/partial-write/add/drop/compact/drop,
   `DB_CREATE` with its own settings, a detached `JOB` reduce, server gauges, subclass lifecycle,

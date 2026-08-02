@@ -132,6 +132,13 @@ test('a store with no layout marker connects against anything', async () => {
     assert.equal(await database.getValue('cfg:layout'), null);
 });
 
+test('an owned pool receives the binary transport option', async () => {
+    const database = new CheetahDatabase({ binary: true, poolSize: 2 });
+    assert.equal(database.pool.clients.length, 2);
+    assert.ok(database.pool.clients.every((client) => client.options.binary === true));
+    await database.close();
+});
+
 test('json values round-trip, and upsert keeps the absolute key stable', async () => {
     const { database } = store();
     await database.connect();

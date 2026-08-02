@@ -52,6 +52,8 @@ class CheetahDatabase {
      * @param {string} [options.database] database name (`DATABASE <name>`)
      * @param {object} [options.databaseOptions] inline overrides sent with it,
      *   e.g. `{pair_bytes: 2}`. Only honoured when the directory is created.
+     * @param {boolean|object} [options.binary] enable the byte-wise TCP
+     *   protocol, optionally with `{uint, int, float}` default widths.
      * @param {{key: string, version: number}} [options.layout] the layout
      *   version marker to write on first connect and to verify afterwards.
      * @param {function} [options.now] clock, for tests
@@ -70,6 +72,7 @@ class CheetahDatabase {
             poolSize,
             host,
             port,
+            binary,
             connectTimeoutMs,
             commandTimeoutMs,
             maxInFlight,
@@ -80,6 +83,7 @@ class CheetahDatabase {
             size: poolSize,
             host,
             port,
+            binary,
             database,
             databaseOptions,
             connectTimeoutMs,
