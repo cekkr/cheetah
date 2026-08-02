@@ -40,12 +40,15 @@ from __future__ import annotations
 
 import logging
 import socket
+import struct
 import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Mapping
 
+from . import binary as binary_codec
 from .batch import AutoBatchPolicy, BatchCollector, HotCommandWindow, split_command_line
+from .binary import BinarySession
 from .hosts import candidate_hosts
 from .protocol import Response, build_command, build_key_value_command, parse_response
 
@@ -98,6 +101,7 @@ class CheetahClient:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         idle_grace: float | None = None,
         auto_batch: AutoBatchPolicy | Mapping[str, Any] | None = None,
+        binary: bool | Mapping[str, int] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -113,6 +117,16 @@ class CheetahClient:
         self._last_errors: list[str] = []
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        # Binary mode (:mod:`cheetah_db.binary`). ``binary=True`` takes the
+        # server's default widths; a mapping asks for its own. Everything above
+        # this client keeps producing command lines: they are transcoded on the
+        # way out and rebuilt from the response frame on the way in, so no
+        # command layer notices which transport it is running over.
+        self.binary_requested = (
+            {} if binary is True else dict(binary) if isinstance(binary, Mapping) else None
+        )
+        self.binary: BinarySession | None = None
+        self._binary_buffer = b""
         self.auto_batch = (
             auto_batch
             if isinstance(auto_batch, AutoBatchPolicy)
@@ -334,22 +348,23 @@ class CheetahClient:
     # Low-level protocol management
     # ------------------------------------------------------------------ #
     def _command(self, text: str) -> str | None:
-        line = (text.strip() + "\n").encode("utf-8")
         with self._lock:
             if not self._ensure_connection():
                 return None
             assert self._sock is not None
             try:
-                self._sock.sendall(line)
-                return self._readline()
+                # Encoded *after* the connection is up: in binary mode the frame
+                # depends on the session this socket negotiated.
+                self._sock.sendall(self._encode_command(text))
+                return self._read_response()
             except OSError as exc:
                 logger.debug("cheetah command failed (%s), reconnecting...", exc)
                 self._close_socket()
                 if not self._ensure_connection():
                     return None
                 assert self._sock is not None
-                self._sock.sendall(line)
-                return self._readline()
+                self._sock.sendall(self._encode_command(text))
+                return self._read_response()
 
     def _ensure_connection(self) -> bool:
         if self._sock:
@@ -365,6 +380,12 @@ class CheetahClient:
                 continue
             self._sock = sock
             self._active_host = host
+            if self.binary_requested is not None and not self._binary_handshake():
+                # Before anything else: the server picks the mode from the first
+                # byte, and the widths it fixes apply to every later frame.
+                self._close_socket()
+                errors.append(f"{host}:{self.port} -> binary handshake failed")
+                continue
             if self.database and self.database != "default":
                 response = self._command_unlocked(self._database_command(self.database))
                 if not response or not response.startswith("SUCCESS"):
@@ -384,16 +405,130 @@ class CheetahClient:
 
     def _command_unlocked(self, text: str) -> str | None:
         """Send a line with the lock already held (connection handshake only)."""
-        line = (text.strip() + "\n").encode("utf-8")
         if not self._sock:
             return None
         try:
-            self._sock.sendall(line)
-            return self._readline()
+            self._sock.sendall(self._encode_command(text))
+            return self._read_response()
         except OSError as exc:
             logger.debug("cheetah command failed (%s) before lock acquisition", exc)
             self._close_socket()
             return None
+
+    # ------------------------------------------------------------------ #
+    # Transport: one line of text, or one frame
+    # ------------------------------------------------------------------ #
+    def _encode_command(self, text: str) -> bytes:
+        if self.binary_requested is None:
+            return (text.strip() + "\n").encode("utf-8")
+        return binary_codec.encode_command_line(text.strip(), self.binary)
+
+    def _read_response(self) -> str | None:
+        if self.binary_requested is None:
+            return self._readline()
+        read = self._read_frame()
+        if read is None:
+            return None
+        frame_type, body = read
+        if frame_type != binary_codec.FrameType.RESPONSE:
+            logger.warning("cheetah sent frame type %s where a response was due", frame_type)
+            self._close_socket()
+            return None
+        widths = self.binary.widths if self.binary else binary_codec.DEFAULT_WIDTHS
+        try:
+            # Back to the canonical line: parse_response and every layer above
+            # it are untouched by which transport carried the answer.
+            return binary_codec.decode_response(body, self.binary, widths).line
+        except binary_codec.BinaryProtocolError as exc:
+            logger.warning("cheetah binary response could not be decoded: %s", exc)
+            self._close_socket()
+            return None
+
+    def _read_frame(self) -> tuple[int, bytes] | None:
+        """One whole frame, or None when the socket went quiet or away."""
+        while True:
+            try:
+                taken = binary_codec.read_frame(self._binary_buffer)
+            except binary_codec.BinaryProtocolError as exc:
+                # A frame we cannot even delimit means we no longer know where
+                # the next one starts: the connection goes down with it.
+                logger.warning("cheetah binary stream desynchronised: %s", exc)
+                self._close_socket()
+                return None
+            if taken is not None:
+                frame_type, body, rest = taken
+                self._binary_buffer = rest
+                return frame_type, body
+            if not self._fill_binary_buffer():
+                return None
+
+    def _fill_binary_buffer(self) -> bool:
+        """Read once, tolerating silence the same way _readline does."""
+        if not self._sock:
+            return False
+        idle_deadline = time.monotonic() + self._readline_idle_grace
+        while True:
+            try:
+                data = self._sock.recv(65536)
+            except socket.timeout:
+                if time.monotonic() >= idle_deadline:
+                    logger.warning(
+                        "cheetah response timed out after %.1fs of inactivity",
+                        self._readline_idle_grace,
+                    )
+                    return False
+                continue
+            except OSError:
+                self._close_socket()
+                return False
+            if not data:
+                self._close_socket()
+                return False
+            self._binary_buffer += data
+            return True
+
+    def _binary_handshake(self) -> bool:
+        """Negotiate the widths and take the tables the ack delivers.
+
+        The ack carries the command index and the argument-key dictionary in
+        full, which is not an optimisation: a response frame names its fields by
+        index, so without the dictionary this client could not decode even the
+        answer to ``ALIAS keys``. The ack is the one message that can break that
+        circle.
+        """
+        if not self._sock:
+            return False
+        requested = self.binary_requested or {}
+        self._binary_buffer = b""
+        try:
+            self._sock.sendall(
+                binary_codec.encode_handshake(
+                    uint=int(requested.get("uint", 0)),
+                    int_=int(requested.get("int", 0)),
+                    float_=int(requested.get("float", 0)),
+                )
+            )
+        except OSError as exc:
+            logger.debug("cheetah binary handshake failed to send (%s)", exc)
+            return False
+        read = self._read_frame()
+        if read is None:
+            return False
+        frame_type, body = read
+        if frame_type != binary_codec.FrameType.HANDSHAKE_ACK:
+            logger.debug("cheetah answered frame type %s to a handshake", frame_type)
+            return False
+        try:
+            ack = binary_codec.decode_handshake_ack(body)
+        except (binary_codec.BinaryProtocolError, IndexError, struct.error) as exc:
+            logger.debug("cheetah handshake ack could not be decoded: %s", exc)
+            return False
+        if ack.version != binary_codec.PROTOCOL_VERSION:
+            logger.debug("cheetah speaks binary protocol v%s, this binder v%s",
+                         ack.version, binary_codec.PROTOCOL_VERSION)
+            return False
+        self.binary = BinarySession().adopt(ack)
+        return True
 
     def _readline(self) -> str | None:
         if not self._sock:
@@ -429,6 +564,10 @@ class CheetahClient:
                 pass
             self._sock = None
         self._active_host = None
+        # The negotiated session belongs to the socket that is going away: a
+        # reconnection re-handshakes, and the index it gets back may differ.
+        self.binary = None
+        self._binary_buffer = b""
 
     def _build_host_candidates(self, host: str) -> list[str]:
         return candidate_hosts(host)

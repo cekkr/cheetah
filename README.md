@@ -182,12 +182,16 @@ single `payload=<base64>` field (JSON once decoded), never as extra lines. The C
 listener speak the same vocabulary — only `DATABASE`, `RESET_DB` and `EXIT` are handled by the
 front-ends, because they change *which* database the connection is talking to.
 
+A TCP client that would rather not spell numbers as text can send the same commands as **byte-wise
+frames**, with the command as a 2-byte index and each value in its own type; the line below is what
+the server reconstructs either way. See [Byte-wise protocol](#byte-wise-binary-protocol).
+
 Three argument dialects coexist, which is why a command's family is easier to guess than its syntax:
 
 | Dialect | Used by | Example |
 | --- | --- | --- |
 | **positional** | the KV and `PAIR_*` families, `LOG_FLUSH`, `FORK_ASSIGN`, job polling | `PAIR_SCAN ctx: 64 x000104` |
-| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*`, the micro-commands (`BATCH`, `DEL`, `JOB`, `RECORD`) | `GRAPH_DEGREE id=alice direction=both` |
+| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*`, the micro-commands (`ALIAS`, `BATCH`, `DEL`, `JOB`, `RECORD`) | `GRAPH_DEGREE id=alice direction=both` |
 | **clause language** | `GRAPH_QUERY` only | `MATCH (id='alice')-[:follows]->(*) HOPS 1..2 RETURN paths` |
 
 `FILE_CHECKPOINT` adds a fourth, smaller convention: bare uppercase flags (`DROP_CACHE`,
@@ -218,6 +222,7 @@ them, so nothing below replaces anything you already use.
 | `DEL records table=<t> key=<k>` | — | one row of a record table |
 | `DEL records table=<t> drop=1` | — | the whole record table: every row, every generation, and the schema |
 | `RECORD define \| alter \| compact \| schema \| tables \| set \| get \| scan` | — | multi-field tables, see [Record tables](#record-tables--one-thing-many-fields) |
+| `ALIAS list \| get \| keys \| types \| profile \| digest` | — | the protocol describing itself: the numeric index of every command, and a table's numeric widths. See [Byte-wise protocol](#byte-wise-binary-protocol) |
 | `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`), anything else is `ERROR,command_not_submittable` |
 | `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS` | `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters; `available=` appears only for a job that produces results per item |
 | `JOB fetch id=<job>` | `PAIR_REDUCE_FETCH`, `PREDICT_INHERIT_FETCH` | the submitted command's own response under `job=<id>` while completed, `PENDING,…` while running, and it consumes the job |
@@ -1019,6 +1024,121 @@ price. The distinctions that actually matter:
   not one `READ` per row.
 - Every paging command uses the same convention: `next_cursor=*` (or absent) means the scan is
   exhausted, and `*` as an *input* cursor or prefix means "start from the beginning / no prefix".
+
+## Byte-wise (binary) protocol
+
+The text protocol describes everything as a string: `42` costs two bytes, `0.25` four, a 32-byte key
+sixty-four in hex, and the command name itself anywhere from four to twenty-three. Over TCP a client
+can instead speak the **binary protocol**, where the command is a 2-byte index and every value
+travels in its own type — unsigned, signed, floating point, bytes, boolean, or an enumeration id.
+
+It is the same protocol, not a second one. A request frame is decoded into the *canonical command
+line* and routed exactly as if it had arrived as text; the answer line is re-encoded into a response
+frame. Nothing about a command changes, no command has to opt in, and a command added tomorrow is
+reachable in binary the day it exists. The CLI is unaffected — it stays text.
+
+### Turning it on
+
+A binary connection is declared by its **first byte**: frames begin with `0xC7`, which no text
+command can start with, so the server picks the mode without any prior negotiation. The first frame
+must be a handshake:
+
+```text
+0xC7  0x01  <u32be length>  <version> <uint_bytes> <int_bytes> <float_bytes> <flags>
+```
+
+A width of `0` means "the server's default" (8 for all three), so a client with an opinion about
+floats alone does not have to state one about integers. The server answers with an **ack** carrying
+the effective widths, the index `epoch` and `digest`, and — in full — the command index and the
+argument-key dictionary. Those two tables arrive here rather than on request because a response
+names its fields by index: a client that did not yet have the dictionary could not read even the
+answer to `ALIAS keys`.
+
+### Frames
+
+```text
+0xC7  <u8 type>  <u32be body length>  <body>          type: 1 handshake · 2 ack · 3 request · 4 response
+
+request body    u8 flags            bit0: command sent by name · bit1: a ":<suffix>" follows
+                u16be | name        the command index, or a length-prefixed name
+                [suffix]            the ":16" of INSERT:16
+                u16be argc
+                arguments:
+                  u8 key mode       0 positional · 1 indexed (u16be) · 2 inline (length + name)
+                  u8 type tag       high nibble the type, low nibble the byte width
+                  value
+
+response body   u8 status           0 other · 1 SUCCESS · 2 ERROR · 3 PENDING
+                u16be field count
+                fields               the same key/type/value triples
+```
+
+| Type | Tag | Value bytes | Renders as |
+| --- | --- | --- | --- |
+| string | `0x0` | `u32be` length + UTF-8 | the text itself |
+| bytes | `0x1` | `u32be` length + raw | `x<hex>` — the escape every binary key should use |
+| uint | `0x2` | *width* bytes, big-endian | decimal |
+| int | `0x3` | *width* bytes, two's complement | decimal |
+| float | `0x4` | 4 or 8 bytes, IEEE-754 | shortest round-trip decimal |
+| bool | `0x5` | 1 byte | `1` / `0` |
+| enum | `0x6` | `u8` family + `u16be` id | the name behind the id (family 1 = commands, 2 = argument keys) |
+| null | `0x7` | none | the argument disappears — how an optional modifier stays in a client's struct |
+
+The **canonical line remains the contract**, and its limits still apply: a `key=value` value may not
+contain whitespace, and a frame that would produce one is refused rather than silently truncated.
+The `bytes` type is the way out, and in binary it costs nothing extra. The one relaxation is the
+*last* positional argument, which may contain spaces because in the text line it is the rest of the
+line — which is exactly what `INSERT`, `EDIT` and `PAIR_SET` treat it as.
+
+### Where a number's width comes from
+
+An integer on the wire does not say how wide it is. Four sources answer that, most specific first:
+
+1. **the type tag** — an explicit width of 1…8, which always wins and never depends on anything else;
+2. **the table's profile** — "this table uses 4-byte integers", declared with `ALIAS profile` and
+   *persisted per database*, so two processes writing the same table encode it the same way;
+3. **the session defaults** — negotiated in the handshake, valid for the connection;
+4. **the server defaults** — 8, 8, 8.
+
+The table profile applies to the arguments that come **after** `table=` in the same frame: arguments
+are decoded in order, and the table is not known before it has been read. Put `table=` first. An
+explicit width in the tag is the only thing that never depends on that ordering.
+
+### `ALIAS` — asking what the numbers mean
+
+Two things a client cannot derive on its own: the command index, which changes whenever a command or
+an alias is added or removed, and a table's numeric widths, which belong to the database. Both are
+readable, and both come with a digest so a cached copy is checked in sixteen characters:
+
+| Command | What it answers |
+| --- | --- |
+| `ALIAS list [from=] [limit=] [kind=]` | the whole index as `payload=<base64 json>` of `{id,name,kind}`, plus `epoch=`/`digest=`/`total=`. `kind` is `micro`, `alias`, `builtin`, `engine` or `frontend` — descriptive; every kind is callable the same way |
+| `ALIAS get name=<COMMAND>` · `ALIAS get id=<n>` | one entry, resolved either way |
+| `ALIAS keys [from=] [limit=]` | the argument-key dictionary, same shape. Missing from it is not an error — an unknown key simply travels spelled out, so the dictionary is a compression and never a restriction |
+| `ALIAS types` | the value types with their numbers, the enum families, the key modes and the server's default widths |
+| `ALIAS profile table=<t>` | the **resolved** widths (what the server will actually use) alongside the declared ones, `declared_*` being `0` where the table says nothing |
+| `ALIAS profile table=<t> [uint=<n>] [int=<n>] [float=<n>]` | declare them. `uint`/`int` are 1…8 bytes, `float` is 4 or 8 — the same rules a record-table field obeys |
+| `ALIAS profile table=<t> reset=1` | drop the declaration |
+| `ALIAS profile` | every declared profile |
+| `ALIAS digest` | just the identity: `epoch=`, `digest=`, `keys_digest=`, and the two counts |
+
+The index ids are **not** a stable wire contract the way response field names are — they are derived
+from the server's command inventory, which is exactly what makes adding or removing an alias free.
+The digest is what a client verifies them against, and the handshake ack hands it over for nothing.
+
+```text
+[cheetah_data/notes]> ALIAS digest
+SUCCESS,version=1,epoch=1,digest=4f2b9c1ad8e73056,commands=62,keys_digest=91c4de07a5b3f218,keys=81
+[cheetah_data/notes]> ALIAS get name=RECORD
+SUCCESS,id=57,name=RECORD,kind=micro,digest=4f2b9c1ad8e73056
+[cheetah_data/notes]> ALIAS profile table=ngram uint=4 float=4
+SUCCESS,table=ngram,uint=4,int=8,float=4,declared=1,declared_uint=4,declared_int=0,declared_float=4,updated=1
+# int was never declared, so it reads as the default 8 rather than as a zero
+```
+
+Both binders speak it: `new CheetahClient({binary: true})` in Node, `CheetahClient(..., binary=True)`
+in Python. Because the frames are a transcoding of the same lines, every command layer above the
+socket — `kv`, `graph`, `records`, `predict`, `admin`, `CheetahDatabase` — works unchanged.
 
 ## Command Walkthroughs
 

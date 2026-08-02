@@ -28,12 +28,18 @@
 const net = require('net');
 const { EventEmitter } = require('events');
 const { buildCommand, parseResponse } = require('./protocol');
+const binaryCodec = require('./binary');
 
 const DEFAULTS = Object.freeze({
     host: '127.0.0.1',
     port: 4455,
     database: null,
     databaseOptions: null,
+    // `true`, or `{uint, int, float}` widths, switches this socket to the
+    // binary protocol (binary.js). Everything above keeps producing command
+    // lines: the client transcodes them and turns each response frame back into
+    // the canonical line, so no command layer notices.
+    binary: false,
     connectTimeoutMs: 5000,
     commandTimeoutMs: 30000,
     maxInFlight: 64,
@@ -95,6 +101,10 @@ class CheetahClient extends EventEmitter {
         this.waiting = [];
         this.connecting = null;
         this.lastError = null;
+        // Binary mode: a session (negotiated widths + the command index) once
+        // the handshake has run, null while the socket speaks text.
+        this.binary = null;
+        this.binaryHandshake = null;
         // Required here rather than at module scope: batch.js reaches back for
         // CheetahError, and two top-level requires would deadlock the cycle.
         const { createAutoBatcher } = require('./batch');
@@ -125,6 +135,12 @@ class CheetahClient extends EventEmitter {
         for (;;) {
             try {
                 await this.#openSocket();
+                if (this.options.binary) {
+                    // Before anything else: the server picks the mode from the
+                    // first byte, and the widths it fixes apply to every later
+                    // frame on this socket.
+                    await this.#binaryHandshakeExchange();
+                }
                 if (this.options.database) {
                     await this.#selectDatabase();
                 }
@@ -152,7 +168,10 @@ class CheetahClient extends EventEmitter {
                 port: this.options.port,
             });
             socket.setNoDelay(true);
-            socket.setEncoding('latin1');
+            // Text mode reads latin1 strings (a lossless byte↔char mapping);
+            // binary mode keeps Buffers, because a frame is split by declared
+            // length rather than by a delimiter.
+            if (!this.options.binary) socket.setEncoding('latin1');
 
             const onConnectTimeout = setTimeout(() => {
                 socket.destroy();
@@ -175,6 +194,7 @@ class CheetahClient extends EventEmitter {
                 this.socket = socket;
                 this.connected = true;
                 this.buffer = '';
+                this.binaryBuffer = Buffer.alloc(0);
                 socket.on('data', (chunk) => this.#onData(chunk));
                 socket.on('error', (error) => this.#onFailure(error));
                 socket.on('close', () => this.#onFailure(new CheetahConnectionError('cheetah connection closed')));
@@ -198,7 +218,60 @@ class CheetahClient extends EventEmitter {
         }
     }
 
+    /**
+     * Run the binary handshake and adopt what it returns.
+     *
+     * The ack carries the command index and the argument-key dictionary in
+     * full, which is not an optimisation: a response frame names its fields by
+     * index, so without the dictionary this client could not decode even the
+     * answer to `ALIAS keys`. The ack is the one message that can break that
+     * circle.
+     */
+    #binaryHandshakeExchange() {
+        const requested = this.options.binary === true ? {} : this.options.binary || {};
+        const session = new binaryCodec.BinarySession();
+        const frame = binaryCodec.encodeHandshake({
+            uint: requested.uint || 0,
+            int: requested.int || 0,
+            float: requested.float || 0,
+        });
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.binaryHandshake = null;
+                reject(new CheetahConnectionError('cheetah binary handshake timed out'));
+            }, this.options.connectTimeoutMs);
+            this.binaryHandshake = {
+                resolve: (ack) => {
+                    clearTimeout(timer);
+                    if (ack.version !== binaryCodec.PROTOCOL_VERSION) {
+                        reject(new CheetahConnectionError(
+                            `cheetah binary protocol version ${ack.version} is not supported by this binder`
+                        ));
+                        return;
+                    }
+                    session.version = ack.version;
+                    session.widths = ack.widths;
+                    session.epoch = ack.epoch;
+                    session.loadCommands(ack.commands, ack.digest);
+                    session.loadKeys(ack.keys, ack.keysDigest);
+                    this.binary = session;
+                    this.emit('binary', { digest: ack.digest, epoch: ack.epoch, widths: ack.widths });
+                    resolve(session);
+                },
+                reject: (error) => {
+                    clearTimeout(timer);
+                    reject(error);
+                },
+            };
+            this.socket.write(frame);
+        });
+    }
+
     #onData(chunk) {
+        if (this.options.binary) {
+            this.#onBinaryData(chunk);
+            return;
+        }
         this.buffer += chunk;
         let newline = this.buffer.indexOf('\n');
         while (newline !== -1) {
@@ -207,6 +280,65 @@ class CheetahClient extends EventEmitter {
             this.#resolveNext(line);
             newline = this.buffer.indexOf('\n');
         }
+    }
+
+    #onBinaryData(chunk) {
+        this.binaryBuffer = this.binaryBuffer.length === 0 ? chunk : Buffer.concat([this.binaryBuffer, chunk]);
+        for (;;) {
+            let taken;
+            try {
+                taken = binaryCodec.readFrame(this.binaryBuffer);
+            } catch (error) {
+                // A frame we cannot even delimit means we no longer know where
+                // the next one starts: the connection goes down with it.
+                this.#failBinary(new CheetahConnectionError(error.message));
+                return;
+            }
+            if (!taken) return;
+            this.binaryBuffer = Buffer.from(taken.rest);
+            if (!this.#onBinaryFrame(taken.frame)) return;
+        }
+    }
+
+    /** Returns false when the connection has been torn down. */
+    #onBinaryFrame(frame) {
+        if (frame.type === binaryCodec.FRAME.HANDSHAKE_ACK) {
+            const pending = this.binaryHandshake;
+            this.binaryHandshake = null;
+            if (!pending) {
+                this.#failBinary(new CheetahConnectionError('cheetah sent an unexpected handshake ack'));
+                return false;
+            }
+            try {
+                pending.resolve(binaryCodec.decodeHandshakeAck(frame.body));
+            } catch (error) {
+                pending.reject(new CheetahConnectionError(error.message));
+                return false;
+            }
+            return true;
+        }
+        if (frame.type !== binaryCodec.FRAME.RESPONSE) {
+            this.#failBinary(new CheetahConnectionError(`cheetah sent an unexpected frame type ${frame.type}`));
+            return false;
+        }
+        let decoded;
+        try {
+            decoded = binaryCodec.decodeResponse(frame.body, this.binary, this.binary ? this.binary.widths : undefined);
+        } catch (error) {
+            this.#failBinary(new CheetahConnectionError(error.message));
+            return false;
+        }
+        // Back to the canonical line: everything above this point — parsing,
+        // the command layers, CheetahDatabase — is untouched by the transport.
+        this.#resolveNext(decoded.line);
+        return true;
+    }
+
+    #failBinary(error) {
+        const pending = this.binaryHandshake;
+        this.binaryHandshake = null;
+        if (pending) pending.reject(error);
+        this.#onFailure(error);
     }
 
     #resolveNext(line) {
@@ -231,6 +363,10 @@ class CheetahClient extends EventEmitter {
         this.socket = null;
         if (socket) socket.destroy();
         this.lastError = error;
+        // The negotiated session belongs to the socket that is going away: a
+        // reconnection re-handshakes, and the index it gets back may differ.
+        this.binary = null;
+        this.binaryBuffer = Buffer.alloc(0);
 
         const pending = [...this.inflight, ...this.waiting];
         this.inflight = [];
@@ -261,6 +397,21 @@ class CheetahClient extends EventEmitter {
             // connection goes down with it.
             this.#onFailure(new CheetahConnectionError(`cheetah command timed out: ${entry.line}`));
         }, this.options.commandTimeoutMs);
+        if (this.options.binary) {
+            // The line is the contract on both sides: encode it, and the server
+            // decodes the very same line back before routing it.
+            let frame;
+            try {
+                frame = binaryCodec.encodeCommandLine(entry.line, this.binary);
+            } catch (error) {
+                clearTimeout(entry.timer);
+                this.inflight.pop();
+                entry.reject(new CheetahError(error.message, { command: entry.line }));
+                return;
+            }
+            this.socket.write(frame);
+            return;
+        }
         this.socket.write(`${entry.line}\n`, 'latin1');
     }
 

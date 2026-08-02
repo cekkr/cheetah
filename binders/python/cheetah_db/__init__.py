@@ -4,6 +4,12 @@ Everything a Python client needs to talk to a cheetah-server, and nothing about
 any particular schema. Layers, each usable on its own::
 
     protocol            pure codec — build a command line, parse a response line
+    binary              the byte-wise protocol: a command as a 2-byte index,
+                        values in their own type. A transcoder over the same
+                        lines, so every layer below keeps working unchanged
+                        (``CheetahClient(..., binary=True)``)
+    alias               ALIAS — the command index and a table's numeric widths,
+                        the two things a client cannot derive on its own
     hosts               where a client should actually dial (0.0.0.0, WSL)
     client              CheetahClient (one socket) + ThreadLocalClientPool
     kv / graph / jobs   free functions over a connection: the two-step write,
@@ -32,7 +38,9 @@ from __future__ import annotations
 
 from . import (
     admin,
+    alias,
     batch,
+    binary,
     graph,
     hosts,
     jobs,
@@ -44,6 +52,7 @@ from . import (
     server,
     vocabulary,
 )
+from .binary import BinarySession
 from .batch import AutoBatchPolicy, BatchResult, DeferredResponse, run_batch, run_batch_async
 from .client import (
     CheetahClient,
@@ -58,6 +67,7 @@ from .vocabulary import TokenVocabulary
 __all__ = [
     "AutoBatchPolicy",
     "BatchResult",
+    "BinarySession",
     "CheetahClient",
     "CheetahConnectionError",
     "CheetahDatabase",
@@ -69,7 +79,9 @@ __all__ = [
     "ThreadLocalClientPool",
     "TokenVocabulary",
     "admin",
+    "alias",
     "batch",
+    "binary",
     "build_command",
     "build_key_value_command",
     "graph",

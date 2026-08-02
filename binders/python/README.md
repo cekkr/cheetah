@@ -23,7 +23,9 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | --- | --- |
 | `protocol` | Pure codec. `build_command`, `build_key_value_command`, `parse_response`, `parse_items`, `parse_cursor`, `decode_payload`, `decode_transport_payload`, `encode_argument`, `raw_argument`. No socket, no state. |
 | `hosts` | Where a client should actually dial: `0.0.0.0` → `127.0.0.1`, and the WSL host's address as a fallback candidate. |
-| `client` | `CheetahClient` (one socket, lock-serialized request/response, reconnect, inactivity grace) and `ThreadLocalClientPool` (one socket per thread). |
+| `client` | `CheetahClient` (one socket, lock-serialized request/response, reconnect, inactivity grace) and `ThreadLocalClientPool` (one socket per thread). `binary=True` switches the socket to the byte-wise protocol. |
+| `binary` | The byte-wise transport: frames, value type tags, `BinarySession`, `encode_command_line`/`decode_response`, `encode_request` for explicitly typed arguments. |
+| `alias` | `ALIAS` — what a client cannot derive on its own: `list_commands`, `list_argument_keys`, `resolve_command`, `describe_types`, `table_profile`, `list_profiles`, `alias_digest`, `load_session`. |
 | `kv` | The two-step write and its reads: `put_value`/`get_value`, `put_json`/`get_json`, `put_bytes`/`get_bytes`, `put_values_batch` (`PAIR_PUT_BATCH`), `delete_pair`, `pair_purge`, `scan_page`/`scan_prefix`/`scan_all`, `pair_summary`. |
 | `graph` | The whole `GRAPH_*` surface: nodes, edges (single and batch), `neighbors`/`degree`/`neighbor_types`, `query`, `recall`/`recall_batched`, `similar`, `term_index`, and the ambiguity trio. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `set_row`, `get_row`, `scan`/`iter_rows`, `delete_row`, `drop_table`, plus `field_spec`. |
@@ -35,6 +37,57 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `vocabulary` | `TokenVocabulary` — a persisted string → uint32 allocator, both directions. |
 | `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it. |
 | `server` | `start_server`/`ensure_server_binary` — spawn a server for development and tests. |
+
+## Speaking bytes instead of text
+
+The wire is text by default: `42` costs two bytes, `0.25` four, a 32-byte key
+sixty-four in hex. Pass `binary` and the same connection sends **frames**
+instead — the command as a 2-byte index, each value in its own type.
+
+```python
+conn = CheetahClient("127.0.0.1", 4455, database="app", binary=True)
+conn.connect()
+
+# or state the widths you want as defaults:
+CheetahClient("127.0.0.1", 4455, binary={"uint": 4, "float": 4})
+```
+
+**Nothing above the socket changes.** `kv`, `graph`, `records`, `predict`,
+`admin` and `CheetahDatabase` keep building command lines; the client transcodes
+them and turns each response frame back into the canonical line. A command added
+to the server tomorrow works over binary the day it exists, because the server
+decodes a frame into that same line before routing it.
+
+What you get on connect is a `BinarySession` (`conn.binary`): the negotiated
+widths, the command index, the argument-key dictionary, and the digest to check
+a cached copy against — all delivered by the handshake, so no extra round trip.
+
+```python
+from cheetah_db import alias
+
+conn.binary.command_id("RECORD")                       # → its 2-byte index
+conn.binary.matches_digest(alias.alias_digest(conn).digest)   # → True
+```
+
+Two things stay true in binary mode, and one changes:
+
+- a `key=value` value still may not contain whitespace — the frame is refused
+  rather than truncated. Use the `bytes` type (`x<hex>` on the line); in binary
+  it costs nothing;
+- numbers are typed automatically when a token re-renders identically, so `42`
+  travels as one byte and `007` stays a string;
+- **widths are always stated explicitly when transcoding.** A width-0 tag means
+  "the server resolves it" — from the table's profile or the session — and only
+  a caller that has loaded that profile (`alias.table_profile`) can predict it.
+  Getting it wrong is a misread frame, not a rounding error.
+
+A table's numeric widths live on the server, not here, because two processes
+writing the same table must encode it the same way:
+
+```python
+alias.table_profile(conn, "ngram", uint=4, float_=4)
+alias.table_profile(conn, "ngram")   # → resolved widths, plus what is declared
+```
 
 ## Things the protocol will do to you
 
@@ -310,8 +363,9 @@ cd binders/python && python3 -m unittest discover -s tests -t .
 ```
 
 No dev dependency: the runner is the standard library's. The suite covers the
-protocol codec, the key primitives, the KV/graph/record/job/database call shapes
-and `CheetahDatabase` against an in-memory stand-in that speaks the same line
+protocol codec, the key primitives, the KV/graph/record/job/database call shapes,
+the binary codec and the `ALIAS` layer, and `CheetahDatabase` against an
+in-memory stand-in that speaks the same line
 protocol. That stand-in does not prove the server answers that way — the Go
 suite (`go test ./src`) and the gated integration test do:
 

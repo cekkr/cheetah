@@ -216,6 +216,7 @@ func resolveJobCommand(name string) *jobCommand {
 }
 
 func registerDefaultMicroCommands(registry *microCommandRegistry) {
+	registry.Register("ALIAS", microAlias)
 	registry.Register("BATCH", microBatch)
 	registry.Register("DEL", microDel)
 	registry.Register("JOB", microJobCommand)

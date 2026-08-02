@@ -4,6 +4,11 @@
 // any particular schema. Four layers, each usable on its own:
 //
 //   protocol    pure codec — build a command line, parse a response line
+//   binary      the byte-wise protocol: a command as a 2-byte index, values in
+//               their own type. A transcoder over the same lines, so every
+//               layer below keeps working unchanged (`new CheetahClient({binary: true})`)
+//   alias       ALIAS — the command index and a table's numeric widths, which
+//               are the two things a client cannot derive on its own
 //   client      one socket (CheetahClient) or several (CheetahPool)
 //   kv / graph  free functions over a connection: the two-step write, scans,
 //   records     nodes, edges, associative recall, multi-field rows
@@ -30,7 +35,9 @@
 //   }
 
 const admin = require('./lib/admin');
+const alias = require('./lib/alias');
 const batch = require('./lib/batch');
+const binary = require('./lib/binary');
 const client = require('./lib/client');
 const database = require('./lib/database');
 const graph = require('./lib/graph');
@@ -46,7 +53,9 @@ const vocabulary = require('./lib/vocabulary');
 module.exports = {
     // Submodules, for callers who want the free-function layers.
     admin,
+    alias,
     batch,
+    binary,
     client,
     database,
     graph,
@@ -60,6 +69,8 @@ module.exports = {
     vocabulary,
 
     // The names most callers reach for.
+    BinarySession: binary.BinarySession,
+    CheetahBinaryError: binary.CheetahBinaryError,
     CheetahClient: client.CheetahClient,
     CheetahPool: client.CheetahPool,
     CheetahError: client.CheetahError,

@@ -23,6 +23,7 @@ const graph = require('../lib/graph');
 const records = require('../lib/records');
 const admin = require('../lib/admin');
 const jobs = require('../lib/jobs');
+const aliasCommands = require('../lib/alias');
 const { hex } = require('../lib/keys');
 
 /** An ephemeral port the OS just told us is free. */
@@ -298,5 +299,65 @@ test('cheetah binder round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRA
         );
         read.forEach((value, index) => assert.equal(value, `value-${index}`));
         await single.close();
+    });
+
+    await t.test('a binary connection speaks the same protocol as a text one', async () => {
+        // The point of the binary mode: the transport changes, nothing above it
+        // does. The same free-function layers run over a socket that carries
+        // 2-byte command indices and typed values.
+        const bin = new CheetahClient({ port, database, binary: { uint: 4, float: 4 } });
+        await bin.connect();
+        try {
+            assert.ok(bin.binary, 'the handshake left a session behind');
+            assert.equal(bin.binary.widths.uint, 4);
+            assert.equal(bin.binary.widths.int, 8, 'a width left at 0 keeps the server default');
+            assert.ok(bin.binary.commandId('RECORD') > 0, 'the ack carried the command index');
+            assert.ok(bin.binary.keyId('table') > 0, 'the ack carried the argument keys');
+
+            // The index the ack delivered must be the one ALIAS reports.
+            const digest = await aliasCommands.aliasDigest(bin);
+            assert.ok(bin.binary.matchesDigest(digest.digest));
+
+            await kv.putValue(bin, 'bin:plain', 'hello');
+            assert.equal(await kv.getValue(bin, 'bin:plain'), 'hello');
+
+            // A payload full of the characters the response grammar uses is
+            // where the framing earns its keep: commas and spaces are data,
+            // not delimiters.
+            const awkward = 'a,b c,,d  e';
+            await kv.putValue(bin, 'bin:awkward', awkward);
+            assert.equal(await kv.getValue(bin, 'bin:awkward'), awkward);
+            await kv.putJson(bin, 'bin:json', { name: 'Berlin, DE', n: 42 }, { upsert: true });
+            assert.deepEqual(await kv.getJson(bin, 'bin:json'), { name: 'Berlin, DE', n: 42 });
+
+            await records.define(bin, 'bin_rows', ['cnt:uint:4', 'prob:float:4']);
+            await records.setRow(bin, 'bin_rows', 'berlin', { cnt: 42, prob: 0.25 });
+            const row = await records.getRow(bin, 'bin_rows', 'berlin');
+            assert.equal(row.cnt, 42);
+            assert.equal(row.prob, 0.25);
+
+            // Per-table widths are a property of the database, so they are set
+            // once and every client reads the same resolved answer.
+            const written = await aliasCommands.tableProfile(bin, 'bin_rows', { uint: 4, float: 4 });
+            assert.equal(written.updated, true);
+            assert.equal(written.uint, 4);
+            const text = new CheetahClient({ port, database });
+            await text.connect();
+            try {
+                const seen = await aliasCommands.tableProfile(text, 'bin_rows');
+                assert.equal(seen.uint, 4);
+                assert.equal(seen.float, 4);
+                assert.equal(seen.declared, true);
+            } finally {
+                await text.close();
+            }
+
+            // And an error still arrives as an error, reason intact.
+            const missing = await bin.send('RECORD get table=bin_rows key=nope');
+            assert.equal(missing.ok, false);
+            assert.match(missing.error, /not_found/);
+        } finally {
+            await bin.close();
+        }
     });
 });

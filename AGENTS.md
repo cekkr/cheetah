@@ -133,6 +133,12 @@ live in `ExecuteCommand`; but they are not connection-scoped either, so they are
 [`engine.go`](src/engine.go) (`engineControlCommand`) and merely *called* by both front-ends. Prefer
 that shape over a second copy in each loop.
 
+The **binary protocol** ([`binary_protocol.go`](src/binary_protocol.go)) does not add a third layer: it
+is a *codec* in front of the same one. A request frame is decoded into the canonical command line and
+handed to the same dispatch the text loop uses ([`connSession.execute`](src/server.go)); the answer
+line is re-encoded into a frame. That is why it needs no edit when a command is added, and why
+`DATABASE`/`RESET_DB` work over it — there is one dispatch, not two.
+
 ---
 
 ## Critical implementation contracts
@@ -271,6 +277,33 @@ that shape over a second copy in each loop.
   gates `GetDatabase`/`CreateDatabase`/`ResetDatabase` and `parseDatabaseTarget`; without it
   `RESET_DB ../..` resolved (and deleted) outside `data_dir`. Any new engine entry point taking a name
   from the wire must call it.
+- **The binary protocol is a codec over the canonical line, never a second command surface.**
+  [`decodeBinaryRequest`](src/binary_protocol.go) renders a frame into the line the text protocol
+  would have carried; [`encodeBinaryResponse`](src/binary_protocol.go) types the answer line back.
+  Response fields are typed by *round-trip equality* — a value is a number only when reformatting it
+  gives the identical string — which is what keeps the conversion lossless and what lets the layer
+  know nothing about the commands it carries. Do not add per-command knowledge here; a command added
+  to `ExecuteCommand` is reachable in binary the day it exists.
+- **The canonical line's limits still apply in binary.** A `key=value` value may not contain
+  whitespace: the frame is *refused*, not truncated. The `bytes` type (rendered `x<hex>`) is the way
+  out and costs nothing there. The single relaxation is the **last positional argument**, which may
+  contain spaces because in the line it is the rest of the line — exactly what `INSERT`, `EDIT` and
+  `PAIR_SET` consume.
+- **A numeric width resolves tag → table profile → session → 8.** The tag's low nibble wins and never
+  depends on ordering; the per-table profile ([`binary_profile.go`](src/binary_profile.go)) is
+  persisted per database, so two writers encode a table identically; the session defaults come from
+  the handshake. The table profile applies to the arguments **after** `table=` in a frame — arguments
+  decode in order — so `table=` goes first. A client that emits a width-0 tag must write exactly the
+  number of bytes the server will resolve; the binders therefore state every width outright when
+  transcoding a line, because they cannot know which table an arbitrary line addresses.
+- **The command index is derived and versioned by digest, not frozen.** `currentCommandIndex`
+  ([`command_index.go`](src/command_index.go)) numbers every name from the same three tables
+  `ExecuteCommand` consults, sorted so two processes agree. Ids are therefore **not** a wire contract
+  the way response field names are: they move when the inventory moves, and `ALIAS digest` /
+  `ALIAS list` exist so a client can tell. The handshake ack carries the digest, the epoch and *both
+  tables in full* — that last part is required, not an optimisation, because a response names its
+  fields by index and a client without the argument-key dictionary could not decode even the answer
+  to `ALIAS keys`.
 - **Per-database settings are persisted, and the pair format still wins.** `DB_CREATE`/`DATABASE`
   overrides are written to `<db>/settings.ini` and re-read at every open, layered
   defaults → file → session ([`config.go`](src/config.go), [`engine.go`](src/engine.go)). This does
@@ -285,13 +318,14 @@ All file names below are relative to [`src/`](src/).
 
 ```
                          ┌─────────────── main.go (CLI loop) ───────────────┐
-client ── TCP ──►  server.go (per-conn loop)                                │
+client ── TCP ──►  server.go (per-conn loop; text or binary frames)         │
+                         │  binary_protocol.go decodes a frame into the same line
                          │  DATABASE / RESET_DB / EXIT handled here (front-end scope)
                          ▼
                   engine.go  ── GetDatabase(name) ──►  cheetah_data/<name>/  (lazy, cached)
                          ▼
               database.go : ExecuteCommand(line)   ← single command router
-                 │  resolves in order: micro_command.go (BATCH, DEL, JOB, RECORD) → command_alias.go
+                 │  resolves in order: micro_command.go (ALIAS, BATCH, DEL, JOB, RECORD) → command_alias.go
                  │  (every historical name) → its own switch (everything not yet decomposed)
                  │    └─ jobs.go        one job manager for every async family
                  ├─ commands.go        Insert/Read/Edit/Delete, PairSet/Get/Del/Purge
@@ -351,10 +385,21 @@ The TCP front-end. Accepts connections, optionally enables OS keep-alives, reads
 commands, and routes them exactly like the CLI (`DB_CREATE`/`DB_LIST` through
 `engineControlCommand`, `DATABASE`/`RESET_DB` locally, else `ExecuteCommand`).
 
-- **Key symbols:** `TCPServer`, `NewTCPServer`, `Start` (listener + keep-alive), `handleConnection`
-  (per-connection current-DB state + command loop).
+It serves two wire formats over one dispatch. A connection whose **first byte is `0xC7`** is a
+binary one ([`binary_protocol.go`](src/binary_protocol.go)): `handleBinaryConnection` runs the
+handshake, then decodes each frame into the canonical line and hands it to the same
+`connSession.execute` the text loop calls. No text command can begin with `0xC7`, which is why the
+mode is detectable from byte one and needs no negotiation.
+
+- **Key symbols:** `TCPServer`, `NewTCPServer`, `Start` (listener + keep-alive), `connSession`
+  (per-connection current-DB state + the single dispatch), `handleConnection` (mode detection +
+  text loop), `handleBinaryConnection`, `writeBinaryError`.
 - **Common mistakes:** No prompt is written over TCP; responses are single `\n`-terminated lines. Keep
-  responses one line — multi-line payloads break line-oriented clients.
+  responses one line — multi-line payloads break line-oriented clients. Route through
+  `connSession.execute`, never with a second copy of the switch: that copy is what the binary
+  front-end was written to avoid. A malformed *frame* answers `ERROR` and keeps the connection; only
+  a frame that cannot be delimited closes it, because past that point nobody knows where the next
+  one starts.
 
 #### [`src/engine.go`](src/engine.go)
 
@@ -684,7 +729,7 @@ until the dispatcher boundary so an alias formatter can read it by name), `micro
 - **Key symbols:** `microField`/`mf`/`mfi`/`mfu`, `microResponse` (`Render`/`Get`/`Has`/`IsError`),
   `microOK`/`microFail`/`microFailf`/`microPending`/`microSilent`, `microHandler`, `microCall`,
   `microCommandRegistry`, `ensureCommandRegistries` (the one-time `sync.Once` that builds all three
-  package-level tables), `registerDefaultMicroCommands` (`BATCH`, `DEL`, `JOB`, `RECORD`), `splitMicroArgs`,
+  package-level tables), `registerDefaultMicroCommands` (`ALIAS`, `BATCH`, `DEL`, `JOB`, `RECORD`), `splitMicroArgs`,
   `microParseBytes`/`microEncodeBytes`, `Database.executeMicroCommand`.
 - **Common mistakes:** `microSilent()` (empty `Status`) is the "only an error to propagate" case and
   renders as the empty string — do not confuse it with `microFail`. `microEncodeBytes` always emits
@@ -909,6 +954,77 @@ protocol's only erasure verb.
   Go errors; a new validation error must be recognisable by its token prefix or it surfaces as an
   internal error.
 
+### Byte-wise protocol
+
+#### [`src/binary_protocol.go`](src/binary_protocol.go)
+
+The frame codec: handshake, request decoding, response encoding, and the value type tags. It is a
+*codec* over the canonical command line, not a second command surface — see
+[Critical contracts](#critical-implementation-contracts).
+
+- **Key symbols:** frame constants (`binaryFrameMagic` `0xC7`, `binaryFrameHandshake`/`…Ack`/
+  `…Request`/`…Response`, `binaryProtocolVersion`, `binaryMaxBodyBytes`); value kinds
+  (`binKindString` … `binKindNull`) and `binKindNames`; key modes (`argKeyPositional`/`Indexed`/
+  `Inline`); enum families (`binEnumCommands`, `binEnumArgumentKeys`); status codes
+  (`binStatusSuccess` …); `binarySession`; `readBinaryFrame`/`encodeBinaryFrame`;
+  `decodeHandshake`/`encodeHandshakeAck` + `commandKindCodes`; `binaryCursor` (`u8`/`u16`/`u32`/
+  `shortString`/`take`); `decodeBinaryRequest`, `decodeBinaryValue`, `formatBinaryFloat`;
+  `binaryResponseField`, `parseResponseLine`, `encodeBinaryResponse`, `appendTypedValue`,
+  `canonicalUint`/`canonicalInt`/`canonicalFloat`, `minimalUintWidth`/`minimalIntWidth`.
+- **Depends on:** [`command_index.go`](src/command_index.go) (the 2-byte names),
+  [`binary_profile.go`](src/binary_profile.go) (the widths). **Tests:**
+  [`binary_protocol_test.go`](src/binary_protocol_test.go).
+- **Common mistakes:** `parseResponseLine` must keep the two exceptions of the response grammar — an
+  `ERROR` reason and a `value=` payload both run to end of line. The automatic typing is safe only
+  because it requires exact round-trip equality; loosening it (accepting `007` as a number, or `1e3`)
+  changes the line a client rebuilds. `encodeHandshakeAck` carries both tables in full on purpose.
+
+#### [`src/command_index.go`](src/command_index.go)
+
+The numeric index of every command, derived from the same tables `ExecuteCommand` consults, plus the
+argument-key dictionary and the digests that identify both.
+
+- **Key symbols:** `commandIndexEntry`, `commandIndexTable` (`lookupName`/`lookupID`, `Digest`,
+  `Epoch`), `buildCommandIndex`, `currentCommandIndex`, `rebuildCommandIndex`; the name sources
+  `builtinCommandNames` / `engineCommandNames` / `frontEndCommandNames` and the `Names()` accessors
+  added to the micro and alias registries; `argumentKeyNames`, `argumentKeyTable`,
+  `currentArgumentKeys`.
+- **Common mistakes:** ids start at 1 — 0 is reserved for "the name follows inline", the escape for a
+  command the client's index does not know. Ids are assigned in **sorted** order because iterating a
+  Go map is not deterministic and two processes must produce the same digest. `builtinCommandNames`
+  is the one list with no registry to derive from: `TestCommandIndexBuiltinsCovered` scans
+  `database.go` for `case command == "…"` to catch a switch command that was never added here. The
+  argument-key dictionary may be incomplete without harm — an unknown key travels spelled out, so it
+  is a compression and never a restriction.
+
+#### [`src/binary_profile.go`](src/binary_profile.go)
+
+Per-table numeric widths, persisted per database in `protocol_profiles.dat`.
+
+- **Key symbols:** `numericProfile` (`overlay`, `validate`, `isEmpty`), `defaultNumericProfile`,
+  `validateNumericWidth`, `numericProfileStore` (`Get`/`Set`/`List`/`persistLocked`),
+  `encodeNumericProfiles`/`decodeNumericProfiles`, `Database.numericProfilesOrNil`,
+  `Database.resolveNumericProfile`.
+- **On-disk format:** `"CHNP"` + version + count, then `[nameLen|uint|int|float|name]` per profile,
+  written through a temp file and a rename like the record schemas. The file is *removed* when the
+  last profile is dropped.
+- **Common mistakes:** a width of `0` means "not declared" and lets the next layer through — that is
+  what allows a table to fix only its floats. Widths obey the same limits as record fields (1…8 for
+  integers, 4 or 8 for floats); there are not two notions of "an n-byte integer" in this server.
+
+#### [`src/micro_alias.go`](src/micro_alias.go)
+
+The `ALIAS` micro-command: `list`, `get`, `keys`, `types`, `profile`, `digest` — the protocol
+describing itself, so a client never has to hard-code an index or guess a table's widths.
+
+- **Key symbols:** `microAlias` (target dispatch), `aliasPage`, `microAliasList`/`Get`/`Keys`/
+  `Types`/`Digest`, `Database.microAliasProfile`, `Database.aliasProfileResponse`.
+- **Common mistakes:** `ALIAS types` reports the **server** defaults, not the connection's — a micro
+  command cannot see connection state (the same reason `DATABASE` lives in the front-ends); the
+  negotiated widths come back in the handshake ack. `ALIAS profile table=…` answers the *resolved*
+  widths with `declared_*` alongside, because "what will the server use" and "what does this table
+  say" are different questions and a client needs the first one.
+
 ### Cluster coordination
 
 #### [`src/cluster_scheduler.go`](src/cluster_scheduler.go)
@@ -1106,7 +1222,9 @@ free-function command layers — [`lib/kv.js`](binders/nodejs/lib/kv.js) (the tw
 [`lib/records.js`](binders/nodejs/lib/records.js) (the `RECORD` family plus `DEL records`, with
 `fieldSpec` validating a field declaration — reserved names included — before the wire),
 [`lib/jobs.js`](binders/nodejs/lib/jobs.js) (`JOB` submit/status/fetch plus `awaitJob`),
-[`lib/predict.js`](binders/nodejs/lib/predict.js) (`PREDICT_*`) and
+[`lib/predict.js`](binders/nodejs/lib/predict.js) (`PREDICT_*`),
+[`lib/alias.js`](binders/nodejs/lib/alias.js) (the `ALIAS` family: the command index, the
+argument-key dictionary and a table's numeric widths, plus `loadSession`) and
 [`lib/admin.js`](binders/nodejs/lib/admin.js) (`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
 `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, `CLUSTER_*`, `FORK_ASSIGN`); each of these exports a
 pure `build*` for its commands, so a caller that writes several commands to a connection as one batch
@@ -1114,7 +1232,10 @@ shares the binder's encoding instead of re-deriving base64 and `x<hex>` — and 
 [`lib/database.js`](binders/nodejs/lib/database.js)
 (`CheetahDatabase` — a subclassable handle holding the plumbing every application otherwise
 rewrites: pool construction, a layout-version guard on connect, a `close` that only closes a pool it
-owns, a per-key mutation chain, collision-checked id allocation, namespace payload accounting). Plus
+owns, a per-key mutation chain, collision-checked id allocation, namespace payload accounting). Beside them sits [`lib/binary.js`](binders/nodejs/lib/binary.js), the byte-wise transport: frames,
+type tags, the negotiated `BinarySession`, and `encodeCommandLine`/`decodeResponse` — a *transcoder*
+over the lines the layers above already build, which is why `new CheetahClient({binary: true})`
+changes the wire and nothing else. Plus
 [`lib/keys.js`](binders/nodejs/lib/keys.js) (fixed-width hex and integer bucketing),
 [`lib/vocabulary.js`](binders/nodejs/lib/vocabulary.js) (a persisted string→uint32 allocator) and
 [`lib/server.js`](binders/nodejs/lib/server.js) (spawns this repository's binary for tests, building
@@ -1132,13 +1253,15 @@ actually spawnable).
   while the server defaults to stopping, so `continue_on_error=1` must travel explicitly. **Any
   change to those on the Go side is a change here too**, and the binder's tests are where a client
   would first notice.
-- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 118 tests (117 passing + 1 opt-in integration test skipped by default):
+- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 135 tests (134 passing + 1 opt-in integration test skipped by default):
   codec, key primitives, the `GRAPH_*` command spellings
   ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), the `RECORD` ones
   ([`test/records.test.js`](binders/nodejs/test/records.test.js)), the job/prediction/admin ones
   ([`test/admin.test.js`](binders/nodejs/test/admin.test.js)), and `CheetahDatabase` against an
-  in-memory stand-in that speaks the same line protocol. `CHEETAH_INTEGRATION=1` additionally builds
-  the server and round-trips against it (19 subtests,
+  in-memory stand-in that speaks the same line protocol, and the binary codec plus the `ALIAS` layer
+  ([`test/binary.test.js`](binders/nodejs/test/binary.test.js)). `CHEETAH_INTEGRATION=1` additionally
+  builds the server and round-trips against it (20 subtests, one of them the whole binder driven over
+  a binary connection,
   [`test/integration.test.js`](binders/nodejs/test/integration.test.js)). These are **not** part of
   `go test ./src`; run them when you change a command's response shape.
 - **A stale root binary silently tests an old protocol.** `ensureServerBinary`
@@ -1169,10 +1292,13 @@ objects across `close_all()` so post-reset reconnects remain owned), the free-fu
 [`records.py`](binders/python/cheetah_db/records.py) (the `RECORD` family plus `DEL records`, with
 `field_spec` validating a field declaration — reserved names included — before the wire),
 [`jobs.py`](binders/python/cheetah_db/jobs.py) (`JOB` submit/status/fetch plus a poll loop),
-[`predict.py`](binders/python/cheetah_db/predict.py) and
+[`predict.py`](binders/python/cheetah_db/predict.py),
+[`alias.py`](binders/python/cheetah_db/alias.py) (the `ALIAS` family) and
 [`admin.py`](binders/python/cheetah_db/admin.py) (`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
 `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, `CLUSTER_*`, `FORK_ASSIGN`), and
 [`database.py`](binders/python/cheetah_db/database.py) (`CheetahDatabase`, the subclassable handle).
+[`binary.py`](binders/python/cheetah_db/binary.py) is the byte-wise transport, the same transcoder
+the Node binder implements (`CheetahClient(..., binary=True)`).
 Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 [`vocabulary.py`](binders/python/cheetah_db/vocabulary.py) and
 [`server.py`](binders/python/cheetah_db/server.py) (`server_binary_name` applies the same Windows
@@ -1190,13 +1316,16 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   `BATCH` must explicitly send `continue_on_error=1` when using the binders' continue-by-default API;
   omission means stop-on-error to the server.
 - **Tests:** `python3 -m unittest discover -s tests -t .` from
-  [`binders/python/`](binders/python/) — 165 tests (154 passing + 11 opt-in integration tests skipped by default): codec, key primitives, KV/graph/record/job
+  [`binders/python/`](binders/python/) — 188 tests (174 passing + 14 opt-in integration tests skipped by default): codec, key primitives, the binary codec and the `ALIAS` layer
+  ([`tests/test_binary.py`](binders/python/tests/test_binary.py)), KV/graph/record/job
   and database-operation call shapes, and `CheetahDatabase` against an in-memory stand-in
   ([`tests/fakes.py`](binders/python/tests/fakes.py), which reproduces enough record-table semantics
   to be worth asserting against: append-only offsets, a drop that leaves a hole, a short row reading
   null, and a compaction that bumps a generation). `CHEETAH_INTEGRATION=1` additionally builds the
   server, boots it on a free port in a temporary data directory and round-trips against it
-  (11 tests, [`tests/test_integration.py`](binders/python/tests/test_integration.py)). Not part of
+  (14 tests, [`tests/test_integration.py`](binders/python/tests/test_integration.py), three of them
+  driving the binder over a binary connection and proving a table's numeric profile is shared by
+  every client). Not part of
   `go test ./src`. The stale-binary trap noted for the Node binder applies here too.
 
 ### Runtime / generated (never edited or committed)
@@ -1208,7 +1337,8 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   `pairs/<hexid>.table` + `pairs/next_id.dat` + `pairs/format.dat`,
   `pair_jumps/{jumps.bin,index.bin,next_id.dat}`, `prediction_<name>.table`,
   `records/<table>.schema` (the `"CHRS"` record-table schemas; the rows themselves live in the trie),
-  `settings.ini` (this database's ad-hoc overrides), `cluster_topology.json`.
+  `settings.ini` (this database's ad-hoc overrides), `protocol_profiles.dat` (the `"CHNP"` per-table
+  numeric widths of the binary protocol), `cluster_topology.json`.
   Source of truth is the engine; these are outputs — but note that `settings.ini` is the one an
   operator may legitimately hand-edit, since it is the per-database half of the configuration.
 
@@ -1391,6 +1521,44 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   `DATABASE <name> key=value`) and reopening — there is no live re-tune command; trie geometry still
   needs `RESET_DB` because `pairs/format.dat` is authoritative.
 
+<a id="feature-binary-protocol"></a>
+### Byte-wise (binary) protocol — Shipped
+
+**Files:** [`binary_protocol.go`](src/binary_protocol.go), [`command_index.go`](src/command_index.go),
+[`binary_profile.go`](src/binary_profile.go), [`micro_alias.go`](src/micro_alias.go),
+[`server.go`](src/server.go). **Tests:** [`binary_protocol_test.go`](src/binary_protocol_test.go).
+**Clients:** [`binders/nodejs/lib/binary.js`](binders/nodejs/lib/binary.js) +
+[`lib/alias.js`](binders/nodejs/lib/alias.js), [`binders/python/cheetah_db/binary.py`](binders/python/cheetah_db/binary.py)
++ [`alias.py`](binders/python/cheetah_db/alias.py).
+
+The text protocol spells everything as a string: `42` is two bytes, `0.25` four, a 32-byte key sixty-
+four in hex, the command name up to twenty-three. A TCP connection can instead send **frames** — the
+command as a 2-byte index, each value in its own type. A connection declares itself binary with its
+first byte (`0xC7`), which no text command can start with.
+
+**The design decision that everything else follows from:** it is a *codec*, not a second command
+surface. A request frame decodes into the canonical command line and continues down the ordinary
+path; the answer line is encoded back. So the layer knows nothing about the commands it carries and
+never needs editing when one is added — the same property that makes `BATCH` general. Response fields
+are typed by round-trip equality, which needs no per-command table and guarantees a client rebuilding
+the line gets the original.
+
+**Where widths come from:** the tag (explicit, wins), the table's persisted profile, the session
+defaults, then 8/8/8. The profile is per *database* rather than per client because two writers must
+encode a table identically; it applies to the arguments after `table=` in a frame.
+
+**What `ALIAS` is for:** the command index is derived from the server's inventory, so it moves when
+the inventory moves — the ids are deliberately not a frozen wire contract. `ALIAS digest`/`list`/
+`get`/`keys`/`types`/`profile` publish it, and the handshake ack ships the digest, the epoch and both
+tables in full.
+
+**Recurring trap:** a client transcoding a text line must state **every** numeric width outright. A
+float written 8 bytes wide but tagged "resolve it" is read at the session's 4 and comes out as
+`1.625`; a transcoder cannot know which table an arbitrary line addresses. Width 0 is only for a
+caller that has loaded the table's profile. A second one, found the same way: an `INSERT` payload
+carrying base64 padding must not be cut at its `=` — both binders gate that on an argument-name
+pattern.
+
 ### Prediction tables + context matrices — Shipped (GPU path simulated)
 
 - **Behavior:** `PREDICT_SET/QUERY/TRAIN/CTX/INHERIT(+batch/async)/BACKEND/BENCH` over fixed-byte
@@ -1505,7 +1673,9 @@ plus the two front-end handlers. There is no generated API manifest.
 | --- | --- |
 | `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](src/main.go) `runCLI`, [`server.go`](src/server.go) `handleConnection`, [`engine.go`](src/engine.go) |
 | `DB_CREATE`, `DB_LIST` (engine-scoped) | [`engine.go`](src/engine.go) `engineControlCommand`, called by both front-ends |
-| `BATCH`, `DEL`, `JOB`, `RECORD` (micro-commands) | [`batch.go`](src/batch.go), [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
+| `ALIAS`, `BATCH`, `DEL`, `JOB`, `RECORD` (micro-commands) | [`micro_alias.go`](src/micro_alias.go), [`batch.go`](src/batch.go), [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
+| `ALIAS list/get/keys/types/profile/digest` | [`micro_alias.go`](src/micro_alias.go), [`command_index.go`](src/command_index.go), [`binary_profile.go`](src/binary_profile.go) |
+| The binary framing itself (no command of its own — a codec over every line) | [`binary_protocol.go`](src/binary_protocol.go), [`server.go`](src/server.go) `handleBinaryConnection` |
 | `RECORD define/alter/compact/schema/tables/set/get/scan`, `DEL records` | [`micro_record.go`](src/micro_record.go), [`record_table.go`](src/record_table.go), [`record_schema.go`](src/record_schema.go) |
 | `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL`, `GRAPH_EDGE_DEL`, `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH` (aliases over the above) | [`command_alias.go`](src/command_alias.go) |
 | `INSERT`, `READ`, `EDIT` | [`commands.go`](src/commands.go) |
@@ -1673,6 +1843,12 @@ seen in old docs are **client-side**; the server does not read them.
 
 | Subsystem / contract | Focused test |
 | --- | --- |
+| Binary frames decode to the canonical line (every type, both escapes) | [`TestBinaryRequestDecodesToCanonicalLine`, `TestBinaryRequestByNameAndSuffix`, `TestBinaryRequestEnumCarriesCommandName`, `TestBinaryRequestRejectsUnrepresentableValue`](src/binary_protocol_test.go) |
+| A response frame re-reads as the exact response line | [`TestBinaryResponseRoundTrip`, `TestBinaryResponseErrorKeepsWholeReason`, `TestBinaryResponseTypesNumbers`](src/binary_protocol_test.go) |
+| A table's numeric profile changes what the same bytes mean | [`TestBinaryWidthsFollowTableProfile`, `TestNumericProfilePersistsAcrossReopen`](src/binary_protocol_test.go) |
+| The command index covers the inventory and is digest-stable | [`TestCommandIndexCoversEveryRoutableName`, `TestCommandIndexBuiltinsCovered`, `TestCommandIndexDigestIsStable`](src/binary_protocol_test.go) |
+| Handshake negotiation + a binary connection over a real socket | [`TestHandshakeNegotiatesWidths`, `TestBinaryConnectionOverSocket`, `TestBinaryEndToEndOverExecute`](src/binary_protocol_test.go) |
+| `ALIAS` answers describe the index and the profiles | [`TestAliasCommandDescribesTheIndex`, `TestAliasProfileReadsAndWrites`](src/binary_protocol_test.go) |
 | Size-changing `EDIT` relocates + recycles | [`TestEditResizesValues`](src/benchmark_test.go) |
 | Equal-size payload inserts reserve distinct slots across reopen | [`TestEqualSizeInsertsReserveDistinctValueSlots`](src/key_recycle_test.go) |
 | Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](src/pair_adaptive_test.go) |
@@ -1795,20 +1971,26 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   field on a live table without rewriting rows, explicit `RECORD compact` to reclaim dead space.
 - Per-database ad-hoc settings (`DB_CREATE`/`DB_LIST`, persisted in `<db>/settings.ini`) and a
   database-name guard that keeps a name inside `data_dir`.
+- **Byte-wise (binary) protocol over TCP**: a connection declared by its first byte (`0xC7`), a
+  handshake fixing the default numeric widths, commands as 2-byte indices and values in their own
+  type (string/bytes/uint/int/float/bool/enum/null). Implemented as a codec over the canonical
+  command line, so every command — present and future — is reachable through it unchanged.
+  Per-table numeric widths are persisted per database, and `ALIAS` publishes the command index, the
+  argument-key dictionary and those widths with digests to verify a cached copy.
 - Prediction tables with context-matrix train/query/inherit and CPU merge path.
 - Managed-file layer, payload cache, resource monitor, `SYSTEM_STATS`/`LOG_FLUSH`/`FILE_CHECKPOINT`.
 - Cluster topology registration, fork assignment, gossip, and `CLUSTER_MOVE` payload transfer.
 - **Node.js binder** ([`binders/nodejs/`](binders/nodejs/)) — dependency-free client: codec, pooled
   TCP client, KV/graph/record/job/prediction/admin helpers, key primitives, token vocabulary,
-  subclassable `CheetahDatabase`, and a test-server launcher. Verified by its own suite (99 unit
-  tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
+  subclassable `CheetahDatabase`, the binary transport and the `ALIAS` discovery layer, and a
+  test-server launcher. Verified by its own suite (134 unit tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
   UTF-8 payloads, batch writes, cursor paging, the `continuations` reducer, vocabulary allocation,
   `GRAPH_RECALL` convergence, a record table through define/partial-write/add/drop/compact/drop,
   `DB_CREATE` with its own settings, a detached `JOB` reduce, server gauges, subclass lifecycle,
   layout-mismatch refusal, `RESET_DB` across a pool, pipelining).
 - **Python binder** ([`binders/python/`](binders/python/)) — standard-library-only client covering
   the same surface, with the differences that follow from a synchronous host (no pipelining; one
-  socket per thread; binary payloads base64 rather than latin1). Verified by its own suite (124 unit
+  socket per thread; binary payloads base64 rather than latin1). Verified by its own suite (174 unit
   tests against an in-memory stand-in) plus a live round-trip against a spawned server
   (`CHEETAH_INTEGRATION=1`, 11 tests: UTF-8 and binary payloads, `PAIR_PUT_BATCH`, hidden pairs,
   cursor paging, the `continuations` reducer, graph write/degree/recall, record-table lifecycle and

@@ -24,7 +24,9 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | Module | What it owns |
 | --- | --- |
 | `protocol` | Pure codec. `buildCommand`, `buildKeyValueCommand`, `parseResponse`, `parseItems`, `parseCursor`, `decodePayload`, `encodeArgument`, `rawArgument`. No socket, no state. |
-| `client` | `CheetahClient` (one socket, FIFO response matching, pipelining, reconnect) and `CheetahPool` (spread, lease, broadcast). |
+| `client` | `CheetahClient` (one socket, FIFO response matching, pipelining, reconnect) and `CheetahPool` (spread, lease, broadcast). `{binary: true}` switches the socket to the byte-wise protocol. |
+| `binary` | The byte-wise transport: frames, value type tags, `BinarySession`, `encodeCommandLine`/`decodeResponse`, `encodeRequest` for explicitly typed arguments. |
+| `alias` | `ALIAS` — what a client cannot derive on its own: `listCommands`, `listArgumentKeys`, `resolveCommand`, `describeTypes`, `tableProfile`, `listProfiles`, `aliasDigest`, `loadSession`. |
 | `kv` | The two-step write and its reads: `putValue`/`getValue`, `putJson`/`getJson`, `putJsonBatch`, `insert`, `editAbsoluteKey`, `readAbsoluteKey`, `pairSet` (with `hidden`), `deletePair`, `deleteValue`, `purgePrefix`, `pairSummary`, `scanPage`/`scanPrefix`/`scanAll`. |
 | `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `similar`, `termIndex`. Plus a pure `build*` for each command, for callers assembling their own batch. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `setRow`, `getRow`, `scanPage`/`scanRows`/`scanAll`, `deleteRow`, `dropTable`, plus `fieldSpec` and a pure `build*` for each command. |
@@ -36,6 +38,57 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `vocabulary` | `TokenVocabulary` — a persisted string → uint32 allocator, both directions. |
 | `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it. |
 | `server` | `startServer`/`ensureServerBinary` — spawn a server for development and tests. |
+
+## Speaking bytes instead of text
+
+The wire is text by default: `42` costs two bytes, `0.25` four, a 32-byte key
+sixty-four in hex. Pass `binary` and the same connection sends **frames**
+instead — the command as a 2-byte index, each value in its own type.
+
+```js
+const client = new CheetahClient({ port: 4455, database: 'app', binary: true });
+await client.connect();
+// or state the widths you want as defaults:
+new CheetahClient({ port: 4455, binary: { uint: 4, float: 4 } });
+```
+
+**Nothing above the socket changes.** `kv`, `graph`, `records`, `predict`,
+`admin` and `CheetahDatabase` keep building command lines; the client transcodes
+them and turns each response frame back into the canonical line. A command added
+to the server tomorrow works over binary the day it exists, because the server
+decodes a frame into that same line before routing it.
+
+What you get on connect is a `BinarySession` (`client.binary`): the negotiated
+widths, the command index, the argument-key dictionary, and the digest to check
+a cached copy against — all of it delivered by the handshake, so no extra round
+trip.
+
+```js
+const alias = require('cheetah-db/lib/alias');
+
+client.binary.commandId('RECORD');            // → its 2-byte index
+client.binary.matchesDigest((await alias.aliasDigest(client)).digest);  // → true
+```
+
+Two things stay true in binary mode, and one changes:
+
+- a `key=value` value still may not contain whitespace — the frame is refused
+  rather than truncated. Use the `bytes` type (`x<hex>` on the line); in binary
+  it costs nothing;
+- numbers are typed automatically when a token re-renders identically, so `42`
+  travels as one byte and `007` stays a string;
+- **widths are always stated explicitly when transcoding.** A width-0 tag means
+  "the server resolves it" — from the table's profile or the session — and only
+  a caller that has loaded that profile (`alias.tableProfile`) can predict it.
+  Getting it wrong is a misread frame, not a rounding error.
+
+A table's numeric widths live on the server, not here, because two processes
+writing the same table must encode it the same way:
+
+```js
+await alias.tableProfile(client, 'ngram', { uint: 4, float: 4 });
+await alias.tableProfile(client, 'ngram');   // → resolved widths + what is declared
+```
 
 ## Things the protocol will do to you
 
@@ -299,8 +352,8 @@ node --test test/*.test.js
 
 No dev dependency: the runner is Node's own. The suite covers the protocol
 codec, the key primitives, the `GRAPH_*`/`RECORD`/`JOB`/`PREDICT_*`/admin command
-spellings, and `CheetahDatabase` against an in-memory stand-in that speaks the
-same line protocol. It does not prove the server answers that way — the Go suite
+spellings, the binary codec and the `ALIAS` layer, and `CheetahDatabase` against
+an in-memory stand-in that speaks the same line protocol. It does not prove the server answers that way — the Go suite
 (`go test ./src`) does, and so does the live round-trip:
 
 ```bash

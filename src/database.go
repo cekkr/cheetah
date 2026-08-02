@@ -67,6 +67,7 @@ type Database struct {
 	forkScheduler    *ForkScheduler
 	predictStore     *PredictionManager
 	recordStore      *RecordManager
+	protocolProfiles *numericProfileStore
 	clusterMessenger *ClusterMessenger
 	jobs             *microJobManager
 	reducers         *ReducerRegistry
@@ -468,6 +469,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	}
 	db.predictStore = newPredictionManager(path)
 	db.recordStore = newRecordManager(filepath.Join(path, "records"))
+	db.protocolProfiles = newNumericProfileStore(filepath.Join(path, numericProfileFile))
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
 	db.registerDefaultReducers()
 

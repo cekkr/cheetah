@@ -14,7 +14,7 @@ import socket
 import tempfile
 import unittest
 
-from cheetah_db import admin, graph, jobs, kv, records
+from cheetah_db import admin, alias, graph, jobs, kv, records
 from cheetah_db.client import CheetahClient
 from cheetah_db.database import CheetahDatabase
 from cheetah_db.server import start_server
@@ -162,6 +162,80 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(store.get_json("a:1"), {"n": 1})
         store.reset()
         self.assertIsNone(store.get_json("a:1"))
+
+
+    # ------------------------------------------------------------------ #
+    # The binary protocol
+    # ------------------------------------------------------------------ #
+    def _binary_client(self, **widths) -> CheetahClient:
+        conn = CheetahClient(
+            self.server.host,
+            self.server.port,
+            database="binder_test",
+            timeout=5.0,
+            binary=widths or True,
+        )
+        self.addCleanup(conn.close)
+        self.assertTrue(conn.connect(), "the binary handshake must succeed")
+        return conn
+
+    def test_binary_protocol_carries_the_same_commands(self) -> None:
+        # The point of the binary mode: the transport changes, nothing above it
+        # does. The same free-function layers run over a socket that carries
+        # 2-byte command indices and typed values.
+        conn = self._binary_client(uint=4, float=4)
+        self.assertIsNotNone(conn.binary)
+        self.assertEqual(conn.binary.widths["uint"], 4)
+        self.assertEqual(conn.binary.widths["int"], 8, "a width left at 0 keeps the default")
+        self.assertGreater(conn.binary.command_id("RECORD"), 0, "the ack carried the index")
+        self.assertGreater(conn.binary.key_id("table"), 0, "the ack carried the keys")
+
+        kv.put_json(conn, "bin:1", {"name": "Berlin, DE", "n": 42}, upsert=True)
+        self.assertEqual(kv.get_json(conn, "bin:1"), {"name": "Berlin, DE", "n": 42})
+
+        payload = bytes(range(0, 256))
+        kv.put_bytes(conn, "bin:raw", payload, upsert=True)
+        self.assertEqual(kv.get_bytes(conn, "bin:raw"), payload)
+
+        records.define(conn, "bin_rows", "cnt:uint:4,prob:float:4")
+        records.set_row(conn, "bin_rows", "berlin", {"cnt": 42, "prob": 0.25})
+        row = records.get_row(conn, "bin_rows", "berlin")
+        self.assertEqual(row["cnt"], 42)
+        self.assertEqual(row["prob"], 0.25)
+
+        # An error still arrives as an error, reason intact.
+        self.assertIsNone(records.get_row(conn, "bin_rows", "nope"))
+
+    def test_binary_index_matches_what_alias_reports(self) -> None:
+        conn = self._binary_client()
+        identity = alias.alias_digest(conn)
+        self.assertTrue(conn.binary.matches_digest(identity.digest))
+        self.assertEqual(len(conn.binary.command_ids), identity.commands)
+        self.assertEqual(len(conn.binary.key_ids), identity.keys)
+        # And ALIAS get resolves both ways against the same table.
+        entry = alias.resolve_command(conn, name="RECORD")
+        self.assertEqual(entry["id"], conn.binary.command_id("RECORD"))
+        self.assertEqual(alias.resolve_command(conn, index=entry["id"])["name"], "RECORD")
+
+    def test_table_numeric_profile_is_a_property_of_the_database(self) -> None:
+        # Set once on one connection, seen by every other: two processes writing
+        # the same table must encode it the same way.
+        writer = self._binary_client()
+        written = alias.table_profile(writer, "profiled", uint=4, float_=4)
+        self.assertTrue(written.updated)
+        self.assertEqual(written.uint, 4)
+        self.assertEqual(written.declared_int, 0, "an undeclared width stays undeclared")
+        self.assertEqual(written.int, 8, "but resolves to the default")
+
+        seen = alias.table_profile(self.conn, "profiled")
+        self.assertTrue(seen.declared)
+        self.assertEqual(seen.widths(), {"uint": 4, "int": 8, "float": 4})
+
+        listed = {entry["table"] for entry in alias.list_profiles(self.conn)}
+        self.assertIn("profiled", listed)
+
+        alias.table_profile(self.conn, "profiled", reset=True)
+        self.assertFalse(alias.table_profile(self.conn, "profiled").declared)
 
 
 if __name__ == "__main__":  # pragma: no cover
