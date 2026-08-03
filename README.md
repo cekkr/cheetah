@@ -827,7 +827,7 @@ ERROR,graph_query_parse_failed:left_node_must_be_anchored_by_id
 | `GRAPH_RECALL_STATUS <job_id>` | Retrieves that recall by id and reports state/progress. The equivalent generic form is `JOB status id=<job_id>`. |
 | `GRAPH_RECALL_FETCH <job_id>` | `PENDING` while it runs, then the `GRAPH_RECALL` response; consumes the job. `JOB fetch id=<job_id>` keeps `job=` on the terminal response for correlation. |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=] [precision=]` | **"What else behaves like this?"** — nodes with the same neighbours (distributional) or the same words in their id (lexical). No edge between them is required. |
-| `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=] [cursor=]` | Maintenance of the derived `\x05gt:` lexical index that free-text seeds resolve through. It is never authoritative: exact ids and synonym edges keep working without it, and `rebuild` is resumable through `next_cursor`. |
+| `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=] [cursor=]` | Maintenance of the derived `\x05gt:` lexical index that free-text seeds resolve through. Token document frequencies give rare words more weight than generic ones; a bounded trigram + edit-distance fallback repairs misspellings. It is never authoritative: exact ids and synonym edges keep working without it, and `rebuild` is resumable through `next_cursor`. |
 | `GRAPH_CACHE stats\|config\|get\|links\|common\|put\|prune …` | **What recall learned.** A cache of *parallel, implicit tables* under `\x07gc:` holding the shortcuts and the convergences that earlier recalls paid for. It is never authoritative — erasing it changes no answer, only how long one takes. See [Association cache](#association-cache--what-recall-learned). |
 
 **In context** — the conversation has been touching Luna and Marco, and nobody has asked a question
@@ -857,6 +857,11 @@ SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,
 # "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"}]}]
 # a bare word, not an id — resolved through the term index, and it says so
 
+[cheetah_data/notes]> GRAPH_RECALL seeds=berln hops=1 limit=4
+SUCCESS,command=GRAPH_RECALL,…,payload=<base64>
+# "matches":[{"id":"city:berlin","score":…,"match":"fuzzy"}]
+# a one-edit misspelling uses the bounded trigram vocabulary; unrelated words still remain unresolved
+
 [cheetah_data/notes]> GRAPH_RECALL_ASYNC seeds=cat:luna,person:marco hops=4 precision=0.02 cache=off
 SUCCESS,command=GRAPH_RECALL,job=graph_recall_1,state=queued,total=262144,budget=262144
 [cheetah_data/notes]> JOB status id=graph_recall_1
@@ -872,7 +877,7 @@ SUCCESS,command=GRAPH_SIMILAR,id=cat:luna,count=3,truncated=0,payload=<base64>
 # luna and mia are never linked to each other; they are similar because of where they both point
 
 [cheetah_data/notes]> GRAPH_TERM_INDEX action=stats
-SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=21
+SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=21,weighted=1,nodes=9,tokens=14,trigrams=58
 [cheetah_data/notes]> GRAPH_TERM_INDEX action=rebuild limit=4096
 SUCCESS,command=GRAPH_TERM_INDEX,action=rebuild,nodes=9,terms=21,next_cursor=*
 # next_cursor=* means the whole graph fitted in one slice; otherwise pass the token back
@@ -1480,7 +1485,7 @@ node that does not exist yet (disable with `autocreate=0`).
 | `GRAPH_RECALL seeds=<t>[,…] [precision=…] [hops=…] [min_sources=…] [references=0\|1] [reference_limit=…] […]` | `resolved`, `visited`, `expanded`, `references`, `count`, `bridges`, `truncated`, and `payload=` the resolved seeds plus the ranked associations. With `references=1`, each association may include complete stored sentences and episodic source payloads. See [associative recall](#associative-recall--graph_recall-graph_similar). |
 | `GRAPH_RECALL_ASYNC <same arguments>` / `GRAPH_RECALL_STATUS <job_id>` / `GRAPH_RECALL_FETCH <job_id>` | Submit, retrieve progress by id, then consume the final recall response. Generic `JOB status id=` / `JOB fetch id=` accept the same `graph_recall_<n>` id; the generic terminal response retains `job=`. |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=<n>]` | `count`, `truncated`, and `payload=` `[{id,score,context,lexical,shared_count,shared,labels}]`. |
-| `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=<n>] [cursor=<tok>]` | `entries`/`enabled` (stats), `nodes`+`terms`+`next_cursor` (rebuild), `removed` (drop). |
+| `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=<n>] [cursor=<tok>]` | `entries`/`enabled` plus `weighted`, indexed `nodes`, distinct `tokens`, and `trigrams` (stats); `nodes`+`terms`+`next_cursor` (rebuild); `removed` (drop). |
 
 ```text
 [cheetah_data/graphlang]> GRAPH_NODE_GET id=alice
@@ -1625,14 +1630,20 @@ SUCCESS,command=GRAPH_RECALL,…,references=2,…,payload=<base64>
 ```
 
 A seed does not have to be an id. Free text resolves through the lexical index (`berlin` →
-`city:berlin`, scored by word overlap) and then through declared synonym edges, and every match says
-which route it took:
+`city:berlin`) and then through declared synonym edges. Overlap is IDF-weighted: a rare token pulls
+harder than a generic one even when the generic token's candidate scan reaches its cap. When an exact
+token has no candidates, bounded trigram lookup proposes vocabulary words and an edit-distance gate
+rejects unrelated ones. Every match says which route it took (`lexical`, `fuzzy`, or `synonym`):
 
 ```text
 [cheetah_data/default]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1
 SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=2,visited=5,expanded=2,hydrated=5,references=0,count=3,…,payload=<base64>
 # "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"},
 #                                      {"id":"city:berlino","score":0.47025,"match":"synonym"}]}]
+
+[cheetah_data/default]> GRAPH_RECALL seeds=berln hops=1
+SUCCESS,command=GRAPH_RECALL,…,payload=<base64>
+# "matches":[{"id":"city:berlin","score":…,"match":"fuzzy"}]
 ```
 
 `GRAPH_SIMILAR` is the other half: not "what is connected to X" but "what else behaves like X",
@@ -1648,13 +1659,15 @@ SUCCESS,command=GRAPH_SIMILAR,id=cat:luna,count=1,truncated=0,payload=<base64>
 # context=1: identical neighbourhoods. lexical=0.333: `cat` out of {cat,luna,mia}
 ```
 
-Free-text seeds need the lexical index, which is maintained automatically on node writes. Databases
-written before it existed (or with `CHEETAH_GRAPH_TERM_INDEX=0`) index nothing until a rebuild — it is
-resumable, so a large graph is walked in bounded slices:
+Free-text seeds need the lexical index, which is maintained automatically on node writes. Candidate
+rows from revisions before frequency metadata remain exact-searchable and report `weighted=0`; a
+rebuild adds their counts and typo vocabulary, publishing `weighted=1` only after the last page.
+Databases written with `CHEETAH_GRAPH_TERM_INDEX=0` likewise need a rebuild. It is resumable, so a
+large graph is walked in bounded slices:
 
 ```text
 [cheetah_data/default]> GRAPH_TERM_INDEX action=stats
-SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=12
+SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=12,weighted=1,nodes=6,tokens=8,trigrams=31
 [cheetah_data/default]> GRAPH_TERM_INDEX action=rebuild limit=4096
 SUCCESS,command=GRAPH_TERM_INDEX,action=rebuild,nodes=6,terms=12,next_cursor=*
 # next_cursor != * means there is more: pass it back as cursor=<token>

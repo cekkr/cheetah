@@ -602,7 +602,13 @@ async function similar(conn, { id, by = null, limit = null }) {
  */
 async function termIndex(conn, options = {}) {
     const response = await commandOrThrow(conn, buildTermIndex(options), 'GRAPH_TERM_INDEX');
-    return { fields: response.fields, nextCursor: parseCursor(response.fields) };
+    return {
+        fields: response.fields,
+        nextCursor: parseCursor(response.fields),
+        weighted: numericField(response.fields, 'weighted', 0) > 0,
+        tokens: numericField(response.fields, 'tokens', 0),
+        trigrams: numericField(response.fields, 'trigrams', 0),
+    };
 }
 
 // ---------------------------------------------------------------------------

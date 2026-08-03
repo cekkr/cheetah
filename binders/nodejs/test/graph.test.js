@@ -127,6 +127,18 @@ test('buildRecall rejects an empty seed set rather than sending seeds=', () => {
     assert.throws(() => graph.buildRecall({ seeds: ['', '  '] }), /at least one seed/);
 });
 
+test('termIndex exposes weighted vocabulary statistics additively', async () => {
+    const conn = fakeConn(() =>
+        'SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=12,' +
+        'weighted=1,nodes=6,tokens=8,trigrams=31'
+    );
+    const result = await graph.termIndex(conn);
+    assert.equal(conn.lines[0], 'GRAPH_TERM_INDEX action=stats');
+    assert.equal(result.weighted, true);
+    assert.equal(result.tokens, 8);
+    assert.equal(result.trigrams, 31);
+});
+
 test('buildEdgeSetBatch base64-encodes the items and any shared props default', () => {
     const line = graph.buildEdgeSetBatch(
         [{ from: 'a', to: 'b', type: 'mentions' }],

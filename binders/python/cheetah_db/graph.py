@@ -670,6 +670,9 @@ def term_index(
     return {
         "entries": response.int_field("entries"),
         "enabled": response.bool_field("enabled", True),
+        "weighted": response.bool_field("weighted", False),
+        "tokens": response.int_field("tokens"),
+        "trigrams": response.int_field("trigrams"),
         "nodes": response.int_field("nodes"),
         "terms": response.int_field("terms"),
         "removed": response.int_field("removed"),

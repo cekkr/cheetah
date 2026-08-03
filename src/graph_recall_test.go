@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -445,10 +447,156 @@ func TestGraphTermIndexLifecycle(t *testing.T) {
 		t.Fatalf("rebuild must index regardless of the switch, got %+v", rebuilt)
 	}
 
-	assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=drop", "SUCCESS")
+	beforeDrop := assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=stats", "SUCCESS")
+	drop := assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=drop", "SUCCESS")
+	if responseField(drop, "removed") != responseField(beforeDrop, "entries") {
+		t.Fatalf("drop must report candidate rows, not derived metadata: before=%s drop=%s", beforeDrop, drop)
+	}
 	resp = assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=stats", "SUCCESS")
 	if !strings.Contains(resp, "entries=0") {
 		t.Fatalf("drop must empty the index, got %s", resp)
+	}
+}
+
+// La frequenza non è soltanto telemetria: un termine raro deve pesare più di
+// una parola generica, e un errore di battitura deve poter arrivare al token
+// corretto attraverso i trigrammi senza una scansione globale del lessico.
+func TestGraphTermIndexWeightsRareTermsAndRepairsMisspellings(t *testing.T) {
+	db := newRecallTestDB(t)
+	for i := 0; i < 12; i++ {
+		assertCommandPrefix(t, db, fmt.Sprintf("GRAPH_NODE_SET id=concept:item-%02d", i), "SUCCESS")
+	}
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=animal:quokka", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=city:berlin", "SUCCESS")
+
+	conceptFrequency, err := db.graphTermDocumentFrequency("concept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quokkaFrequency, err := db.graphTermDocumentFrequency("quokka")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conceptFrequency != 12 || quokkaFrequency != 1 {
+		t.Fatalf("unexpected document frequencies concept=%d quokka=%d", conceptFrequency, quokkaFrequency)
+	}
+
+	resp := assertCommandPrefix(t, db, "GRAPH_RECALL seeds=concept:quokka hops=1", "SUCCESS")
+	payload := recallPayload(t, resp)
+	if len(payload.Seeds) != 1 {
+		t.Fatalf("weighted compound seed did not resolve: %+v", payload)
+	}
+	if len(payload.Seeds[0].Matches) != 1 || payload.Seeds[0].Matches[0].ID != "animal:quokka" {
+		t.Fatalf("the rare token should outrank and filter generic concept matches: %+v", payload.Seeds[0].Matches)
+	}
+
+	resp = assertCommandPrefix(t, db, "GRAPH_RECALL seeds=berln hops=1", "SUCCESS")
+	payload = recallPayload(t, resp)
+	if len(payload.Seeds) != 1 || len(payload.Seeds[0].Matches) == 0 {
+		t.Fatalf("misspelled seed did not resolve: %+v", payload)
+	}
+	if got := payload.Seeds[0].Matches[0]; got.ID != "city:berlin" || got.Match != "fuzzy" {
+		t.Fatalf("expected fuzzy city:berlin, got %+v", got)
+	}
+
+	stats := assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=stats", "SUCCESS")
+	if responseField(stats, "weighted") != "1" || responseField(stats, "nodes") != "14" {
+		t.Fatalf("stats omit weighted metadata: %s", stats)
+	}
+	if responseField(stats, "tokens") == "0" || responseField(stats, "trigrams") == "0" {
+		t.Fatalf("stats omit frequency/trigram rows: %s", stats)
+	}
+
+	assertCommandPrefix(t, db, "GRAPH_NODE_DEL id=city:berlin", "SUCCESS")
+	if matches, err := db.graphTermApproximateTokens("berln", 0); err != nil {
+		t.Fatal(err)
+	} else if len(matches) != 0 {
+		t.Fatalf("dropping the last berlin document must remove its fuzzy vocabulary row: %+v", matches)
+	}
+}
+
+// Gli indici creati dalla revisione precedente conservano le righe token->nodo
+// ma non i contatori. Restano servibili in modalità esatta; un rebuild paginato
+// aggiunge i metadati v2 e pubblica il marker solo alla fine.
+func TestGraphTermIndexRebuildUpgradesLegacyRowsResumably(t *testing.T) {
+	db := newRecallTestDB(t)
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=city:berlin", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=city:lisbon", "SUCCESS")
+
+	db.graphTermMu.Lock()
+	if _, err := db.PairPurge([]byte(graphTermMetadataPrefix), 0); err != nil {
+		db.graphTermMu.Unlock()
+		t.Fatal(err)
+	}
+	db.graphTermMu.Unlock()
+	if ready, _, err := db.graphTermMetadataReady(); err != nil {
+		t.Fatal(err)
+	} else if ready {
+		t.Fatal("legacy candidate rows must not claim weighted metadata")
+	}
+	if exact, err := db.graphTermCandidates("berlin", 0); err != nil || len(exact) != 1 {
+		t.Fatalf("legacy exact lookup stopped working: ids=%+v err=%v", exact, err)
+	}
+	if fuzzy, err := db.graphTermApproximateTokens("berln", 0); err != nil || len(fuzzy) != 0 {
+		t.Fatalf("legacy index should degrade without claiming fuzzy support: %+v err=%v", fuzzy, err)
+	}
+
+	resp := assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=rebuild limit=1", "SUCCESS")
+	cursor := responseField(resp, "next_cursor")
+	if cursor == "" || cursor == "*" {
+		t.Fatalf("one-node rebuild should be resumable: %s", resp)
+	}
+	stats := assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=stats", "SUCCESS")
+	if responseField(stats, "weighted") != "0" {
+		t.Fatalf("a partial rebuild must not publish incomplete counts: %s", stats)
+	}
+	resp = assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=rebuild limit=1 cursor="+cursor, "SUCCESS")
+	if responseField(resp, "next_cursor") != "*" {
+		t.Fatalf("second page should complete the rebuild: %s", resp)
+	}
+	stats = assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=stats", "SUCCESS")
+	if responseField(stats, "weighted") != "1" || responseField(stats, "nodes") != "2" {
+		t.Fatalf("completed rebuild did not publish exact metadata: %s", stats)
+	}
+	if fuzzy, err := db.graphTermApproximateTokens("berln", 0); err != nil {
+		t.Fatal(err)
+	} else if len(fuzzy) == 0 || fuzzy[0].Token != "berlin" {
+		t.Fatalf("rebuild did not create typo vocabulary: %+v", fuzzy)
+	}
+
+	// Ripartire da cursor vuoto ricostruisce da zero e non raddoppia i conti.
+	assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=rebuild", "SUCCESS")
+	if frequency, err := db.graphTermDocumentFrequency("city"); err != nil || frequency != 2 {
+		t.Fatalf("idempotent rebuild frequency=%d err=%v", frequency, err)
+	}
+}
+
+func TestGraphTermIndexSerializesConcurrentFrequencyUpdates(t *testing.T) {
+	db := newRecallTestDB(t)
+	const nodes = 48
+	var writes sync.WaitGroup
+	errs := make(chan string, nodes)
+	for i := 0; i < nodes; i++ {
+		writes.Add(1)
+		go func(index int) {
+			defer writes.Done()
+			response, err := db.ExecuteCommand(fmt.Sprintf("GRAPH_NODE_SET id=shared:item-%02d", index))
+			if err != nil || !strings.HasPrefix(response, "SUCCESS") {
+				errs <- fmt.Sprintf("response=%q err=%v", response, err)
+			}
+		}(i)
+	}
+	writes.Wait()
+	close(errs)
+	for failure := range errs {
+		t.Fatal(failure)
+	}
+	if frequency, err := db.graphTermDocumentFrequency("shared"); err != nil || frequency != nodes {
+		t.Fatalf("concurrent frequency=%d err=%v", frequency, err)
+	}
+	ready, indexedNodes, err := db.graphTermMetadataReady()
+	if err != nil || !ready || indexedNodes != nodes {
+		t.Fatalf("concurrent document count ready=%v nodes=%d err=%v", ready, indexedNodes, err)
 	}
 }
 

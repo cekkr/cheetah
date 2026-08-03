@@ -263,6 +263,12 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   seeds when they are missing. Node upsert/delete keep them in sync
   ([`graphSyncNodeTerms`](src/graph_recall.go)/[`graphDropNodeTerms`](src/graph_recall.go)); a new node
   write path must call them or its nodes become unreachable by free-text seed.
+- **Term rarity/typo metadata is versioned inside the derived index.** Candidate rows keep their
+  historical layout; `\x05gt:!c/` holds document frequencies, `!d/` indexed-document markers,
+  `!g/` trigram→token rows, and `!version` publishes completeness. Fresh indexes maintain v2 under
+  `Database.graphTermMu`; legacy candidates continue exact lookup with `weighted=0` until the final
+  page of `GRAPH_TERM_INDEX action=rebuild` publishes v2. Never publish the version at rebuild start:
+  partial counts must not influence IDF or fuzzy matching. `entries=` excludes the `!` subtree.
 - **Reference sentences are bounded graph evidence, not a new fact store.** `GraphNodeRecord.References`
   holds at most 64 complete `{id,text,source?,ordinal?}` entries (4 KiB each, 64 KiB total);
   `GRAPH_NODE_SET references=` preserves them when omitted and clears them only with `-`. Their words
@@ -972,7 +978,8 @@ next query.
 - **Key symbols:** the reserved term-index namespace `graphTermIndexPrefix` (`\x05gt:`) with
   `graphTermPairKey`/`graphTermScanPrefix`/`graphNodeIndexTokens`/`graphSyncNodeTerms`/
   `graphDropNodeTerms`/`graphEnsureTermEntry`/`graphTermCandidates`/`graphRebuildTermIndex`; lexical
-  helpers `graphRecallTokens`/`graphRecallTokenSet`/`graphRecallJaccard`; scoring
+  helpers `graphRecallTokens`/`graphRecallTokenSet`/`graphRecallJaccard`; weighted/fuzzy metadata lives
+  in [`graph_term_index.go`](src/graph_term_index.go); scoring
   `graphRecallAffinity` (weight × confidence), `graphRecallNoisyOr`, `graphRecallNovelty`; option
   parsing `graphParseRecallOptions`/`graphParseRecallExpansion`/`graphRecallResolveSynonymTypes`/
   `(*graphRecallOptions).applyTypeFilter`; seed resolution `graphResolveRecallSeeds`/
@@ -998,6 +1005,23 @@ next query.
   depth), which is not the `hops` reported per source. Traversal never hydrates node records — labels
   are read only for the items that survive the limit. When equal activations compete for the one
   displayed `via`, choose the lexical seed; map iteration must not make identical recalls differ.
+
+#### [`src/graph_term_index.go`](src/graph_term_index.go)
+
+The v2 metadata side of the derived lexical index. It keeps smoothed-IDF document frequencies and a
+bounded trigram vocabulary without changing historical `token/node` candidate rows. Exact misses
+consult at most 256 rows per trigram and eight candidate vocabulary tokens; Levenshtein distance then
+admits one edit through length 8 and two beyond it. Successful repairs surface as `match:"fuzzy"`.
+
+- **Key symbols:** metadata prefixes `graphTermMetadataPrefix`/`graphTermCountPrefix`/
+  `graphTermDocumentPrefix`/`graphTermGramPrefix`; lifecycle `graphTermMetadataActiveLocked`,
+  `graphTermTrackDocumentLocked`, `graphTermUntrackDocumentLocked`, `graphTermBeginRebuildLocked`,
+  `graphTermFinishRebuildLocked`; scoring/search `graphTermIDF`, `graphTermWeightedTokenScore`,
+  `graphTermUniqueTrigrams`, `graphTermApproximateTokens`, `graphTermLevenshtein`.
+- **Common mistakes:** every counter is read-modify-write and all write/rebuild/drop paths must hold
+  `Database.graphTermMu`. The metadata is derived and hidden but its writes still use the graph
+  wrappers, preserving the single graph-cache epoch choke point. A legacy index is a supported
+  degraded state, not permission to fabricate frequencies from a capped candidate page.
 
 #### [`src/graph_cache_budget.go`](src/graph_cache_budget.go)
 
@@ -1738,23 +1762,25 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   score and the `via` evidence path (per edge: weight, confidence, modality). Activation combines
   across seeds in **noisy-OR**, so a node two seeds reach outranks either seed's own neighbours —
   `min_sources=2` returns only those convergences, which is the "unexpected correlation" view.
-  Seeds resolve by exact id, by lexical overlap through the `\x05gt:` term index, and through declared
-  synonym edges. Node `references` store complete readable sentences and feed the lexical index;
+  Seeds resolve by exact id, by IDF-weighted lexical overlap through the `\x05gt:` term index, by a
+  bounded trigram/edit-distance repair when an exact token misses, and through declared synonym
+  edges. Node `references` store complete readable sentences and feed the lexical index;
   `references=1 [reference_limit=…]` returns them plus episodic payloads cited by `edge.props.src`.
   `GRAPH_SIMILAR id=<node>` answers "what else is like this" from shared neighbours (distributional)
   and shared id words (lexical). `GRAPH_TERM_INDEX action=stats|rebuild|drop` maintains the index.
-- **Owners:** [`graph_recall.go`](src/graph_recall.go); node-write hooks in
+- **Owners:** [`graph_recall.go`](src/graph_recall.go),
+  [`graph_term_index.go`](src/graph_term_index.go); node-write hooks in
   [`graph.go`](src/graph.go) (`handleGraphNodeSet`, `graphEnsureNode`) and in
   [`micro_del.go`](src/micro_del.go) (`microDelGraphNode`, which took over `handleGraphNodeDel`).
   **Tests:** [`graph_recall_test.go`](src/graph_recall_test.go).
 - **Constraints:** every walk is bounded by `branch_limit` (per node/direction) and `budget`
   (hydrated edges); exhausting either answers `truncated=1` rather than stalling. `hops` caps at 6.
   Term-index maintenance on write is switchable with `CHEETAH_GRAPH_TERM_INDEX=0`; a database written
-  with it off (or created before this feature) needs `GRAPH_TERM_INDEX action=rebuild` before free-text
-  seeds resolve — exact ids and synonym edges work regardless.
-- **Gaps:** no async variant, and the index weighs every token equally — both open items in
-  [`NEXT_STEPS.md`](NEXT_STEPS.md). Consolidation is no longer one: a recall now writes back what it
-  discovered through the association cache below.
+  with it off needs `GRAPH_TERM_INDEX action=rebuild` before free-text seeds resolve. A pre-v2 index
+  keeps exact lexical resolution but needs the same resumable rebuild for IDF/fuzzy mode; stats says
+  `weighted=0` until completion. Exact ids and synonym edges work regardless.
+- **Gaps:** no dedicated async term-index rebuild. Recall itself already has the shared job path, and
+  consolidation writes back through the association cache below.
 
 <a id="feature-graph-cache"></a>
 ### Graph association cache (real-time, self-training) — Shipped
@@ -2013,7 +2039,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `PAIR_REDUCE` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go); its async forms go through [`jobs.go`](src/jobs.go) |
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
-| `GRAPH_RECALL` (including bounded complete references and the shared sync/job execution path), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go), [`micro_job.go`](src/micro_job.go) |
+| `GRAPH_RECALL` (including bounded complete references and the shared sync/job execution path), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go), [`graph_term_index.go`](src/graph_term_index.go), [`micro_job.go`](src/micro_job.go) |
 | `GRAPH_CACHE stats/config/get/links/common/put/prune`, `DEL graph_cache` | [`micro_graph_cache.go`](src/micro_graph_cache.go), [`graph_cache.go`](src/graph_cache.go), [`graph_cache_budget.go`](src/graph_cache_budget.go), [`engine.go`](src/engine.go) |
 | `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`jobs.go`](src/jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
@@ -2155,7 +2181,8 @@ Environment variables read by the server (all verified in-tree):
   `CHEETAH_CACHE_IDLE_SECONDS`, `CHEETAH_CACHE_FORCE_SECONDS`, `CHEETAH_CACHE_SWEEP_SECONDS`,
   `CHEETAH_CACHE_STATS_SECONDS`, `CHEETAH_CACHE_PRESSURE_HIGH`, `CHEETAH_CACHE_PRESSURE_LOW`,
   `CHEETAH_CACHE_WRITE_WEIGHT`, `CHEETAH_CACHE_READ_WEIGHT`.
-- **Graph term index** ([`graph_recall.go`](src/graph_recall.go)): `CHEETAH_GRAPH_TERM_INDEX`
+- **Graph term index** ([`graph_recall.go`](src/graph_recall.go),
+  [`graph_term_index.go`](src/graph_term_index.go)): `CHEETAH_GRAPH_TERM_INDEX`
   (default on; `0/false/no/off/disable(d)` turns off the automatic maintenance on node write —
   `GRAPH_TERM_INDEX action=rebuild` indexes regardless, since it is an explicit request).
 - **Graph association cache** ([`graph_cache.go`](src/graph_cache.go),
@@ -2243,6 +2270,8 @@ seen in old docs are **client-side**; the server does not read them.
 | Exhausted recall budget answers `truncated=1` on one line instead of stalling | [`TestGraphRecallBudgetDegradesInsteadOfStalling`](src/graph_recall_test.go) |
 | Distributional similarity: shared neighbours and shared id words | [`TestGraphSimilarSharesContextAndWords`](src/graph_recall_test.go) |
 | Term index maintained on write, dropped with the node, rebuildable, switchable | [`TestGraphTermIndexLifecycle`](src/graph_recall_test.go) |
+| Rare terms outweigh generic ones; bounded typo repair is explicit and disappears with the last token row | [`TestGraphTermIndexWeightsRareTermsAndRepairsMisspellings`](src/graph_recall_test.go) |
+| A paged rebuild upgrades legacy rows and publishes counts only at completion; concurrent writes retain exact frequencies | [`TestGraphTermIndexRebuildUpgradesLegacyRowsResumably`, `TestGraphTermIndexSerializesConcurrentFrequencyUpdates`](src/graph_recall_test.go) (`-race`) |
 | Complete node references round-trip, preserve/clear, and feed lexical lookup | [`TestGraphNodeReferencesRoundTripAndFeedTheTermIndex`](src/graph_recall_test.go) |
 | Recall hydrates bounded node sentences + episodic `edge.props.src` payloads | [`TestGraphRecallHydratesCompleteNodeAndEpisodeReferences`](src/graph_recall_test.go) |
 | Record tables: define/set/get, partial update, projection, error wordings | [`TestRecordTableMultiFieldLifecycle`](src/record_test.go) |
@@ -2335,7 +2364,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   index.
 - Associative recall: multi-seed `GRAPH_RECALL` with noisy-OR convergence, bounded complete node/
   episodic reference hydration, `GRAPH_SIMILAR`, and the `\x05gt:` lexical term index behind
-  `GRAPH_TERM_INDEX`.
+  `GRAPH_TERM_INDEX`, including IDF frequencies and bounded typo repair.
 - Real-time association cache under `\x07gc:`: `GRAPH_RECALL` writes back the shortcuts and the
   convergences it discovers and reads them again for free, with sampled admission, `hits`/
   `observations` recurrence, and a resource-aware maintainer that prunes and compresses continuously
@@ -2399,8 +2428,8 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))
 
-1. Share association-cache capacity across databases, then add frequency-weighted /
-   misspelling-tolerant term matching.
+1. Feed association-cache hit rates into recall decay, then learn relation-specific decay from the
+   prediction tables.
 2. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
 3. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
 4. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.

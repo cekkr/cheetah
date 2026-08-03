@@ -828,6 +828,14 @@ class FakeCheetahServer:
     def _do_file_checkpoint(self, rest: str) -> str:
         return "SUCCESS,file_checkpoint_flushed=4"
 
+    def _do_graph_term_index(self, rest: str) -> str:
+        fields = _kv_args(rest)
+        action = fields.get("action", "stats")
+        return (
+            f"SUCCESS,command=GRAPH_TERM_INDEX,action={action},enabled=1,entries=12,"
+            "weighted=1,nodes=6,tokens=8,trigrams=31,next_cursor=*"
+        )
+
 
 class FakeConnection:
     """A ``conn`` for the free-function layers: no socket, same responses."""

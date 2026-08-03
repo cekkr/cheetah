@@ -82,6 +82,13 @@ class RecallTests(unittest.TestCase):
         self.assertIn("reference_limit=4", line)
         self.assertIn("include_seeds=1", line)
 
+    def test_term_index_exposes_weighted_vocabulary_statistics(self) -> None:
+        result = graph.term_index(self.conn)
+        self.assertTrue(result["weighted"])
+        self.assertEqual(result["tokens"], 8)
+        self.assertEqual(result["trigrams"], 31)
+        self.assertEqual(result["nodes"], 6)
+
     def test_detached_recall_is_retrieved_and_decoded_by_job_id(self) -> None:
         job_id = graph.recall_async(self.conn, ["heavy rain"], hops=2)
         submitted = next(command for command in self.conn.commands if command.startswith("JOB submit"))

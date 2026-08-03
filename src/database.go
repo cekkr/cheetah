@@ -72,6 +72,7 @@ type Database struct {
 	predictStore     *PredictionManager
 	recordStore      *RecordManager
 	graphCache       *graphCacheStore
+	graphTermMu      sync.Mutex // Serializza contatori/grammi derivati dell'indice lessicale.
 	protocolProfiles *numericProfileStore
 	clusterMessenger *ClusterMessenger
 	jobs             *microJobManager

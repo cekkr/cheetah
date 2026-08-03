@@ -265,8 +265,8 @@ var argumentKeyNames = []string{
 	"payloads", "pair_bytes", "precision", "prefix", "props", "reducer",
 	"reference_limit", "references", "reset", "results", "rows", "scanned", "seed",
 	"seeds", "share", "size", "source", "state", "stop_on_error", "table",
-	"tables", "target", "terms", "to", "type", "types", "uint", "int",
-	"float", "value", "values", "weight", "width", "window",
+	"tables", "target", "terms", "to", "tokens", "trigrams", "type", "types", "uint", "int",
+	"float", "value", "values", "weight", "weighted", "width", "window",
 }
 
 type argumentKeyTable struct {

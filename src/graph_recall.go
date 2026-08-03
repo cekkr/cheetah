@@ -232,17 +232,18 @@ func graphNodeIndexTokens(record *GraphNodeRecord) []string {
 }
 
 // graphEnsureTermEntry è idempotente: il payload di una voce d'indice è l'id del
-// nodo, quindi una voce già presente non va riscritta (conta per il rebuild, che
-// ripassa su nodi già indicizzati).
-func (db *Database) graphEnsureTermEntry(token string, nodeID string) error {
+// nodo, quindi una voce già presente non va riscritta. Il bool distingue una
+// nuova riga, che deve avanzare la frequenza del token quando i metadati v2 sono
+// attivi.
+func (db *Database) graphEnsureTermEntry(token string, nodeID string) (bool, error) {
 	pairKey := graphTermPairKey(token, nodeID)
 	if _, err := db.getPairValue(pairKey); err == nil {
-		return nil
+		return false, nil
 	} else if !errors.Is(err, errPairNotFound) {
-		return err
+		return false, err
 	}
 	_, err := db.graphUpsertPairPayload(pairKey, []byte(nodeID), true)
-	return err
+	return err == nil, err
 }
 
 // graphSyncNodeTerms allinea l'indice a un upsert di nodo: `previous` nil vuol
@@ -250,6 +251,19 @@ func (db *Database) graphEnsureTermEntry(token string, nodeID string) error {
 func (db *Database) graphSyncNodeTerms(previous *GraphNodeRecord, next *GraphNodeRecord) error {
 	if !graphTermIndexEnabled() || next == nil || next.ID == "" {
 		return nil
+	}
+	db.graphTermMu.Lock()
+	defer db.graphTermMu.Unlock()
+	metadataActive, err := db.graphTermMetadataActiveLocked()
+	if err != nil {
+		return err
+	}
+	trackedNow := false
+	if metadataActive {
+		trackedNow, err = db.graphTermTrackDocumentLocked(next)
+		if err != nil {
+			return err
+		}
 	}
 	nextTokens := graphNodeIndexTokens(next)
 	wanted := make(map[string]struct{}, len(nextTokens))
@@ -261,14 +275,26 @@ func (db *Database) graphSyncNodeTerms(previous *GraphNodeRecord, next *GraphNod
 			if _, ok := wanted[token]; ok {
 				continue
 			}
-			if _, err := db.graphDeletePairAndPayload(graphTermPairKey(token, previous.ID)); err != nil {
+			deleted, err := db.graphDeletePairAndPayload(graphTermPairKey(token, previous.ID))
+			if err != nil {
 				return err
+			}
+			if metadataActive && !trackedNow && deleted {
+				if err := db.graphTermAdjustTokenCountLocked(token, -1); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	for _, token := range nextTokens {
-		if err := db.graphEnsureTermEntry(token, next.ID); err != nil {
+		created, err := db.graphEnsureTermEntry(token, next.ID)
+		if err != nil {
 			return err
+		}
+		if metadataActive && !trackedNow && created {
+			if err := db.graphTermAdjustTokenCountLocked(token, 1); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -280,8 +306,34 @@ func (db *Database) graphDropNodeTerms(record *GraphNodeRecord) error {
 	if record == nil || record.ID == "" {
 		return nil
 	}
+	db.graphTermMu.Lock()
+	defer db.graphTermMu.Unlock()
+	ready, building, err := db.graphTermMetadataStateLocked()
+	if err != nil {
+		return err
+	}
+	metadataActive := ready || building
+	tracked := false
+	if metadataActive {
+		if _, found, err := db.getPairPayload(graphTermDocumentKey(record.ID)); err != nil {
+			return err
+		} else {
+			tracked = found
+		}
+	}
 	for _, token := range graphNodeIndexTokens(record) {
-		if _, err := db.graphDeletePairAndPayload(graphTermPairKey(token, record.ID)); err != nil {
+		deleted, err := db.graphDeletePairAndPayload(graphTermPairKey(token, record.ID))
+		if err != nil {
+			return err
+		}
+		if tracked && deleted {
+			if err := db.graphTermAdjustTokenCountLocked(token, -1); err != nil {
+				return err
+			}
+		}
+	}
+	if tracked {
+		if _, err := db.graphTermUntrackDocumentLocked(record); err != nil {
 			return err
 		}
 	}
@@ -328,6 +380,17 @@ func (db *Database) graphTermCandidates(token string, limit int) ([]string, erro
 }
 
 func (db *Database) graphRebuildTermIndex(limit int, cursor []byte) (int, int, []byte, error) {
+	db.graphTermMu.Lock()
+	defer db.graphTermMu.Unlock()
+	if len(cursor) == 0 {
+		if err := db.graphTermBeginRebuildLocked(); err != nil {
+			return 0, 0, nil, err
+		}
+	}
+	_, building, err := db.graphTermMetadataStateLocked()
+	if err != nil {
+		return 0, 0, nil, err
+	}
 	prefix := []byte(graphNodePrefix)
 	nodes := 0
 	terms := 0
@@ -342,6 +405,11 @@ func (db *Database) graphRebuildTermIndex(limit int, cursor []byte) (int, int, [
 			return nodes, terms, nil, err
 		}
 		if len(results) == 0 {
+			if building {
+				if err := db.graphTermFinishRebuildLocked(); err != nil {
+					return nodes, terms, nil, err
+				}
+			}
 			return nodes, terms, nil, nil
 		}
 		for _, res := range results {
@@ -354,14 +422,32 @@ func (db *Database) graphRebuildTermIndex(limit int, cursor []byte) (int, int, [
 				continue
 			}
 			nodes++
-			for _, token := range graphNodeIndexTokens(&record) {
-				if err := db.graphEnsureTermEntry(token, record.ID); err != nil {
+			trackedNow := false
+			if building {
+				trackedNow, err = db.graphTermTrackDocumentLocked(&record)
+				if err != nil {
 					return nodes, terms, nil, err
+				}
+			}
+			for _, token := range graphNodeIndexTokens(&record) {
+				created, err := db.graphEnsureTermEntry(token, record.ID)
+				if err != nil {
+					return nodes, terms, nil, err
+				}
+				if building && !trackedNow && created {
+					if err := db.graphTermAdjustTokenCountLocked(token, 1); err != nil {
+						return nodes, terms, nil, err
+					}
 				}
 				terms++
 			}
 		}
 		if len(nextCursor) == 0 || len(results) < page {
+			if building {
+				if err := db.graphTermFinishRebuildLocked(); err != nil {
+					return nodes, terms, nil, err
+				}
+			}
 			return nodes, terms, nil, nil
 		}
 		current = nextCursor
@@ -811,6 +897,12 @@ type graphRecallSeedResolution struct {
 	Matches []graphRecallSeedMatch `json:"matches,omitempty"`
 }
 
+type graphRecallLexicalEvidence struct {
+	Weight       float64
+	IndexedToken string
+	Fuzzy        bool
+}
+
 func (db *Database) graphResolveRecallSeeds(opts *graphRecallOptions) ([]graphRecallSeedResolution, []string, error) {
 	resolutions := make([]graphRecallSeedResolution, 0, len(opts.Seeds))
 	unresolved := make([]string, 0)
@@ -851,24 +943,131 @@ func (db *Database) graphResolveRecallTerm(term string, opts *graphRecallOptions
 	}
 
 	if opts.Expand.Lexical {
-		termTokens := graphRecallTokenSet(term)
-		candidates := make(map[string]struct{})
-		for _, token := range graphRecallTokens(term) {
-			ids, err := db.graphTermCandidates(token, graphTermCandidateLimit)
+		termTokens := graphRecallTokens(term)
+		weighted, documents, err := db.graphTermMetadataReady()
+		if err != nil {
+			return nil, err
+		}
+		queryWeights := make(map[string]float64, len(termTokens))
+		candidates := make(map[string]map[string]graphRecallLexicalEvidence)
+		addEvidence := func(id string, queryToken string, indexedToken string, weight float64, fuzzy bool) {
+			if weight <= 0 {
+				return
+			}
+			byQuery := candidates[id]
+			if byQuery == nil {
+				byQuery = make(map[string]graphRecallLexicalEvidence)
+				candidates[id] = byQuery
+			}
+			if previous, ok := byQuery[queryToken]; ok && previous.Weight >= weight {
+				return
+			}
+			byQuery[queryToken] = graphRecallLexicalEvidence{
+				Weight:       weight,
+				IndexedToken: indexedToken,
+				Fuzzy:        fuzzy,
+			}
+		}
+		for _, token := range termTokens {
+			frequency := uint64(0)
+			if weighted {
+				frequency, err = db.graphTermDocumentFrequency(token)
+				if err != nil {
+					return nil, err
+				}
+			}
+			queryWeight := 1.0
+			if weighted {
+				queryWeight = graphTermIDF(documents, frequency)
+			}
+			queryWeights[token] = queryWeight
+			scanLimit := graphTermCandidateLimit
+			if frequency > 0 && frequency < uint64(scanLimit) {
+				scanLimit = int(frequency)
+			}
+			ids, err := db.graphTermCandidates(token, scanLimit)
 			if err != nil {
 				return nil, err
 			}
 			for _, id := range ids {
-				candidates[id] = struct{}{}
+				addEvidence(id, token, token, queryWeight, false)
+			}
+			if len(ids) != 0 || !weighted {
+				continue
+			}
+			approximate, err := db.graphTermApproximateTokens(token, graphTermFuzzyTokenLimit)
+			if err != nil {
+				return nil, err
+			}
+			remaining := graphTermCandidateLimit
+			for _, match := range approximate {
+				if remaining <= 0 {
+					break
+				}
+				limit := remaining
+				if match.Frequency < uint64(limit) {
+					limit = int(match.Frequency)
+				}
+				ids, err := db.graphTermCandidates(match.Token, limit)
+				if err != nil {
+					return nil, err
+				}
+				indexedWeight := graphTermIDF(documents, match.Frequency)
+				if indexedWeight > queryWeight {
+					indexedWeight = queryWeight
+				}
+				for _, id := range ids {
+					addEvidence(id, token, match.Token, indexedWeight*match.Similarity, true)
+				}
+				remaining -= len(ids)
 			}
 		}
-		for id := range candidates {
-			score := graphRecallJaccard(termTokens, graphRecallTokenSet(id))
+		totalQueryWeight := 0.0
+		for _, weight := range queryWeights {
+			totalQueryWeight += weight
+		}
+		averageWeight := 1.0
+		if len(queryWeights) > 0 {
+			averageWeight = totalQueryWeight / float64(len(queryWeights))
+		}
+		for id, evidence := range candidates {
+			matchedTokens := make(map[string]struct{}, len(evidence))
+			evidenceWeight := 0.0
+			anyExact, anyFuzzy := false, false
+			for _, item := range evidence {
+				evidenceWeight += item.Weight
+				matchedTokens[item.IndexedToken] = struct{}{}
+				if item.Fuzzy {
+					anyFuzzy = true
+				} else {
+					anyExact = true
+				}
+			}
+			candidateTokens := graphRecallTokenSet(id)
+			sharedIDTokens := 0
+			for token := range candidateTokens {
+				if _, ok := matchedTokens[token]; ok {
+					sharedIDTokens++
+				}
+			}
+			extraIDTokens := len(candidateTokens) - sharedIDTokens
+			if extraIDTokens < 0 {
+				extraIDTokens = 0
+			}
+			denominator := totalQueryWeight + averageWeight*float64(extraIDTokens)
+			score := 0.0
+			if denominator > 0 {
+				score = graphRecallClamp01(evidenceWeight / denominator)
+			}
 			if score < opts.Precision || score <= 0 {
 				continue
 			}
 			// Un match lessicale non è mai buono quanto l'id esatto.
-			record(id, score*0.99, "lexical")
+			matchKind := "lexical"
+			if anyFuzzy && !anyExact {
+				matchKind = "fuzzy"
+			}
+			record(id, score*0.99, matchKind)
 		}
 	}
 
@@ -1789,7 +1988,21 @@ func (db *Database) graphSimilarMatches(
 	baseTokens := graphRecallTokenSet(nodeID)
 	lexicalScores := make(map[string]float64)
 	if useLexical {
+		weighted, documents, err := db.graphTermMetadataReady()
+		if err != nil {
+			return nil, false, err
+		}
+		baseWeights := make(map[string]float64, len(baseTokens))
 		for _, token := range graphRecallTokens(nodeID) {
+			weight := 1.0
+			if weighted {
+				frequency, err := db.graphTermDocumentFrequency(token)
+				if err != nil {
+					return nil, false, err
+				}
+				weight = graphTermIDF(documents, frequency)
+			}
+			baseWeights[token] = weight
 			ids, err := db.graphTermCandidates(token, graphTermCandidateLimit)
 			if err != nil {
 				return nil, false, err
@@ -1802,7 +2015,7 @@ func (db *Database) graphSimilarMatches(
 			}
 		}
 		for candidate := range candidates {
-			lexicalScores[candidate] = graphRecallJaccard(baseTokens, graphRecallTokenSet(candidate))
+			lexicalScores[candidate] = graphTermWeightedTokenScore(baseWeights, graphRecallTokenSet(candidate))
 		}
 	}
 
@@ -1889,14 +2102,44 @@ func (db *Database) handleGraphTermIndex(args string) (string, error) {
 	}
 	switch action {
 	case "stats", "status":
+		db.graphTermMu.Lock()
+		defer db.graphTermMu.Unlock()
 		summary, err := db.PairSummaryWithOptions([]byte(graphTermIndexPrefix), 0, 0, true)
 		if err != nil {
 			return "", err
 		}
+		metadata, err := db.PairSummaryWithOptions([]byte(graphTermMetadataPrefix), 0, 0, true)
+		if err != nil {
+			return "", err
+		}
+		counts, err := db.PairSummaryWithOptions([]byte(graphTermCountPrefix), 0, 0, true)
+		if err != nil {
+			return "", err
+		}
+		grams, err := db.PairSummaryWithOptions([]byte(graphTermGramPrefix), 0, 0, true)
+		if err != nil {
+			return "", err
+		}
+		ready, _, err := db.graphTermMetadataStateLocked()
+		if err != nil {
+			return "", err
+		}
+		nodes, err := db.graphTermReadCounterLocked([]byte(graphTermNodeCountKey))
+		if err != nil {
+			return "", err
+		}
+		entries := summary.TerminalCount - metadata.TerminalCount
+		if entries < 0 {
+			entries = 0
+		}
 		return fmt.Sprintf(
-			"SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=%d,entries=%d",
+			"SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=%d,entries=%d,weighted=%d,nodes=%d,tokens=%d,trigrams=%d",
 			boolToInt(graphTermIndexEnabled()),
-			summary.TerminalCount,
+			entries,
+			boolToInt(ready),
+			nodes,
+			counts.TerminalCount,
+			grams.TerminalCount,
 		), nil
 	case "rebuild", "reindex":
 		limit := graphTermRebuildDefaultLimit
@@ -1922,11 +2165,21 @@ func (db *Database) handleGraphTermIndex(args string) (string, error) {
 			graphCursorToken(nextCursor),
 		), nil
 	case "drop", "clear":
+		db.graphTermMu.Lock()
+		defer db.graphTermMu.Unlock()
+		metadata, err := db.PairSummaryWithOptions([]byte(graphTermMetadataPrefix), 0, 0, true)
+		if err != nil {
+			return "", err
+		}
 		removed, err := db.PairPurge([]byte(graphTermIndexPrefix), 0)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("SUCCESS,command=GRAPH_TERM_INDEX,action=drop,removed=%d", removed), nil
+		visibleRemoved := int64(removed) - metadata.TerminalCount
+		if visibleRemoved < 0 {
+			visibleRemoved = 0
+		}
+		return fmt.Sprintf("SUCCESS,command=GRAPH_TERM_INDEX,action=drop,removed=%d", visibleRemoved), nil
 	default:
 		return "ERROR,unknown_action", nil
 	}
