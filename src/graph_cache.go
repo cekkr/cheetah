@@ -95,6 +95,9 @@ const (
 	graphCacheTargetHitRate = 0.20
 	graphCacheMinBias       = 0.10
 	graphCacheMaxBias       = 2.00
+	graphCacheMinDecay      = 0.75
+	graphCacheMaxDecay      = 1.25
+	graphCacheDecayQuantum  = 0.05
 	// Sotto questo numero di lookup una classe non ha ancora abbastanza storia
 	// perché il suo hit rate significhi qualcosa.
 	graphCacheClassMinSamples = 32
@@ -356,12 +359,14 @@ func graphCacheSignature(origins []string, opts *graphRecallOptions) string {
 	if opts != nil {
 		fmt.Fprintf(
 			&b,
-			"|p=%.4f|h=%d|d=%s|m=%d|k=%.4f|b=%d",
+			"|p=%.4f|h=%d|d=%s|m=%d|k=%.4f|cd=%.2f|rd=%s|b=%d",
 			opts.Precision,
 			opts.Hops,
 			opts.Direction,
 			opts.MinSources,
 			opts.Decay,
+			opts.cacheDecay(),
+			graphRecallDecayProfileToken(opts.relationDecayProfile),
 			opts.BranchLimit,
 		)
 		if len(opts.TypeFilter) > 0 || len(opts.ScanTypes) > 0 {
@@ -446,6 +451,46 @@ func (class *graphCacheClass) setBias(value float64) {
 	class.bias.Store(math.Float64bits(value))
 }
 
+// decayMultiplier traduce lo stesso segnale appreso dall'ammissione in un
+// aggiustamento molto più stretto della diffusione. Bias=1 è neutro; anche agli
+// estremi la cache può muovere il decay solo fra 0.75 e 1.25. Prima del prossimo
+// retune usa provvisoriamente l'hit rate quando ci sono già abbastanza campioni,
+// poi quantizza per non frammentare le firme delle convergenze a ogni lookup.
+func (class *graphCacheClass) decayMultiplier() float64 {
+	bias := class.Bias()
+	lookups := class.Lookups.Load()
+	if lookups >= graphCacheClassMinSamples {
+		hitRate := float64(class.Hits.Load()) / float64(lookups)
+		desired := hitRate / graphCacheTargetHitRate
+		if desired < graphCacheMinBias {
+			desired = graphCacheMinBias
+		}
+		if desired > graphCacheMaxBias {
+			desired = graphCacheMaxBias
+		}
+		bias = bias*0.7 + desired*0.3
+	}
+	factor := 1.0
+	if bias < 1 {
+		span := 1 - graphCacheMinBias
+		if span > 0 {
+			factor = 1 - (1-bias)/span*(1-graphCacheMinDecay)
+		}
+	} else if bias > 1 {
+		span := graphCacheMaxBias - 1
+		if span > 0 {
+			factor = 1 + (bias-1)/span*(graphCacheMaxDecay-1)
+		}
+	}
+	if factor < graphCacheMinDecay {
+		factor = graphCacheMinDecay
+	}
+	if factor > graphCacheMaxDecay {
+		factor = graphCacheMaxDecay
+	}
+	return math.Round(factor/graphCacheDecayQuantum) * graphCacheDecayQuantum
+}
+
 // retune sposta il bias verso l'hit rate osservato e poi dimezza i contatori.
 // Il dimezzamento è il punto: senza, la classe ricorderebbe per sempre il primo
 // carico visto e non seguirebbe più quello attuale.
@@ -462,6 +507,13 @@ func (class *graphCacheClass) retune() {
 	class.Lookups.Store(lookups / 2)
 	class.Hits.Store(hits / 2)
 	class.Writes.Store(class.Writes.Load() / 2)
+}
+
+func (store *graphCacheStore) classDecayMultiplier(class int) float64 {
+	if store == nil || class < 0 || class >= graphCacheClassSlots {
+		return 1
+	}
+	return store.classes[class].decayMultiplier()
 }
 
 // --- store -------------------------------------------------------------------
@@ -1501,11 +1553,12 @@ func minInt(left int, right int) int {
 // --- stato -------------------------------------------------------------------
 
 type graphCacheClassView struct {
-	Class   int     `json:"class"`
-	Lookups uint64  `json:"lookups"`
-	Hits    uint64  `json:"hits"`
-	Writes  uint64  `json:"writes"`
-	Bias    float64 `json:"bias"`
+	Class       int     `json:"class"`
+	Lookups     uint64  `json:"lookups"`
+	Hits        uint64  `json:"hits"`
+	Writes      uint64  `json:"writes"`
+	Bias        float64 `json:"bias"`
+	DecayFactor float64 `json:"decay_factor"`
 }
 
 // classViews rende solo le classi che hanno visto qualcosa: le altre sono slot
@@ -1519,11 +1572,12 @@ func (store *graphCacheStore) classViews() []graphCacheClassView {
 			continue
 		}
 		out = append(out, graphCacheClassView{
-			Class:   i,
-			Lookups: lookups,
-			Hits:    store.classes[i].Hits.Load(),
-			Writes:  writes,
-			Bias:    graphRoundConfidence(store.classes[i].Bias() / graphCacheMaxBias),
+			Class:       i,
+			Lookups:     lookups,
+			Hits:        store.classes[i].Hits.Load(),
+			Writes:      writes,
+			Bias:        graphRoundConfidence(store.classes[i].Bias() / graphCacheMaxBias),
+			DecayFactor: graphRoundConfidence(store.classes[i].decayMultiplier()),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

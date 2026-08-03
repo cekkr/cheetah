@@ -268,7 +268,7 @@ GRAPH_EDGE_SET from=city:berlin to=country:germany type=located_in
 GRAPH_EDGE_SET from=city:berlin to=city:berlino type=alias
 
 [cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=8
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,count=6,bridges=3,truncated=0,precision=0.100,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,count=6,bridges=3,truncated=0,precision=0.100,decay=0.55,cache_decay=1,decay_relations=0,decay_profile=-,payload=<base64>
 # associations decode to, in order:
 #  city:berlin      score 0.7975   novelty 0.39875  distance 1  sources 2  ← both seeds, one hop
 #  city:berlino     score 0.771994 novelty 0.385997 distance 1  sources 2  ← an alias: a hop, no distance
@@ -312,6 +312,23 @@ The knob that matters is `precision`. It is a belief threshold as much as a dist
 activation is multiplied by each edge's confidence on the way: an edge recorded as `possible` passes
 half of what a plain one passes, so raising `precision` drops hearsay before it drops distant facts.
 It takes the same words as `edge.confidence` — `precision=probable` is 0.75.
+
+`decay=` is the caller's base rather than the final per-edge rate. After a query shape has 32 cache
+lookups, its smoothed hit rate contributes a quantized 0.75–1.25 factor; `cache=off` makes that part
+neutral. A second, independent factor can be learned per relation through the existing prediction
+engine:
+
+```text
+PREDICT_SET table=graph_recall_decay key=has_breed value=carry prob=0.9
+PREDICT_SET table=graph_recall_decay key=has_breed value=stop prob=0.1
+PREDICT_SET table=graph_recall_decay key=mentioned_near value=carry prob=0.1
+PREDICT_SET table=graph_recall_decay key=mentioned_near value=stop prob=0.9
+```
+
+Recall maps the `carry`/`stop` scores to a bounded 0.5–1.5 relation factor. The table and each pair
+are optional: missing or half-written evidence is exactly neutral, and recall never creates the
+table just by reading it. The response exposes `decay`, `cache_decay`, `decay_relations`, and a
+stable `decay_profile` digest. Synonym edges retain their fixed identity-preserving decay.
 
 Recall never says "nothing". It says `count=0`, or it says `truncated=1` when the budget ran out
 before the graph did — a partial answer that declares itself. Both are reportable; neither is a
@@ -693,9 +710,10 @@ that turned out to matter. `PAIR_REDUCE counts episode:<day>` returns the raw ut
 long sweeps use `PAIR_REDUCE_ASYNC` and poll `PAIR_REDUCE_STATUS`, so the interactive connection stays
 free.
 
-**Decay.** Nothing expires by itself. A facts-get-stale policy is a re-assert with a lower weight and
-an updated `as_of` — and because omitted fields default (§4.1), the re-assert must carry the whole
-record.
+**Fact decay.** Nothing expires by itself. A facts-get-stale policy is a re-assert with a lower weight
+and an updated `as_of` — and because omitted fields default (§4.1), the re-assert must carry the
+whole record. This is distinct from the bounded *activation decay* in §5.1: adaptive recall changes
+how far evidence spreads for one query; it never edits or expires the underlying edge.
 
 **Forgetting, three levels:**
 

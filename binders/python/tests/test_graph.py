@@ -76,11 +76,15 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(decoded, "heavy rain,storm")
 
     def test_references_ask_for_seed_nodes_so_their_sentences_hydrate(self) -> None:
-        graph.recall(self.conn, ["a"], references=True, reference_limit=4, include_seeds=True)
+        result = graph.recall(self.conn, ["a"], references=True, reference_limit=4, include_seeds=True)
         line = self.conn.commands[-1]
         self.assertIn("references=1", line)
         self.assertIn("reference_limit=4", line)
         self.assertIn("include_seeds=1", line)
+        self.assertEqual(result["decay"], 0.55)
+        self.assertEqual(result["cache_decay"], 1.1)
+        self.assertEqual(result["decay_relations"], 2)
+        self.assertEqual(result["decay_profile"], "abcd")
 
     def test_term_index_exposes_weighted_vocabulary_statistics(self) -> None:
         result = graph.term_index(self.conn)

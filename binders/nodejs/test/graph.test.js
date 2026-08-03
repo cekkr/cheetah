@@ -215,7 +215,8 @@ test('neighborsAll stops at maxEdges without asking for another page', async () 
 test('recall returns the hydrated references and the reference count', async () => {
     const conn = fakeConn(
         () =>
-            'SUCCESS,command=GRAPH_RECALL,references=1,count=1,truncated=0,payload=' +
+            'SUCCESS,command=GRAPH_RECALL,references=1,count=1,truncated=0,decay=0.55,' +
+            'cache_decay=1.1,decay_relations=2,decay_profile=abcd,payload=' +
             payloadOf({
                 seeds: [{ term: 'parser', matches: [{ id: 'module:parser' }] }],
                 associations: [
@@ -230,6 +231,10 @@ test('recall returns the hydrated references and the reference count', async () 
     );
     const result = await graph.recall(conn, { seeds: ['parser'], references: true, referenceLimit: 8 });
     assert.equal(result.references, 1);
+    assert.equal(result.decay, 0.55);
+    assert.equal(result.cacheDecay, 1.1);
+    assert.equal(result.decayRelations, 2);
+    assert.equal(result.decayProfile, 'abcd');
     assert.equal(result.associations[0].references[0].text, 'The parser rejects non-finite values.');
     assert.match(conn.lines[0], / references=1 reference_limit=8$/);
 });

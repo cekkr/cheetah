@@ -33,7 +33,9 @@ other dense analytical slices must be served with predictable latency.
   seeds that reached it, its distance, the edges that justify it, and a novelty score. Because the
   seeds combine in noisy-OR, what two topics *share* outranks what either topic merely touches, which
   is where correlations nobody asked for turn up. Free-text seeds resolve through a lexical index and
-  declared synonym edges; `GRAPH_SIMILAR` answers the sibling question, "what else behaves like this".
+  declared synonym edges; cache hit rates adapt decay per query shape, while the optional
+  `graph_recall_decay` prediction table learns a different carry rate per relation. `GRAPH_SIMILAR`
+  answers the sibling question, "what else behaves like this".
 - **Payload caching.** `src/database.go` keeps a bounded cache (defaults: 16k entries ≈64 MB) keyed by
   `<value_size, table_id, entry_id>` so hot payloads never hit disk. Tune it with
   `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
@@ -822,7 +824,7 @@ ERROR,graph_query_parse_failed:left_node_must_be_anchored_by_id
 
 | Command | What it means |
 | --- | --- |
-| `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [references=0\|1] [reference_limit=] [limit=] [branch_limit=] [budget=] [cache=on\|off\|serve] [cache_limit=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. `references=1` also hydrates complete node sentences and episodic payloads cited by `edge.props.src`, under a separate bound. |
+| `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [references=0\|1] [reference_limit=] [limit=] [branch_limit=] [budget=] [cache=on\|off\|serve] [cache_limit=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. `references=1` hydrates bounded provenance. `decay=` is the base rate; cache evidence and the optional relation model adapt it without changing that caller input. |
 | `GRAPH_RECALL_ASYNC seeds=<t>[,…] [<recall options>]` | The same recall detached under a `graph_recall_<n>` job id. Without an explicit `budget=`, it uses the maximum bounded sweep (262 144) instead of the synchronous default (4 096). |
 | `GRAPH_RECALL_STATUS <job_id>` | Retrieves that recall by id and reports state/progress. The equivalent generic form is `JOB status id=<job_id>`. |
 | `GRAPH_RECALL_FETCH <job_id>` | `PENDING` while it runs, then the `GRAPH_RECALL` response; consumes the job. `JOB fetch id=<job_id>` keeps `job=` on the terminal response for correlation. |
@@ -835,7 +837,7 @@ yet. Recall answers what a query cannot be written for:
 
 ```text
 [cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=28,references=0,count=4,bridges=4,truncated=0,precision=0.100,cache=miss,cache_injected=0,cache_links=<n>,cache_common=4,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=28,references=0,count=4,bridges=4,truncated=0,precision=0.100,decay=0.55,cache_decay=1,decay_relations=0,decay_profile=-,cache=miss,cache_injected=0,cache_links=<n>,cache_common=4,payload=<base64>
 # payload decodes to {"seeds":[{"term":"cat:luna","matches":[{"id":"cat:luna","score":1,"match":"exact"},
 #                                                            {"id":"cat:mia","score":0.33,"match":"lexical"}]}, …],
 #  "associations":[
@@ -849,11 +851,11 @@ SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=2
 # cat:mia lexically.
 
 [cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=34,references=0,count=4,bridges=4,truncated=0,precision=0.050,cache=miss,cache_injected=0,cache_links=<n>,cache_common=4,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=34,references=0,count=4,bridges=4,truncated=0,precision=0.050,decay=0.55,cache_decay=1,decay_relations=0,decay_profile=-,cache=miss,cache_injected=0,cache_links=<n>,cache_common=4,payload=<base64>
 # the "what do these two have to do with each other?" view: only nodes both seeds reach
 
 [cheetah_data/notes]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,references=0,count=3,bridges=0,truncated=0,precision=0.100,cache=miss,cache_injected=0,cache_links=<n>,cache_common=0,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,references=0,count=3,bridges=0,truncated=0,precision=0.100,decay=0.55,cache_decay=1,decay_relations=0,decay_profile=-,cache=miss,cache_injected=0,cache_links=<n>,cache_common=0,payload=<base64>
 # "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"}]}]
 # a bare word, not an id — resolved through the term index, and it says so
 
@@ -903,7 +905,7 @@ Two things get remembered, because there are two different questions:
 - a **convergence** `q/<signature>` — what a whole seed set has in common. This is the memo of the
   comparison itself, for the case where no single input is expensive but comparing all of them is.
 
-**It trains itself; it does not just fill up.** Three mechanisms, and the third does not work without
+**It trains itself; it does not just fill up.** Four mechanisms, and the third does not work without
 the first two:
 
 1. **Sampled admission.** A pair never seen before is written only *with a probability*, raised by how
@@ -919,6 +921,10 @@ the first two:
    what falls below threshold, and halves the survivors' counters on every completed lap, so the
    numbers stay small and comparable and an old, famous row cannot outrank a new, useful one forever.
    It paces itself on free CPU and memory and skips its turn when the machine is busy.
+4. **Query-shape decay feedback.** The same 64 query classes turn their smoothed hit rate into a
+   quantized multiplier around recall's base `decay`: 0.75–1.25 in 0.05 steps. Fewer than 32 samples
+   stays neutral, and `cache=off` forces this factor to exactly 1. Quantization lets useful feedback
+   enter convergence signatures without creating a new cache key for every lookup.
 
 Capacity has two levels. Each database keeps its hot-configurable `graph_cache_capacity`; the engine
 also shares one `graph_cache_global_capacity` across every loaded database (default 65,536). A new
@@ -932,7 +938,7 @@ operator or a test that wants the result *now*.
 
 | Command | What it means |
 | --- | --- |
-| `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration, plus `global_entries`, `global_capacity`, and loaded `global_databases`. The background maintainer resynchronises the entry estimate after every complete lap (including after a reopen); `recount=1` pays for a full walk immediately and additionally reports the link/query split. |
+| `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration, plus `global_entries`, `global_capacity`, and loaded `global_databases`. Each query-class row in `payload=` includes its current `decay_factor`. The background maintainer resynchronises the entry estimate after every complete lap (including after a reopen); `recount=1` pays for a full walk immediately and additionally reports the link/query split. |
 | `GRAPH_CACHE config [enabled=] [sample=] [capacity=] [half_life=] [min_utility=] [budget=] [interval=] [page=]` | Steers the training live and persists the resulting profile in this database's `settings.ini`; a reopen restores it. The same fields are accepted with a `graph_cache_` prefix by `DB_CONFIG`. |
 | `GRAPH_CACHE get from=<id> to=<id>` / `signature=<sig>` | One row, with both recurrence counters, its usage probability and its current utility. |
 | `GRAPH_CACHE links id=<id> [limit=]` | Every shortcut known from a node. |
@@ -941,9 +947,10 @@ operator or a test that wants the result *now*.
 | `GRAPH_CACHE prune [limit=] [min_utility=] [age=1]` | Force a sweep. `min_utility=` applies to this pass only and is restored afterwards. |
 | `DEL graph_cache [scope=links\|queries\|all] [limit=]` | Erase it. Erasure goes through `DEL` because `DEL` is the protocol's only erasure verb. |
 
-On `GRAPH_RECALL`, `cache=on` (the default) feeds the cache and injects its shortcuts; `cache=off`
-restores the previous behavior exactly; `cache=serve` will additionally answer a repeated comparison
-from the stored convergence, when the graph has not been written since.
+On `GRAPH_RECALL`, `cache=on` (the default) feeds the cache, injects its shortcuts and enables the
+query-shape decay factor; `cache=off` disables all three cache effects and fixes `cache_decay=1`;
+`cache=serve` will additionally answer a repeated comparison from the stored convergence, when the
+graph has not been written since. Relation-specific decay remains independent of this switch.
 
 ```text
 [cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1
@@ -1007,6 +1014,24 @@ everywhere else.
 | `PREDICT_INHERIT_FETCH <job_id>` | `PENDING` while it runs, then the batch results. |
 | `PREDICT_BACKEND [mode=cpu\|gpu] [table=]` | Read or switch which merger a table uses. The "gpu" path is `webgpu-simulated` — CPU fan-out, not a real WebGPU binding. |
 | `PREDICT_BENCH samples= window= [table=]` | Compare the two mergers on this host, so the choice above is measured rather than assumed. |
+
+One prediction table has an optional server-side convention. In `table=graph_recall_decay`, use an
+edge type as `key=` and the exact outcomes `carry` and `stop` as values:
+
+```text
+PREDICT_SET table=graph_recall_decay key=has_breed value=carry prob=0.9
+PREDICT_SET table=graph_recall_decay key=has_breed value=stop prob=0.1
+PREDICT_SET table=graph_recall_decay key=mentioned_near value=carry prob=0.1
+PREDICT_SET table=graph_recall_decay key=mentioned_near value=stop prob=0.9
+```
+
+Recall reads the two base scores with no context, applies a two-way softmax and maps the carry
+probability to a 0.5–1.5 multiplier. It never creates this table merely by reading it: an absent
+table, relation, or either outcome is neutral. `PREDICT_TRAIN` can refine the same rows. The stable
+relation profile digest and the quantized cache factor are both part of a convergence signature, so
+`cache=serve` cannot reuse an answer learned under an older decay model. Every `GRAPH_RECALL`
+response reports the caller's base `decay`, `cache_decay`, the number of modeled
+`decay_relations`, and `decay_profile` (or `-` when neutral).
 
 **In context** — three candidate continuations for the prefix `ctx:the`, then one round of learning
 and one composite token seeded from its parts:
@@ -1482,7 +1507,7 @@ node that does not exist yet (disable with `autocreate=0`).
 | `GRAPH_DEGREE id=<id> [direction=out\|in\|both] [type=<t\|*>] [weighted=0\|1]` | `degree` (plus `weighted_degree` when `weighted=1`). |
 | `GRAPH_NEIGHBOR_TYPES id=<id> [direction=out\|in\|both] [limit=<n>] [cursor=<tok>] [weighted=0\|1]` | `payload=` a compact relation histogram `[{type,count,weighted}]`. |
 | `GRAPH_AMBIGUITY_GET from=<id> group=<g> [direction=out\|in] [limit=<n>]` | `count`, `confidence_sum`, `top`, `top_modality`, and `payload=` the alternatives, strongest first. |
-| `GRAPH_RECALL seeds=<t>[,…] [precision=…] [hops=…] [min_sources=…] [references=0\|1] [reference_limit=…] […]` | `resolved`, `visited`, `expanded`, `references`, `count`, `bridges`, `truncated`, and `payload=` the resolved seeds plus the ranked associations. With `references=1`, each association may include complete stored sentences and episodic source payloads. See [associative recall](#associative-recall--graph_recall-graph_similar). |
+| `GRAPH_RECALL seeds=<t>[,…] [precision=…] [hops=…] [min_sources=…] [references=0\|1] [reference_limit=…] […]` | `resolved`, `visited`, `expanded`, `references`, `count`, `bridges`, `truncated`, base `decay`, adaptive `cache_decay`, `decay_relations`, `decay_profile`, and `payload=` the resolved seeds plus the ranked associations. With `references=1`, each association may include complete stored sentences and episodic source payloads. See [associative recall](#associative-recall--graph_recall-graph_similar). |
 | `GRAPH_RECALL_ASYNC <same arguments>` / `GRAPH_RECALL_STATUS <job_id>` / `GRAPH_RECALL_FETCH <job_id>` | Submit, retrieve progress by id, then consume the final recall response. Generic `JOB status id=` / `JOB fetch id=` accept the same `graph_recall_<n>` id; the generic terminal response retains `job=`. |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=<n>]` | `count`, `truncated`, and `payload=` `[{id,score,context,lexical,shared_count,shared,labels}]`. |
 | `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=<n>] [cursor=<tok>]` | `entries`/`enabled` plus `weighted`, indexed `nodes`, distinct `tokens`, and `trigrams` (stats); `nodes`+`terms`+`next_cursor` (rebuild); `removed` (drop). |
@@ -1570,7 +1595,7 @@ GRAPH_RECALL seeds=<term>[,<term>…]     # free text or node ids; base64:<list>
   [min_sources=<n>]         # 2 = only what several seeds reach: the convergence view
   [direction=out|in|both]   # default both — association is not directional
   [type=<t>[,…]]            # restrict the relations that carry activation
-  [decay=<0..1>]            # activation kept per hop, default 0.55
+  [decay=<0..1>]            # base activation kept per hop, default 0.55; feedback adapts it
   [expand=exact|lexical|synonyms|all]   # how seeds resolve, default all
   [synonym_types=<t>[,…]|-] # default synonym,alias,same_as,aka,abbreviation,acronym
   [references=0|1]           # hydrate complete sentence evidence, default 0
@@ -1590,9 +1615,12 @@ are process-local, and a successful fetch consumes the id.
 Scoring, in one line each:
 
 - **Activation** leaves a seed at its resolution score (1.0 for an exact id) and is multiplied at each
-  edge by `decay × weight × confidence` — so a `possible` edge carries half of what a plain one does,
-  and `precision` is a belief threshold as much as a distance one. It gates seed resolution too: a
-  free-text seed must overlap a node's words by at least `precision` to resolve to it.
+  ordinary edge by `base decay × cache factor × relation factor × weight × confidence`. The cache
+  factor is 0.75–1.25 from that query shape's prior hit rate; a modeled relation is 0.5–1.5 from
+  `graph_recall_decay`; missing evidence is neutral. Thus a `possible` edge still carries half of
+  what a plain one does, and `precision` remains a belief threshold as much as a distance one. It
+  gates seed resolution too: a free-text seed must overlap a node's words by at least `precision`.
+  Declared synonym types keep their fixed synonym decay.
 - **Convergence** combines the seeds in noisy-OR (`1 − Π(1 − aᵢ)`): a node two seeds each reach at
   0.55 scores **0.7975**, above either of their own direct neighbours. `bridge=true` marks it.
 - **`distance`** is conceptual depth: crossing a synonym edge costs a hop but no distance, because an
@@ -1602,7 +1630,7 @@ Scoring, in one line each:
 
 ```text
 [cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=8
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,references=0,count=6,bridges=3,truncated=0,precision=0.100,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15,references=0,count=6,bridges=3,truncated=0,precision=0.100,decay=0.55,cache_decay=1,decay_relations=0,decay_profile=-,payload=<base64>
 # payload decodes to {"seeds":[…],"associations":[
 #   {"id":"city:berlin","score":0.7975,"novelty":0.39875,"distance":1,"source_count":2,"bridge":true,
 #    "sources":[{"seed":"cat:luna","activation":0.55,"hops":1},{"seed":"person:marco","activation":0.55,"hops":1}],
@@ -1611,7 +1639,7 @@ SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=6,hydrated=15
 #   {"id":"breed:siamese","score":0.55,"novelty":0.1375,"distance":1,"source_count":1,…}, …]}
 
 [cheetah_data/default]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=13,hydrated=24,references=0,count=5,bridges=5,truncated=0,precision=0.050,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=2,visited=8,expanded=13,hydrated=24,references=0,count=5,bridges=5,truncated=0,precision=0.050,decay=0.55,cache_decay=1,decay_relations=0,decay_profile=-,payload=<base64>
 # only what more than one seed reaches — the "what do these two have to do with each other?" question
 ```
 

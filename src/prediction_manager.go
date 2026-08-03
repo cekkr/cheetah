@@ -64,6 +64,43 @@ func (pm *PredictionManager) Get(table string) (*PredictionTable, error) {
 	return pt, nil
 }
 
+// GetExisting apre una tabella soltanto se esiste già in memoria o su disco.
+// I lettori opzionali (come il decadimento appreso del grafo) non devono creare
+// una prediction table vuota come effetto collaterale di una query.
+func (pm *PredictionManager) GetExisting(table string) (*PredictionTable, bool, error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.ensureTablesMapLocked()
+	name := pm.sanitizeTableName(table)
+	if existing, ok := pm.tables[name]; ok {
+		return existing, true, nil
+	}
+	path, legacy := pm.tablePaths(name)
+	if _, err := os.Stat(path); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, false, err
+		}
+		if _, legacyErr := os.Stat(legacy); legacyErr != nil {
+			if os.IsNotExist(legacyErr) {
+				return nil, false, nil
+			}
+			return nil, false, legacyErr
+		}
+	}
+	pt, err := newPredictionTable(path, legacy, name)
+	if err != nil {
+		return nil, false, err
+	}
+	pm.tables[name] = pt
+	return pt, true, nil
+}
+
+func (pm *PredictionManager) ensureTablesMapLocked() {
+	if pm.tables == nil {
+		pm.tables = make(map[string]*PredictionTable)
+	}
+}
+
 func (pm *PredictionManager) Close() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()

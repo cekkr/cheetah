@@ -27,7 +27,7 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `binary` | The byte-wise transport: frames, value type tags, `BinarySession`, `encode_command_line`/`decode_response`, `encode_request` for explicitly typed arguments. |
 | `alias` | `ALIAS` — what a client cannot derive on its own: `list_commands`, `list_argument_keys`, `resolve_command`, `describe_types`, `table_profile`, `list_profiles`, `alias_digest`, `load_session`. |
 | `kv` | The two-step write and its reads: `put_value`/`get_value`, `put_json`/`get_json`, `put_bytes`/`get_bytes`, `put_values_batch` (`PAIR_PUT_BATCH`), `delete_pair`, `pair_purge`, `scan_page`/`scan_prefix`/`scan_all`, `pair_summary`. |
-| `graph` | The whole `GRAPH_*` surface: nodes, edges (single and batch), `neighbors`/`degree`/`neighbor_types`, `query`, `recall`/`recall_batched`, detached `recall_async`/`fetch_recall`/`await_recall`, `similar`, `term_index` (including `weighted`/`tokens`/`trigrams` stats), and the ambiguity trio. |
+| `graph` | The whole `GRAPH_*` surface: nodes, edges (single and batch), `neighbors`/`degree`/`neighbor_types`, `query`, `recall`/`recall_batched`, detached `recall_async`/`fetch_recall`/`await_recall`, `similar`, `term_index` (including `weighted`/`tokens`/`trigrams` stats), and the ambiguity trio. Recall results expose base `decay`, adaptive `cache_decay`, `decay_relations`, and `decay_profile`. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `set_row`, `get_row`, `scan`/`iter_rows`, `delete_row`, `drop_table`, plus `field_spec`. |
 | `jobs` | The `JOB` micro-command: `submit`, `status`, `fetch`, `results`, `await_job`, `supports_job_api`. |
 | `batch` | `BATCH` — one command, N argument sets, one round trip: `build_batch`, `run_batch`, `run_batch_chunked`, `run_batch_async`, `batch`, `parse_batch_response`, plus `BatchCollector`/`AutoBatchPolicy`, the client-level coalescing. |
@@ -116,6 +116,10 @@ to prevent.
   truncated. Free-text `GRAPH_RECALL` seeds travel as `base64:<…>`.
   `GRAPH_RECALL` also caps seeds at 32 per call; `graph.recall_batched` batches
   above that and merges with the same noisy-OR the server uses within a batch.
+- **Recall decay diagnostics are outputs, not extra client policy.** `graph.recall`
+  returns `decay`, `cache_decay`, `decay_relations`, and `decay_profile`; teach
+  relation-specific decay through `predict` with table `graph_recall_decay` and
+  exact values `carry`/`stop`.
 - **`GRAPH_NODE_SET references=` replaces the stored list**, it does not merge.
   Read the node back and write the union if you mean to extend provenance; `-`
   clears it.

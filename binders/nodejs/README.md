@@ -28,7 +28,7 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `binary` | The byte-wise transport: frames, value type tags, `BinarySession`, `encodeCommandLine`/`decodeResponse`, `encodeRequest` for explicitly typed arguments. |
 | `alias` | `ALIAS` — what a client cannot derive on its own: `listCommands`, `listArgumentKeys`, `resolveCommand`, `describeTypes`, `tableProfile`, `listProfiles`, `aliasDigest`, `loadSession`. |
 | `kv` | The two-step write and its reads: `putValue`/`getValue`, `putJson`/`getJson`, `putJsonBatch`, `insert`, `editAbsoluteKey`, `readAbsoluteKey`, `pairSet` (with `hidden`), `deletePair`, `deleteValue`, `purgePrefix`, `pairSummary`, `scanPage`/`scanPrefix`/`scanAll`. |
-| `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `recallAsync`, `fetchRecall`, `awaitRecall`, `similar`, `termIndex` (including `weighted`/`tokens`/`trigrams` stats). Plus a pure `build*` for each command, for callers assembling their own batch. |
+| `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `recallAsync`, `fetchRecall`, `awaitRecall`, `similar`, `termIndex` (including `weighted`/`tokens`/`trigrams` stats). Recall results expose base `decay`, adaptive `cacheDecay`, `decayRelations`, and `decayProfile`. Plus a pure `build*` for each command, for callers assembling their own batch. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `setRow`, `getRow`, `scanPage`/`scanRows`/`scanAll`, `deleteRow`, `dropTable`, plus `fieldSpec` and a pure `build*` for each command. |
 | `jobs` | Detached commands over the `JOB` envelope: `submit`, `status`, `fetch`, `results`, `awaitJob`, `supportsJobApi`. |
 | `batch` | `BATCH` — one command, N argument sets, one round trip: `buildBatch`, `runBatch`, `runBatchChunked`, `runBatchAsync`, `batch`, `parseBatchResponse`, plus `CommandBatcher`, the coalescer `CheetahClient` runs by itself. |
@@ -118,6 +118,10 @@ to prevent.
   space, so anything free-form travels base64 (`graph.encodeJsonArgument`).
   `GRAPH_RECALL` also caps seeds at 32 per call; `recallBatched` batches above
   that and merges with the same noisy-OR the server uses within a batch.
+- **Recall decay diagnostics are outputs, not extra client policy.** `recall` returns
+  `decay`, `cacheDecay`, `decayRelations` and `decayProfile`; teach relation-specific
+  decay through the existing prediction helpers with table `graph_recall_decay` and
+  `carry`/`stop` values.
 - **Omitting a graph field preserves it; clearing it is a different spelling.**
   `GRAPH_NODE_SET` keeps stored labels/props/references when the argument is
   absent, so `references: undefined` is "leave them alone" and `references:

@@ -492,6 +492,10 @@ type graphRecallOptions struct {
 	CacheLimit int
 	// class è la forma della query, su cui la cache allena la sua ammissione.
 	class int
+	// Feedback interni preparati una volta prima della diffusione. Non sono
+	// opzioni di protocollo: il decay dichiarato resta la base leggibile.
+	cacheDecayFactor     float64
+	relationDecayProfile *graphRelationDecayProfile
 }
 
 const (
@@ -1426,12 +1430,12 @@ func (db *Database) graphRecallSpread(
 			}
 			for i := range links {
 				link := links[i]
-				decay := opts.Decay
+				synonym := opts.isSynonymType(link.Edge.Type)
 				depth := item.Depth + 1
-				if opts.isSynonymType(link.Edge.Type) {
-					decay = graphRecallSynonymDecay
+				if synonym {
 					depth = item.Depth
 				}
+				decay := opts.effectiveDecay(link.Edge.Type, synonym)
 				activation := item.Activation * decay * graphRecallAffinity(&link.Edge)
 				if activation < floor {
 					continue
@@ -1703,6 +1707,7 @@ func (db *Database) executeGraphRecall(
 	opts *graphRecallOptions,
 	progress func(completed int, total int),
 ) ([]microField, error) {
+	db.graphPrepareRecallDecay(opts)
 	resolutions, unresolved, err := db.graphResolveRecallSeeds(opts)
 	if err != nil {
 		return nil, err
@@ -1818,6 +1823,10 @@ func graphRecallResponseFields(
 		mfi("bridges", bridges),
 		mfi("truncated", boolToInt(truncated)),
 		mf("precision", fmt.Sprintf("%.3f", opts.Precision)),
+		mf("decay", formatGraphCacheFloat(opts.Decay)),
+		mf("cache_decay", formatGraphCacheFloat(opts.cacheDecay())),
+		mfi("decay_relations", opts.relationDecayProfile.count()),
+		mf("decay_profile", graphRecallDecayProfileToken(opts.relationDecayProfile)),
 		mf("cache", cacheState),
 		mfi("cache_injected", cacheInjected),
 		mfi("cache_links", cacheLinks),

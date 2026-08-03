@@ -373,7 +373,10 @@ class FakeCheetahServer:
         payload = base64.b64encode(
             json.dumps({"seeds": seeds, "associations": associations}).encode("utf-8")
         ).decode("ascii")
-        return f"SUCCESS,command=GRAPH_RECALL,count={len(associations)},payload={payload}"
+        return (
+            f"SUCCESS,command=GRAPH_RECALL,count={len(associations)},decay=0.55,"
+            f"cache_decay=1.1,decay_relations=2,decay_profile=abcd,payload={payload}"
+        )
 
     # -- jobs ----------------------------------------------------------- #
     def _do_job(self, rest: str) -> str:

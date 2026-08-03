@@ -256,8 +256,8 @@ func (t *commandIndexTable) lookupID(id uint16) (commandIndexEntry, bool) {
 
 var argumentKeyNames = []string{
 	"action", "add", "algorithm", "ambiguity", "backend", "branch_limit", "budget",
-	"changed", "command", "compact", "confidence", "continue_on_error", "cost_limit",
-	"count", "cursor", "database", "depth", "direction", "drop", "edge",
+	"cache_decay", "changed", "command", "compact", "confidence", "continue_on_error", "cost_limit",
+	"count", "cursor", "database", "decay_profile", "decay_relations", "depth", "direction", "drop", "edge",
 	"encoding", "entries", "expand", "fields", "field", "filter", "from", "generation",
 	"global_capacity", "global_databases", "global_entries", "group", "hidden", "hops", "hidden_only", "id", "if_not_exists", "items",
 	"indexed", "key", "keys", "kind", "label", "labels", "limit", "matrix", "mode",

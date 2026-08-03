@@ -495,6 +495,10 @@ def _recall_result(response: Response, job_id: str | None = None) -> dict[str, A
         "seeds": payload.get("seeds") or [],
         "associations": payload.get("associations") or [],
         "truncated": (numeric_field(response.fields, "truncated", 0) or 0) > 0,
+        "decay": numeric_field(response.fields, "decay", 0) or 0,
+        "cache_decay": numeric_field(response.fields, "cache_decay", 1) or 1,
+        "decay_relations": numeric_field(response.fields, "decay_relations", 0) or 0,
+        "decay_profile": response.field_value("decay_profile"),
         "response": response,
     }
     resolved_job_id = response.field_value("job", job_id)

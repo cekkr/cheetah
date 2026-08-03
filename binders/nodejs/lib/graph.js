@@ -508,6 +508,10 @@ function recallResult(response, jobId = null) {
         associations: payload.associations || [],
         references: numericField(response.fields, 'references', 0),
         truncated: numericField(response.fields, 'truncated', 0) > 0,
+        decay: numericField(response.fields, 'decay', 0),
+        cacheDecay: numericField(response.fields, 'cache_decay', 1),
+        decayRelations: numericField(response.fields, 'decay_relations', 0),
+        decayProfile: response.fields.decay_profile || null,
     };
     const resolvedJobId = response.fields.job || jobId;
     if (resolvedJobId) result.jobId = resolvedJobId;

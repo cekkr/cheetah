@@ -313,6 +313,14 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   single answer — only how fast it arrives. A cached shortcut therefore enters a recall as evidence
   marked `cached` (a dedicated `graphRecallEdgeView.Cached` bool, **not** a reserved edge type, which
   a user-declared type could always collide with), never as an edge.
+- **Recall decay has two independent, bounded feedback factors.** A query shape's cache class maps
+  its smoothed hit-rate bias to a quantized 0.75–1.25 multiplier only after 32 lookups;
+  `cache=off` fixes this factor at 1. Relation factors come from the optional prediction table
+  `graph_recall_decay`, keyed by edge type with exact outcomes `carry` and `stop`: the two-way softmax
+  maps to 0.5–1.5, while an absent table/key/outcome is neutral. Optional reads MUST use
+  `PredictionManager.GetExisting` so ordinary recall never creates the table. The quantized cache
+  factor and stable relation-profile digest belong in convergence signatures, or `cache=serve` can
+  return a result computed under stale learned decay. Synonym edges keep their fixed 0.95 decay.
 - **A completed graph-cache maintenance lap is also its entry-count census.** The process-local
   counter intentionally starts at zero on reopen so startup never blocks on a namespace scan. Each
   sweep page counts the live `l/` and `q/` rows it retains; on wrap, the census replaces the estimate
@@ -400,6 +408,7 @@ client ── TCP ──►  server.go (per-conn loop; text or binary frames)   
                  ├─ reducers.go        PAIR_REDUCE counts/probs/continuations + graph degree/triangle/pagerank
                  ├─ graph.go           GRAPH_* nodes/edges/adjacency/query
                  │    ├─ graph_recall.go  GRAPH_RECALL/SIMILAR/TERM_INDEX (associative recall)
+                 │    ├─ graph_decay.go   cache-shape + relation-specific activation decay
                  │    └─ graph_cache.go   \x07gc: shortcut + convergence cache, self-training
                  ├─ record_*.go        RECORD multi-field tables (schema + rows + derived indexes)
                  ├─ prediction_*.go    PREDICT_* tables + context matrices
@@ -946,8 +955,8 @@ evaluation/training, and the simulated GPU merge path.
 Per-database registry of named prediction tables, sanitizing table names into
 `prediction_<name>.table` paths.
 
-- **Key symbols:** `PredictionManager`, `Get` (open-or-create), `tablePaths`, `sanitizeTableName`,
-  `ListTables`, `Close`.
+- **Key symbols:** `PredictionManager`, `Get` (open-or-create), `GetExisting` (optional read without
+  creating an empty table), `tablePaths`, `sanitizeTableName`, `ListTables`, `Close`.
 
 ### Graph store
 
@@ -986,7 +995,9 @@ next query.
   `graphResolveRecallTerm`/`graphSynonymsOf`; traversal `graphRecallLinks`, `graphRecallSpread`,
   `(*graphRecallRun).touch`/`path`/`associations`; bounded sentence hydration
   `graphHydrateAssociationEvidence` (node references + episodic `edge.props.src`); shared execution
-  `executeGraphRecall`/`graphRecallResponseFields`; handlers `handleGraphRecall`, `handleGraphSimilar`
+  `executeGraphRecall`/`graphRecallResponseFields`; adaptive decay is prepared by
+  `graphPrepareRecallDecay` in [`graph_decay.go`](src/graph_decay.go); handlers `handleGraphRecall`,
+  `handleGraphSimilar`
   (with `graphSimilarMatches`), `handleGraphTermIndex`.
 - **Cache hooks:** `graphRecallInjectCache` puts remembered shortcuts into the frontier *alongside the
   seeds* (a link that had cost three hops now costs zero and the spread restarts from there with the
@@ -997,7 +1008,7 @@ next query.
   and [`graph_uncertainty.go`](src/graph_uncertainty.go) (`graphEffectiveConfidence`/`Modality`, and the
   modality scale, which `precision=` reuses so `precision=probable` means 0.75).
   **Tests:** [`graph_recall_test.go`](src/graph_recall_test.go),
-  [`graph_cache_test.go`](src/graph_cache_test.go).
+  [`graph_cache_test.go`](src/graph_cache_test.go), [`graph_decay_test.go`](src/graph_decay_test.go).
 - **Common mistakes:** activation is combined across seeds with **noisy-OR**, so a node can pass
   `precision` even when no single seed reaches it — the frontier is therefore pruned at
   `precision / seeds` (floored at `graphRecallMinActivation`), never at `precision`; tightening that
@@ -1005,6 +1016,21 @@ next query.
   depth), which is not the `hops` reported per source. Traversal never hydrates node records — labels
   are read only for the items that survive the limit. When equal activations compete for the one
   displayed `via`, choose the lexical seed; map iteration must not make identical recalls differ.
+
+#### [`src/graph_decay.go`](src/graph_decay.go)
+
+Bridges cache evidence and prediction tables into bounded per-hop activation factors without making
+either subsystem authoritative.
+
+- **Key symbols:** `graphRelationDecayProfile`, `graphLoadRelationDecayProfile`,
+  `graphRelationCarryProbability`, `graphPrepareRecallDecay`,
+  `(*graphRecallOptions).effectiveDecay`/`cacheDecay`/`relationDecay`.
+- **Convention:** table `graph_recall_decay`, key = edge type, values = exact bytes `carry` and
+  `stop`. Only a complete pair participates. Scores are read with empty context and normalized by a
+  two-way softmax; the table is never auto-created on recall.
+- **Common mistakes:** keep cache feedback and relation learning independent (`cache=off` disables
+  only the former); never apply learned factors to synonym edges; keep profile hashing sorted and
+  stable because it is part of the convergence key.
 
 #### [`src/graph_term_index.go`](src/graph_term_index.go)
 
@@ -1052,10 +1078,10 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
   `usageProbability`), `graphCacheStore` (`observeLink`, `observeCommon`, `observeRun`,
   `lookupCommon`, `linksOf`, `sweep`, `maintain`, `countEntries`, `adjustEntries`,
   `reserveEntrySlot`, `cancelEntrySlot`, `commitEntrySlot`, `invalidateEntrySweep`, `CloseAndWait`),
-  `admissionProbability`, `graphCacheClass`/`retune`, `graphCacheSignature`, `graphCacheClassOf`,
+  `admissionProbability`, `graphCacheClass`/`retune`/`decayMultiplier`, `graphCacheSignature`, `graphCacheClassOf`,
   `graphCacheLinkKey`/`graphCacheQueryKey`, the epoch (`currentEpoch`, `bumpEpoch`,
   `graphCacheBumpEpoch`), `graphCacheConfig`.
-- **The three training mechanisms, and why all three are needed.** *Sampled admission*: a pair never
+- **The four training mechanisms, and why the first three are needed.** *Sampled admission*: a pair never
   seen before is written only with a probability raised by the association's strength, by its
   distance (an adjacent neighbour is no shortcut — the graph already finds it — so it is damped to
   30%) and by the learned bias of that **query shape**. A one-off is almost never stored; something
@@ -1065,6 +1091,8 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
   earning its place. *Continuous pruning + compression*: the maintainer decays utility, drops what
   falls under threshold, and halves survivors' counters on every completed lap, so the numbers stay
   small and comparable and an old-and-famous row cannot outrank a new-and-useful one forever.
+  *Recall feedback*: after 32 lookups the same class bias maps to a 0.75–1.25 decay multiplier,
+  quantized in 0.05 steps. `GRAPH_CACHE stats` exposes it as `decay_factor` in each class view.
 - **The maintainer needs no command.** It backs off the moment `ResourceMonitor` reports CPU ≥ 80/85%
   or memory pressure ≥ 0.90, sizes its page from `RecommendedWorkers`, and stretches its interval up
   to 32× while it finds nothing — the same degrade-don't-stall posture as reducers and scans. It
@@ -1085,7 +1113,8 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
   `deletePairAndPayload`), [`database.go`](src/database.go) (`PairScanWithOptions`),
   [`graph_recall.go`](src/graph_recall.go) (options, run, associations),
   [`graph_cache_budget.go`](src/graph_cache_budget.go) (process coordinator).
-  **Tests:** [`graph_cache_test.go`](src/graph_cache_test.go).
+  **Tests:** [`graph_cache_test.go`](src/graph_cache_test.go),
+  [`graph_decay_test.go`](src/graph_decay_test.go).
 - **Common mistakes:** do not make the link key symmetric — the two directions are two different
   facts with two different recurrences. Do not skip the `read` before admitting: reinforcement of an
   existing row must never be sampled, or recurrence stops meaning recurrence. Do not let the sweep
@@ -1366,7 +1395,7 @@ the key staying **directed** (a shortcut `a→b` must not answer for `b`); `hits
 counted apart into a usage probability; decay-driven pruning and counter-halving compression;
 convergences going stale on a graph write and the staleness counted apart from a miss; signature
 canonicality (seed order irrelevant, parameters not); a cached shortcut putting a node in reach that
-one hop could not have reached, with `cache=off` restoring the old behavior exactly; write-back of
+one hop could not have reached, with `cache=off` disabling shortcut injection; write-back of
 both shortcuts and convergences and `cache=serve` answering from them; a truncated run refusing to
 memoise; the whole `GRAPH_CACHE` surface plus `DEL graph_cache`; the maintainer pruning **without
 being asked**; per-query-shape bias following hit rate; cache rows staying out of ordinary scans;
@@ -1376,6 +1405,14 @@ deletion retaining the other family's count; and `CHEETAH_GRAPH_CACHE=0`.
 Provides `forceGraphCache`, which makes
 the sampling and the clock deterministic. Builds on `newRecallTestDB`/`seedRecallGraph` from
 [`graph_recall_test.go`](src/graph_recall_test.go).
+
+#### [`src/graph_decay_test.go`](src/graph_decay_test.go)
+
+The two recall-decay feedback loops: per-query-shape hit rates stay neutral below the sample floor,
+then lower/raise a quantized cache multiplier; `cache=off` fixes only that factor at 1. Relation rows
+in `graph_recall_decay` alter traversal per edge type, incomplete rows stay neutral, a missing
+optional table is not created, training changes the convergence signature, and the learned profile
+survives reopen.
 
 #### [`src/command_alias_test.go`](src/command_alias_test.go)
 
@@ -1766,9 +1803,12 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   bounded trigram/edit-distance repair when an exact token misses, and through declared synonym
   edges. Node `references` store complete readable sentences and feed the lexical index;
   `references=1 [reference_limit=…]` returns them plus episodic payloads cited by `edge.props.src`.
+  The caller's `decay` is a base: a quantized query-shape cache factor and an optional learned
+  relation factor adapt ordinary edges, while missing evidence and synonym edges stay neutral/fixed.
+  Responses expose `decay`, `cache_decay`, `decay_relations`, and `decay_profile`.
   `GRAPH_SIMILAR id=<node>` answers "what else is like this" from shared neighbours (distributional)
   and shared id words (lexical). `GRAPH_TERM_INDEX action=stats|rebuild|drop` maintains the index.
-- **Owners:** [`graph_recall.go`](src/graph_recall.go),
+- **Owners:** [`graph_recall.go`](src/graph_recall.go), [`graph_decay.go`](src/graph_decay.go),
   [`graph_term_index.go`](src/graph_term_index.go); node-write hooks in
   [`graph.go`](src/graph.go) (`handleGraphNodeSet`, `graphEnsureNode`) and in
   [`micro_del.go`](src/micro_del.go) (`microDelGraphNode`, which took over `handleGraphNodeDel`).
@@ -1788,11 +1828,13 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 - **Behavior:** `GRAPH_RECALL` learns. Every run proposes what it discovered to a cache of *parallel,
   implicit tables* under `\x07gc:` — `l/<from>/<to>` shortcuts and `q/<signature>` convergences — and
   every later run reads them back for free. `cache=on` (the default) feeds the cache and injects its
-  shortcuts into the frontier; `cache=off` restores the previous behavior exactly; `cache=serve`
+  shortcuts into the frontier; `cache=off` disables cache injection/write-back/serving and fixes its
+  decay factor at 1; `cache=serve`
   additionally answers a repeated comparison from the stored convergence when the graph has not been
   written since. `GRAPH_CACHE stats/config/get/links/common/put/prune` inspects and steers it,
   `DEL graph_cache [scope=links|queries|all]` erases it. New response fields on `GRAPH_RECALL`:
-  `cache=`, `cache_injected=`, `cache_links=`, `cache_common=`.
+  `cache=`, `cache_injected=`, `cache_links=`, `cache_common=`, `cache_decay=`,
+  `decay_relations=`, `decay_profile=`.
 - **Why it is a cache and not an index:** what is expensive here is not reading a node, it is
   *comparing many things to find what they share*. A convergence memoises that comparison whole; a
   shortcut memoises one hidden link that cost several hops to find. Both are throwaway — dropping
@@ -1803,14 +1845,16 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   continuously at a cadence set by free resources. Per **query shape** (hops, min_sources, direction,
   type filter, seed-count bucket → one of 64 slots) the cache tracks its own hit rate and raises or
   lowers that shape's admission bias, so the sampling budget follows the queries that actually read
-  it back. Nothing about this needs a command: `GRAPH_CACHE prune` exists for operators and tests.
+  it back. After 32 samples that same evidence also adjusts recall decay by a quantized 0.75–1.25
+  factor; `cache=off` makes it exactly neutral. Nothing about this needs a command: the prune action
+  exists for operators and tests.
 - **Owners:** [`graph_cache.go`](src/graph_cache.go),
   [`graph_cache_budget.go`](src/graph_cache_budget.go),
   [`micro_graph_cache.go`](src/micro_graph_cache.go),
   the hooks in [`graph_recall.go`](src/graph_recall.go), the epoch bump in [`graph.go`](src/graph.go),
   the store field/shutdown in [`database.go`](src/database.go), and the coordinator attachment in
   [`engine.go`](src/engine.go). **Tests:**
-  [`graph_cache_test.go`](src/graph_cache_test.go).
+  [`graph_cache_test.go`](src/graph_cache_test.go), [`graph_decay_test.go`](src/graph_decay_test.go).
 - **Constraints:** injection is bounded by `cache_limit` (default 64, max 256) and by the same
   activation `floor` as real spreading, so a fat cache cannot widen a recall past what was asked; a
   **truncated** run never memoises its convergence, because its "nothing in common" is a budget
@@ -1917,7 +1961,9 @@ value; encoding those code units as UTF-8 a second time turns `é` into `Ã©` a
 ### Prediction tables + context matrices — Shipped (GPU path simulated)
 
 - **Behavior:** `PREDICT_SET/QUERY/TRAIN/CTX/INHERIT(+batch/async)/BACKEND/BENCH` over fixed-byte
-  tables with context-matrix weighting and multi-window merges.
+  tables with context-matrix weighting and multi-window merges. The optional conventional table
+  `graph_recall_decay` supplies relation-specific recall factors from complete `carry`/`stop` rows;
+  recall reads it without creating it.
 - **Owners:** [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go),
   [`jobs.go`](src/jobs.go) + [`micro_job.go`](src/micro_job.go) for the async inherit.
 - **Constraints:** the "GPU" backend is `webgpu-simulated` (CPU fan-out), not a real WebGPU binding.
@@ -2039,7 +2085,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `PAIR_REDUCE` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go); its async forms go through [`jobs.go`](src/jobs.go) |
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
-| `GRAPH_RECALL` (including bounded complete references and the shared sync/job execution path), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go), [`graph_term_index.go`](src/graph_term_index.go), [`micro_job.go`](src/micro_job.go) |
+| `GRAPH_RECALL` (including bounded complete references, adaptive decay, and the shared sync/job execution path), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go), [`graph_decay.go`](src/graph_decay.go), [`graph_term_index.go`](src/graph_term_index.go), [`micro_job.go`](src/micro_job.go) |
 | `GRAPH_CACHE stats/config/get/links/common/put/prune`, `DEL graph_cache` | [`micro_graph_cache.go`](src/micro_graph_cache.go), [`graph_cache.go`](src/graph_cache.go), [`graph_cache_budget.go`](src/graph_cache_budget.go), [`engine.go`](src/engine.go) |
 | `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`jobs.go`](src/jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
@@ -2260,6 +2306,8 @@ seen in old docs are **client-side**; the server does not read them.
 | A truncated run never memoises its comparison | [`TestGraphRecallDoesNotMemoriseTruncatedComparisons`](src/graph_cache_test.go) |
 | The maintainer prunes with no command issued | [`TestGraphCacheMaintainerRunsWithoutBeingAsked`](src/graph_cache_test.go) |
 | Per-query-shape admission bias follows the observed hit rate | [`TestGraphCacheClassBiasFollowsHitRate`](src/graph_cache_test.go) |
+| Per-query-shape cache hit rates become a bounded quantized recall-decay factor; `cache=off` is neutral | [`TestGraphCacheHitRateFeedsRecallDecayByQueryShape`](src/graph_decay_test.go) |
+| Complete `graph_recall_decay` carry/stop rows alter relations, training changes signatures, and the profile survives reopen | [`TestGraphRecallReadsRelationSpecificDecayFromPredictionTable`, `TestGraphRecallDecayPredictionProfileSurvivesReopen`](src/graph_decay_test.go) |
 | Cache rows stay hidden from ordinary scans; the epoch survives a reopen | [`TestGraphCacheEntriesStayHidden`, `TestGraphCacheEpochSurvivesReopen`](src/graph_cache_test.go) |
 | A post-reopen cache lap restores the count; a concurrent admission invalidates the lap and a quiet retry converges | [`TestGraphCacheSweepRecountsAfterReopenAndEnforcesCapacity`, `TestGraphCacheSweepCensusRetriesAfterConcurrentMutation`](src/graph_cache_test.go) |
 | Scoped graph-cache deletion preserves the other family's entry count | [`TestGraphCacheScopedDeletePreservesRemainingEntryCount`](src/graph_cache_test.go) |
@@ -2364,7 +2412,8 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   index.
 - Associative recall: multi-seed `GRAPH_RECALL` with noisy-OR convergence, bounded complete node/
   episodic reference hydration, `GRAPH_SIMILAR`, and the `\x05gt:` lexical term index behind
-  `GRAPH_TERM_INDEX`, including IDF frequencies and bounded typo repair.
+  `GRAPH_TERM_INDEX`, including IDF frequencies and bounded typo repair. Recall decay adapts from
+  quantized per-query-shape cache evidence and optional relation-specific prediction rows.
 - Real-time association cache under `\x07gc:`: `GRAPH_RECALL` writes back the shortcuts and the
   convergences it discovers and reads them again for free, with sampled admission, `hits`/
   `observations` recurrence, and a resource-aware maintainer that prunes and compresses continuously
@@ -2387,14 +2436,14 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - **Node.js binder** ([`binders/nodejs/`](binders/nodejs/)) — dependency-free client: codec, pooled
   TCP client, KV/graph/record/job/prediction/admin helpers, key primitives, token vocabulary,
   subclassable `CheetahDatabase`, the binary transport and the `ALIAS` discovery layer, and a
-  test-server launcher. Verified by its own suite (138 passing unit tests, one gated integration test) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
+  test-server launcher. Verified by its own suite (143 passing unit tests, one gated integration test) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
   UTF-8 payloads, batch writes, cursor paging, the `continuations` reducer, vocabulary allocation,
   `GRAPH_RECALL` convergence, a record table through define/partial-write/add/drop/compact/drop,
   `DB_CREATE` with its own settings, a detached `JOB` reduce, server gauges, subclass lifecycle,
   layout-mismatch refusal, `RESET_DB` across a pool, pipelining).
 - **Python binder** ([`binders/python/`](binders/python/)) — standard-library-only client covering
   the same surface, with the differences that follow from a synchronous host (no pipelining; one
-  socket per thread; binary payloads base64 rather than latin1). Verified by its own suite (176 passing
+  socket per thread; binary payloads base64 rather than latin1). Verified by its own suite (180 passing
   tests against an in-memory stand-in, 14 gated integration skips) plus a live round-trip against a spawned server
   (`CHEETAH_INTEGRATION=1`, 14 tests: UTF-8 and binary payloads, `PAIR_PUT_BATCH`, hidden pairs,
   cursor paging, the `continuations` reducer, graph write/degree/recall, record-table lifecycle and
@@ -2428,11 +2477,9 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))
 
-1. Feed association-cache hit rates into recall decay, then learn relation-specific decay from the
-   prediction tables.
-2. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
-3. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
-4. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.
+1. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
+2. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
+3. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.
 
 ---
 
