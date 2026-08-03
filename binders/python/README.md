@@ -27,7 +27,7 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `binary` | The byte-wise transport: frames, value type tags, `BinarySession`, `encode_command_line`/`decode_response`, `encode_request` for explicitly typed arguments. |
 | `alias` | `ALIAS` — what a client cannot derive on its own: `list_commands`, `list_argument_keys`, `resolve_command`, `describe_types`, `table_profile`, `list_profiles`, `alias_digest`, `load_session`. |
 | `kv` | The two-step write and its reads: `put_value`/`get_value`, `put_json`/`get_json`, `put_bytes`/`get_bytes`, `put_values_batch` (`PAIR_PUT_BATCH`), `delete_pair`, `pair_purge`, `scan_page`/`scan_prefix`/`scan_all`, `pair_summary`. |
-| `graph` | The whole `GRAPH_*` surface: nodes, edges (single and batch), `neighbors`/`degree`/`neighbor_types`, `query`, `recall`/`recall_batched`, `similar`, `term_index`, and the ambiguity trio. |
+| `graph` | The whole `GRAPH_*` surface: nodes, edges (single and batch), `neighbors`/`degree`/`neighbor_types`, `query`, `recall`/`recall_batched`, detached `recall_async`/`fetch_recall`/`await_recall`, `similar`, `term_index`, and the ambiguity trio. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `set_row`, `get_row`, `scan`/`iter_rows`, `delete_row`, `drop_table`, plus `field_spec`. |
 | `jobs` | The `JOB` micro-command: `submit`, `status`, `fetch`, `results`, `await_job`, `supports_job_api`. |
 | `batch` | `BATCH` — one command, N argument sets, one round trip: `build_batch`, `run_batch`, `run_batch_chunked`, `run_batch_async`, `batch`, `parse_batch_response`, plus `BatchCollector`/`AutoBatchPolicy`, the client-level coalescing. |
@@ -136,6 +136,10 @@ to prevent.
   from two buckets to three.
 - **Jobs live in memory.** `JOB fetch` consumes the job and a restart loses it,
   so treat `job_not_found` as terminal rather than retrying.
+- **Detached recall is retrieved by id.** `graph.recall_async(...)` returns a
+  `graph_recall_<n>` handle; pass it to `graph.fetch_recall` or
+  `graph.await_recall`. Omitting `budget` selects the server's maximum bounded
+  detached sweep; an explicit value remains the limit.
 
 ## Record tables — several fields, one row
 
@@ -330,7 +334,7 @@ Inherited: `connect`/`close`/`reset`, `conn`, `get_value`/`put_value`,
 `get_json`/`put_json`/`put_json_batched`, `delete_pair`, `scan`/`scan_all`/
 `scan_json`, `mutate_json`, `allocate_random_id`, `timestamp`, `pair_summary`/
 `namespace_summary`, and the graph surface (`set_node`, `get_node`,
-`set_edge_batch`, `degree`, `recall`).
+`set_edge_batch`, `degree`, `recall`, `recall_async`, `fetch_recall`, `await_recall`).
 
 Hooks for subclasses: `on_connect(conn)` and `clear_caches()`.
 

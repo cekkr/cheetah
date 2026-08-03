@@ -28,7 +28,7 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `binary` | The byte-wise transport: frames, value type tags, `BinarySession`, `encodeCommandLine`/`decodeResponse`, `encodeRequest` for explicitly typed arguments. |
 | `alias` | `ALIAS` — what a client cannot derive on its own: `listCommands`, `listArgumentKeys`, `resolveCommand`, `describeTypes`, `tableProfile`, `listProfiles`, `aliasDigest`, `loadSession`. |
 | `kv` | The two-step write and its reads: `putValue`/`getValue`, `putJson`/`getJson`, `putJsonBatch`, `insert`, `editAbsoluteKey`, `readAbsoluteKey`, `pairSet` (with `hidden`), `deletePair`, `deleteValue`, `purgePrefix`, `pairSummary`, `scanPage`/`scanPrefix`/`scanAll`. |
-| `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `similar`, `termIndex`. Plus a pure `build*` for each command, for callers assembling their own batch. |
+| `graph` | Nodes and edges: `setNode` (labels, props, `references`), `getNode`, `deleteNode`, `setEdge`, `getEdge`, `deleteEdge`, `setEdgeBatch`. Adjacency: `neighbors`, `neighborsAll`, `neighborTypes`, `degree`. Queries: `query`, `recall`, `recallBatched`, `recallAsync`, `fetchRecall`, `awaitRecall`, `similar`, `termIndex`. Plus a pure `build*` for each command, for callers assembling their own batch. |
 | `records` | Multi-field tables: `define`, `alter`, `compact`, `schema`, `tables`, `setRow`, `getRow`, `scanPage`/`scanRows`/`scanAll`, `deleteRow`, `dropTable`, plus `fieldSpec` and a pure `build*` for each command. |
 | `jobs` | Detached commands over the `JOB` envelope: `submit`, `status`, `fetch`, `results`, `awaitJob`, `supportsJobApi`. |
 | `batch` | `BATCH` — one command, N argument sets, one round trip: `buildBatch`, `runBatch`, `runBatchChunked`, `runBatchAsync`, `batch`, `parseBatchResponse`, plus `CommandBatcher`, the coalescer `CheetahClient` runs by itself. |
@@ -254,7 +254,7 @@ a failure harder to read.
 ## Databases, jobs and the server
 
 ```js
-const { admin, jobs } = require('cheetah-db');
+const { admin, graph, jobs } = require('cheetah-db');
 
 // A database of its own, with settings that override the server's [database]
 // section for this database alone and persist next to its data.
@@ -264,6 +264,11 @@ await admin.listDatabases(pool);        // name, path, loaded, adHoc, settings
 // A sweep too long for one round trip.
 const jobId = await jobs.submit(pool, 'PAIR_REDUCE counts ctx: 4096');
 const result = await jobs.awaitJob(pool, jobId, { pollIntervalMs: 2000 });
+
+// Wide recall returns the same kind of retrieval handle. Omitting budget asks
+// the server for its maximum bounded detached sweep.
+const recallId = await graph.recallAsync(pool, { seeds: ['cat:luna', 'person:marco'], hops: 4 });
+const recalled = await graph.awaitRecall(pool, recallId, { pollIntervalMs: 2000 });
 
 await admin.systemStats(pool);          // gauges; `NA` reads as null, never 0
 ```
@@ -321,7 +326,8 @@ class ArticleStore extends CheetahDatabase {
 Inherited: `connect`/`close`/`reset`, `withConnection`, `getValue`/`putValue`,
 `getJson`/`putJson`/`putJsonBatched`, `deletePair`, `scan`/`scanAll`/`scanJson`,
 `mutateJson`, `allocateRandomId`, `timestamp`, `pairSummary`/`namespaceSummary`,
-and the graph surface (`setNode`, `getNode`, `setEdgeBatch`, `degree`, `recall`).
+and the graph surface (`setNode`, `getNode`, `setEdgeBatch`, `degree`, `recall`,
+`recallAsync`, `fetchRecall`, `awaitRecall`).
 
 Hooks for subclasses: `onConnect(conn)` and `clearCaches()`.
 

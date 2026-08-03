@@ -7,9 +7,10 @@
 // risultato strutturato) e ciò che cambia per famiglia sta in un *job command*
 // registrato, non in un manager separato.
 //
-// Gli id restano nella forma storica <kind>_<n> con la sequenza *per kind*:
-// reduce_1, predict_inherit_1. Un client che ha memorizzato un id lo rivede
-// uguale.
+// Gli id restano nella forma <kind>_<n> con la sequenza *per kind*:
+// reduce_1, predict_inherit_1, graph_recall_1. Un client che ha memorizzato un
+// id lo rivede uguale e può usarlo con status/fetch indipendentemente dal nome
+// che ha creato il job.
 package main
 
 import (
@@ -341,6 +342,11 @@ func registerDefaultJobCommands(registry *jobCommandRegistry) {
 		Name:    "BATCH",
 		Kind:    "batch",
 		Prepare: prepareBatchJob,
+	})
+	registry.Register(&jobCommand{
+		Name:    "GRAPH_RECALL",
+		Kind:    "graph_recall",
+		Prepare: prepareGraphRecallJob,
 	})
 }
 

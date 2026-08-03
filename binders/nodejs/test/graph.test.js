@@ -222,6 +222,30 @@ test('recall returns the hydrated references and the reference count', async () 
     assert.match(conn.lines[0], / references=1 reference_limit=8$/);
 });
 
+test('detached recall returns a job id and retrieves its decoded result by id', async () => {
+    const payload = payloadOf({
+        seeds: [{ term: 'parser', matches: [{ id: 'module:parser' }] }],
+        associations: [{ id: 'module:parser', score: 0.8, source_count: 1 }],
+    });
+    const conn = fakeConn((line) => {
+        if (line.startsWith('JOB submit')) {
+            const submitted = Buffer.from(fieldOf(line, 'command'), 'base64').toString('utf8');
+            assert.equal(submitted, 'GRAPH_RECALL seeds=parser hops=2');
+            // No budget means "use the detached maximum" on the server.
+            assert.equal(fieldOf(submitted, 'budget'), null);
+            return 'SUCCESS,job=graph_recall_7,kind=graph_recall,state=queued';
+        }
+        assert.equal(line, 'JOB fetch id=graph_recall_7');
+        return `SUCCESS,job=graph_recall_7,command=GRAPH_RECALL,references=0,truncated=0,payload=${payload}`;
+    });
+
+    const jobId = await graph.recallAsync(conn, { seeds: ['parser'], hops: 2 });
+    assert.equal(jobId, 'graph_recall_7');
+    const result = await graph.fetchRecall(conn, jobId);
+    assert.equal(result.jobId, jobId);
+    assert.equal(result.associations[0].id, 'module:parser');
+});
+
 test('recall refuses more seeds than the server accepts', async () => {
     const conn = fakeConn(() => 'SUCCESS');
     const seeds = Array.from({ length: graph.MAX_RECALL_SEEDS + 1 }, (_, index) => `s${index}`);

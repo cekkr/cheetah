@@ -221,7 +221,7 @@ func registerDeleteAliases(registry *commandAliasRegistry) {
 	})
 }
 
-// --- i due trittici asincroni ----------------------------------------------
+// --- i trittici asincroni --------------------------------------------------
 
 // jobSubmitCall costruisce "JOB submit <comando>". La riga incapsulata viaggia
 // in command=<base64> perché il dialetto micro separa i token sugli spazi.
@@ -237,12 +237,16 @@ func jobSubmitCall(command string, args string) microCall {
 	}
 }
 
-func jobLookupCall(action string, args string) (microCall, string) {
+func jobLookupCall(action string, args string, kind string) (microCall, string) {
 	jobID := strings.TrimSpace(args)
 	if jobID == "" {
 		return microCall{}, "ERROR,missing_job_id"
 	}
-	return microCall{Verb: "JOB", Target: action, Params: map[string]string{"id": jobID}}, ""
+	params := map[string]string{"id": jobID}
+	if kind != "" {
+		params["kind"] = kind
+	}
+	return microCall{Verb: "JOB", Target: action, Params: params}, ""
 }
 
 // I due trittici formulavano "job non trovato" e "gestore assente" con parole
@@ -275,7 +279,7 @@ func registerJobAliases(registry *commandAliasRegistry) {
 	registry.Register(&commandAlias{
 		Name: "PAIR_REDUCE_STATUS",
 		Rewrite: func(db *Database, args string) (microCall, string, error) {
-			call, early := jobLookupCall("status", args)
+			call, early := jobLookupCall("status", args, "reduce")
 			return call, early, nil
 		},
 		Format: func(res microResponse) string {
@@ -292,7 +296,7 @@ func registerJobAliases(registry *commandAliasRegistry) {
 	registry.Register(&commandAlias{
 		Name: "PAIR_REDUCE_FETCH",
 		Rewrite: func(db *Database, args string) (microCall, string, error) {
-			call, early := jobLookupCall("fetch", args)
+			call, early := jobLookupCall("fetch", args, "reduce")
 			return call, early, nil
 		},
 		Format: func(res microResponse) string {
@@ -333,7 +337,7 @@ func registerJobAliases(registry *commandAliasRegistry) {
 	registry.Register(&commandAlias{
 		Name: "PREDICT_INHERIT_STATUS",
 		Rewrite: func(db *Database, args string) (microCall, string, error) {
-			call, early := jobLookupCall("status", args)
+			call, early := jobLookupCall("status", args, "predict_inherit")
 			return call, early, nil
 		},
 		Format: func(res microResponse) string {
@@ -358,7 +362,7 @@ func registerJobAliases(registry *commandAliasRegistry) {
 	registry.Register(&commandAlias{
 		Name: "PREDICT_INHERIT_FETCH",
 		Rewrite: func(db *Database, args string) (microCall, string, error) {
-			call, early := jobLookupCall("fetch", args)
+			call, early := jobLookupCall("fetch", args, "predict_inherit")
 			return call, early, nil
 		},
 		Format: func(res microResponse) string {
@@ -385,6 +389,62 @@ func registerJobAliases(registry *commandAliasRegistry) {
 			)
 		},
 		ErrorTokens: predictJobErrorTokens,
+	})
+
+	registry.Register(&commandAlias{
+		Name: "GRAPH_RECALL_ASYNC",
+		Rewrite: func(db *Database, args string) (microCall, string, error) {
+			return jobSubmitCall("GRAPH_RECALL", args), "", nil
+		},
+		Format: func(res microResponse) string {
+			return fmt.Sprintf(
+				"SUCCESS,command=GRAPH_RECALL,job=%s,state=queued,total=%s,budget=%s",
+				res.Get("job"),
+				res.Get("total"),
+				res.Get("budget"),
+			)
+		},
+	})
+
+	registry.Register(&commandAlias{
+		Name: "GRAPH_RECALL_STATUS",
+		Rewrite: func(db *Database, args string) (microCall, string, error) {
+			call, early := jobLookupCall("status", args, "graph_recall")
+			return call, early, nil
+		},
+		Format: func(res microResponse) string {
+			return fmt.Sprintf(
+				"SUCCESS,job=%s,state=%s,progress=%s,completed=%s,total=%s",
+				res.Get("job"),
+				res.Get("state"),
+				res.Get("progress"),
+				res.Get("completed"),
+				res.Get("total"),
+			)
+		},
+	})
+
+	registry.Register(&commandAlias{
+		Name: "GRAPH_RECALL_FETCH",
+		Rewrite: func(db *Database, args string) (microCall, string, error) {
+			call, early := jobLookupCall("fetch", args, "graph_recall")
+			return call, early, nil
+		},
+		Format: func(res microResponse) string {
+			if res.Status == "PENDING" {
+				return fmt.Sprintf(
+					"PENDING,job=%s,state=%s,progress=%s,completed=%s,total=%s",
+					res.Get("job"),
+					res.Get("state"),
+					res.Get("progress"),
+					res.Get("completed"),
+					res.Get("total"),
+				)
+			}
+			// Come PAIR_REDUCE_FETCH, a lavoro finito rende esattamente la
+			// riga sincrona. Il job id resta disponibile nella via generica.
+			return microOK(dropField(res.Fields, "job")...).Render()
+		},
 	})
 }
 

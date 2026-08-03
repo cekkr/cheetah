@@ -370,6 +370,18 @@ class CheetahDatabase {
         return graph.recallBatched(this.pool, options);
     }
 
+    recallAsync(options) {
+        return graph.recallAsync(this.pool, options);
+    }
+
+    fetchRecall(jobId) {
+        return graph.fetchRecall(this.pool, jobId);
+    }
+
+    awaitRecall(jobId, options) {
+        return graph.awaitRecall(this.pool, jobId, options);
+    }
+
     // -- record tables ------------------------------------------------------
     //
     // Thin delegations, like the graph ones above: a subclass that keeps a

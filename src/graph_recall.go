@@ -1165,6 +1165,7 @@ func (db *Database) graphRecallInjectCache(
 func (db *Database) graphRecallSpread(
 	resolutions []graphRecallSeedResolution,
 	opts *graphRecallOptions,
+	progress func(completed int, total int),
 ) (*graphRecallRun, error) {
 	run := &graphRecallRun{
 		Nodes:   make(map[string]*graphRecallNode),
@@ -1217,6 +1218,13 @@ func (db *Database) graphRecallSpread(
 			run.Expanded++
 			run.Hydrated += len(links)
 			budget -= len(links) + 1
+			if progress != nil {
+				completed := opts.Budget - budget
+				if completed > opts.Budget {
+					completed = opts.Budget
+				}
+				progress(completed, opts.Budget)
+			}
 			for i := range links {
 				link := links[i]
 				decay := opts.Decay
@@ -1325,11 +1333,16 @@ func (run *graphRecallRun) associations(opts *graphRecallOptions) []graphRecallA
 			if trace.Depth < distance {
 				distance = trace.Depth
 			}
-			if trace.Activation > bestActivation {
+			// Due semi possono arrivare con la stessa attivazione. L'ordine di
+			// una map Go non è stabile: senza il secondo confronto il cammino in
+			// `via` cambiava fra due recall identiche (e fra sync e job).
+			if trace.Activation > bestActivation ||
+				(trace.Activation == bestActivation && (bestSeed == "" || seed < bestSeed)) {
 				bestActivation = trace.Activation
 				bestSeed = seed
 			}
 		}
+		sort.Float64s(activations)
 		score := graphRecallNoisyOr(activations)
 		if score < opts.Precision {
 			continue
@@ -1477,10 +1490,23 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	resolutions, unresolved, err := db.graphResolveRecallSeeds(&opts)
+	fields, err := db.executeGraphRecall(&opts, nil)
 	if err != nil {
 		return "", err
+	}
+	return microOK(fields...).Render(), nil
+}
+
+// executeGraphRecall è il corpo condiviso dalla via sincrona e dal job. Il
+// callback è nil nella prima e aggiorna completed/total nella seconda; tenere
+// qui il lavoro impedisce alle due forme di divergere nella risposta.
+func (db *Database) executeGraphRecall(
+	opts *graphRecallOptions,
+	progress func(completed int, total int),
+) ([]microField, error) {
+	resolutions, unresolved, err := db.graphResolveRecallSeeds(opts)
+	if err != nil {
+		return nil, err
 	}
 	resolved := 0
 	origins := make([]string, 0, resolved)
@@ -1494,7 +1520,7 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 	store := db.graphCacheOrNil()
 	signature := ""
 	if store != nil && opts.Cache != graphRecallCacheOff && len(origins) > 0 {
-		signature = graphCacheSignature(origins, &opts)
+		signature = graphCacheSignature(origins, opts)
 	}
 
 	// `cache=serve`: se lo stesso confronto è già stato fatto e da allora il
@@ -1518,40 +1544,40 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 			if len(associations) > opts.Limit {
 				associations = associations[:opts.Limit]
 			}
-			references := db.graphHydrateAssociationEvidence(associations, &opts)
-			return graphRecallResponse(
-				&opts, resolutions, unresolved, associations,
+			references := db.graphHydrateAssociationEvidence(associations, opts)
+			return graphRecallResponseFields(
+				opts, resolutions, unresolved, associations,
 				resolved, len(associations), 0, 0, references, false,
 				"hit", 0, 0, 0,
 			)
 		}
 	}
 
-	run, err := db.graphRecallSpread(resolutions, &opts)
+	run, err := db.graphRecallSpread(resolutions, opts, progress)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	associations := run.associations(&opts)
-	references := db.graphHydrateAssociationEvidence(associations, &opts)
+	associations := run.associations(opts)
+	references := db.graphHydrateAssociationEvidence(associations, opts)
 
 	cacheState := "off"
 	cacheLinks, cacheCommon := 0, 0
 	if store != nil && opts.Cache != graphRecallCacheOff {
 		cacheState = "miss"
-		cacheLinks, cacheCommon = store.observeRun(run, associations, &opts, signature)
+		cacheLinks, cacheCommon = store.observeRun(run, associations, opts, signature)
 	}
 
-	return graphRecallResponse(
-		&opts, resolutions, unresolved, associations,
+	return graphRecallResponseFields(
+		opts, resolutions, unresolved, associations,
 		resolved, len(run.Nodes), run.Expanded, run.Hydrated, references, run.Truncated,
 		cacheState, run.Injected, cacheLinks, cacheCommon,
 	)
 }
 
-// graphRecallResponse tiene in un posto solo la riga di risposta, che ora ha due
-// chiamanti (la recall vera e quella servita dalla cache) e deve restare
-// identica campo per campo fra i due.
-func graphRecallResponse(
+// graphRecallResponseFields tiene in un posto solo la risposta strutturata. La
+// via sincrona la rende direttamente; JOB vi antepone job=<id> senza dover
+// ri-analizzare una riga già formattata.
+func graphRecallResponseFields(
 	opts *graphRecallOptions,
 	resolutions []graphRecallSeedResolution,
 	unresolved []string,
@@ -1566,7 +1592,7 @@ func graphRecallResponse(
 	cacheInjected int,
 	cacheLinks int,
 	cacheCommon int,
-) (string, error) {
+) ([]microField, error) {
 	bridges := 0
 	for _, association := range associations {
 		if association.SourceCount > 1 {
@@ -1579,26 +1605,26 @@ func graphRecallResponse(
 		Associations: associations,
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return fmt.Sprintf(
-		"SUCCESS,command=GRAPH_RECALL,seeds=%d,resolved=%d,visited=%d,expanded=%d,hydrated=%d,references=%d,count=%d,bridges=%d,truncated=%d,precision=%.3f,cache=%s,cache_injected=%d,cache_links=%d,cache_common=%d,payload=%s",
-		len(opts.Seeds),
-		resolved,
-		visited,
-		expanded,
-		hydrated,
-		references,
-		len(associations),
-		bridges,
-		boolToInt(truncated),
-		opts.Precision,
-		cacheState,
-		cacheInjected,
-		cacheLinks,
-		cacheCommon,
-		payload,
-	), nil
+	return []microField{
+		mf("command", "GRAPH_RECALL"),
+		mfi("seeds", len(opts.Seeds)),
+		mfi("resolved", resolved),
+		mfi("visited", visited),
+		mfi("expanded", expanded),
+		mfi("hydrated", hydrated),
+		mfi("references", references),
+		mfi("count", len(associations)),
+		mfi("bridges", bridges),
+		mfi("truncated", boolToInt(truncated)),
+		mf("precision", fmt.Sprintf("%.3f", opts.Precision)),
+		mf("cache", cacheState),
+		mfi("cache_injected", cacheInjected),
+		mfi("cache_links", cacheLinks),
+		mfi("cache_common", cacheCommon),
+		mf("payload", payload),
+	}, nil
 }
 
 type graphSimilarMatch struct {

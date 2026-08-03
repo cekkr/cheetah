@@ -163,17 +163,75 @@ func TestLegacyPredictJobAliasesAreByteIdentical(t *testing.T) {
 	assertResponse(t, db, "PREDICT_INHERIT_FETCH predict_inherit_1", "ERROR,predict_inherit_job_not_found")
 }
 
+// TestGraphRecallJobsAreRetrievableByID copre entrambe le porte dello stesso
+// job: la forma generica usa id=<job>, il trittico di comodità usa l'id
+// posizionale. Il fetch generico conserva job= per correlare la risposta; il
+// fetch GRAPH_RECALL rende invece la stessa riga della forma sincrona.
+func TestGraphRecallJobsAreRetrievableByID(t *testing.T) {
+	db := newRecallTestDB(t)
+	seedRecallGraph(t, db)
+	mustCommand(t, db, "FILE_CHECKPOINT")
+	args := "seeds=cat:luna,person:marco hops=2 precision=0.1 limit=8 budget=128 cache=off"
+	sync := mustCommand(t, db, "GRAPH_RECALL "+args)
+
+	assertResponse(t, db, "JOB submit GRAPH_RECALL "+args,
+		"SUCCESS,job=graph_recall_1,kind=graph_recall,command=GRAPH_RECALL,state=queued,total=128,seeds=2,budget=128")
+	if status := waitForJobState(t, db, "JOB status id=graph_recall_1"); !strings.Contains(status, "progress=100.00") {
+		t.Fatalf("completed recall job did not close progress at 100%%: %q", status)
+	}
+	fetched := mustCommand(t, db, "JOB fetch id=graph_recall_1")
+	wantFetched := "SUCCESS,job=graph_recall_1," + strings.TrimPrefix(sync, "SUCCESS,")
+	if fetched != wantFetched {
+		mismatch := 0
+		for mismatch < len(fetched) && mismatch < len(wantFetched) && fetched[mismatch] == wantFetched[mismatch] {
+			mismatch++
+		}
+		t.Fatalf("JOB fetch graph_recall_1 differs from synchronous recall at byte %d\n got: %q\nwant: %q", mismatch, fetched, wantFetched)
+	}
+	assertResponse(t, db, "JOB status id=graph_recall_1", "ERROR,job_not_found")
+
+	defaultArgs := "seeds=cat:luna,person:marco hops=2 precision=0.1 limit=8 cache=off"
+	defaultSync := mustCommand(t, db, "GRAPH_RECALL "+defaultArgs)
+	assertResponse(t, db, "GRAPH_RECALL_ASYNC "+defaultArgs,
+		fmt.Sprintf(
+			"SUCCESS,command=GRAPH_RECALL,job=graph_recall_2,state=queued,total=%d,budget=%d",
+			graphRecallMaxBudget,
+			graphRecallMaxBudget,
+		))
+	assertResponse(t, db, "GRAPH_RECALL_STATUS nope", "ERROR,job_not_found")
+	assertResponse(t, db, "GRAPH_RECALL_STATUS", "ERROR,missing_job_id")
+	assertResponse(t, db, "GRAPH_RECALL_ASYNC", "ERROR,graph_recall_requires_seeds")
+	if status := waitForJobState(t, db, "GRAPH_RECALL_STATUS graph_recall_2"); !strings.Contains(status, "progress=100.00") {
+		t.Fatalf("completed recall alias did not close progress at 100%%: %q", status)
+	}
+	assertResponse(t, db, "GRAPH_RECALL_FETCH graph_recall_2", defaultSync)
+	assertResponse(t, db, "GRAPH_RECALL_FETCH graph_recall_2", "ERROR,job_not_found")
+}
+
 // TestJobIDSequencesStayPerFamily verifica che l'unificazione dei due manager
-// non abbia mescolato le sequenze: con un contatore solo il primo job predict
-// dopo un reduce si sarebbe chiamato predict_inherit_2.
+// non abbia mescolato le sequenze: con un contatore solo i primi job predict e
+// graph recall dopo un reduce non si chiamerebbero entrambi *_1.
 func TestJobIDSequencesStayPerFamily(t *testing.T) {
 	db := newRecallTestDB(t)
 	mustInsertPair(t, db, "seq:one")
 	mustCommand(t, db, "PREDICT_SET table=t key=k1 target=t1 value=0.5")
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=seq:node", "SUCCESS")
 
 	assertResponse(t, db, "PAIR_REDUCE_ASYNC counts seq:", "SUCCESS,reducer=counts,job=reduce_1,state=queued")
 	assertResponse(t, db, "PREDICT_INHERIT_ASYNC table=t items="+predictInheritItems(t),
 		"SUCCESS,table=t,job=predict_inherit_1,state=queued,total=1")
+	assertResponse(t, db, "GRAPH_RECALL_ASYNC seeds=seq:node cache=off",
+		fmt.Sprintf(
+			"SUCCESS,command=GRAPH_RECALL,job=graph_recall_1,state=queued,total=%d,budget=%d",
+			graphRecallMaxBudget,
+			graphRecallMaxBudget,
+		))
+	assertResponse(t, db, "PAIR_REDUCE_STATUS predict_inherit_1", "ERROR,reduce_job_not_found")
+	assertResponse(t, db, "PREDICT_INHERIT_STATUS graph_recall_1", "ERROR,predict_inherit_job_not_found")
+	assertResponse(t, db, "GRAPH_RECALL_STATUS reduce_1", "ERROR,job_not_found")
+	if generic := mustCommand(t, db, "JOB status id=graph_recall_1"); !strings.Contains(generic, "job=graph_recall_1") {
+		t.Fatalf("generic JOB lookup did not retrieve graph_recall_1: %q", generic)
+	}
 	assertResponse(t, db, "PAIR_REDUCE_ASYNC counts seq:", "SUCCESS,reducer=counts,job=reduce_2,state=queued")
 }
 

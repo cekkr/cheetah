@@ -82,6 +82,20 @@ class RecallTests(unittest.TestCase):
         self.assertIn("reference_limit=4", line)
         self.assertIn("include_seeds=1", line)
 
+    def test_detached_recall_is_retrieved_and_decoded_by_job_id(self) -> None:
+        job_id = graph.recall_async(self.conn, ["heavy rain"], hops=2)
+        submitted = next(command for command in self.conn.commands if command.startswith("JOB submit"))
+        encoded = submitted.split("command=", 1)[1]
+        recall_line = base64.b64decode(encoded).decode("utf-8")
+        self.assertTrue(recall_line.startswith("GRAPH_RECALL "))
+        self.assertNotIn(" budget=", recall_line)
+
+        result = graph.fetch_recall(self.conn, job_id)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["job_id"], job_id)
+        self.assertEqual(result["associations"][0]["id"], "hit:heavy rain")
+
     def test_more_than_the_seed_cap_is_refused_by_recall_and_batched_by_recall_batched(self) -> None:
         seeds = [f"s{index}" for index in range(graph.MAX_RECALL_SEEDS + 5)]
         with self.assertRaises(CheetahError):

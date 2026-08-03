@@ -884,6 +884,7 @@ Design honestly around these; none of them has a workaround inside the server to
   index. Keep the embeddings and the neighbour search outside, store only the resulting ids.
 - **No temporal validity.** `as_of`/`since` props are a convention; the engine never reasons about
   time.
-- **Jobs are process-local.** `PAIR_REDUCE_ASYNC` / `PREDICT_INHERIT_ASYNC` results vanish on restart.
+- **Jobs are process-local.** `PAIR_REDUCE_ASYNC` / `PREDICT_INHERIT_ASYNC` /
+  `GRAPH_RECALL_ASYNC` results and their retrieval ids vanish on restart.
 - **No authentication or TLS.** The protocol is plaintext on `0.0.0.0:4455`; an agent with a socket has
   full write access to every database. Bind it to loopback.

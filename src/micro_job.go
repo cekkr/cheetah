@@ -13,9 +13,9 @@
 // job — solo `fetch` lo fa.
 //
 // Sostituisce PAIR_REDUCE_ASYNC/_STATUS/_FETCH e PREDICT_INHERIT_ASYNC/_STATUS/
-// _FETCH, che restano come alias. Un comando lungo nuovo si registra in
-// jobCommands (jobs.go) e ottiene le tre forme senza aggiungere un terzo
-// trittico al dispatcher.
+// _FETCH, che restano come alias. GRAPH_RECALL usa lo stesso involucro e tiene
+// il proprio trittico come nomi di comodità. Un comando lungo nuovo si registra
+// in jobCommands (jobs.go) e ottiene le tre forme senza aggiungere un manager.
 package main
 
 import (
@@ -105,6 +105,12 @@ func (db *Database) lookupJob(args microArgs) (*microJob, microResponse) {
 	}
 	job := db.jobs.getJob(jobID)
 	if job == nil {
+		return nil, microFail("job_not_found")
+	}
+	// Gli alias di famiglia passano kind= per non accettare per sbaglio l'id
+	// di un altro lavoro. La superficie JOB generica non lo passa e resta
+	// volutamente capace di recuperare qualunque id.
+	if expectedKind := args.get("kind"); expectedKind != "" && job.kind != expectedKind {
 		return nil, microFail("job_not_found")
 	}
 	return job, microResponse{}
@@ -251,7 +257,7 @@ func sanitizeJobError(err error) string {
 	return msg
 }
 
-// --- i due comandi eseguibili in job ---------------------------------------
+// --- i comandi eseguibili in job -------------------------------------------
 
 func preparePairReduceJob(db *Database, args string) (jobTask, microResponse, error) {
 	if strings.TrimSpace(args) == "" {
@@ -285,6 +291,46 @@ func preparePairReduceJob(db *Database, args string) (jobTask, microResponse, er
 			// segnalato avanzamenti.
 			job.setProgress(len(results), len(results))
 			return pairReduceResponseFields(results, mode, nextCursor), nil
+		},
+	}
+	return task, microResponse{}, nil
+}
+
+// prepareGraphRecallJob valida la stessa riga del comando sincrono prima della
+// submit. Senza budget esplicito, il job usa il tetto sicuro invece del piccolo
+// default interattivo: è ciò che gli permette di attraversare un fan-out largo
+// senza tenere occupata la connessione. Un budget esplicito resta autorevole.
+func prepareGraphRecallJob(db *Database, args string) (jobTask, microResponse, error) {
+	params := parseKeyValueArgs(args)
+	opts, errResp, err := graphParseRecallOptions(params)
+	if errResp != "" {
+		return jobTask{}, microRawError(errResp), nil
+	}
+	if err != nil {
+		return jobTask{}, microSilent(), err
+	}
+	if strings.TrimSpace(params["budget"]) == "" {
+		opts.Budget = graphRecallMaxBudget
+		opts.class = graphCacheClassOf(&opts)
+	}
+	task := jobTask{
+		Total: opts.Budget,
+		Meta: []microField{
+			mfi("seeds", len(opts.Seeds)),
+			mfi("budget", opts.Budget),
+		},
+		Run: func(job *microJob) ([]microField, error) {
+			fields, err := db.executeGraphRecall(&opts, func(completed int, total int) {
+				job.setProgress(completed, total)
+			})
+			if err != nil {
+				return nil, err
+			}
+			// Il budget è un limite, non una quantità che deve essere consumata:
+			// una frontiera esaurita prima del tetto è comunque completa al 100%.
+			snap := job.snapshot()
+			job.setProgress(snap.Completed, snap.Completed)
+			return fields, nil
 		},
 	}
 	return task, microResponse{}, nil

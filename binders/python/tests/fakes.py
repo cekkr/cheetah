@@ -385,11 +385,12 @@ class FakeCheetahServer:
             encoded = fields.get("command", "")
             line = base64.b64decode(encoded).decode("utf-8") if encoded else ""
             name = line.split(" ", 1)[0].upper()
-            if name not in {"PAIR_REDUCE", "PREDICT_INHERIT_BATCH"}:
+            if name not in {"PAIR_REDUCE", "PREDICT_INHERIT_BATCH", "GRAPH_RECALL"}:
                 return "ERROR,command_not_submittable"
             job_id = f"job_{len(self.jobs) + 1}"
             self.jobs[job_id] = line
-            return f"SUCCESS,job={job_id},kind=reduce,command={name},state=queued,total=0"
+            kind = "graph_recall" if name == "GRAPH_RECALL" else "reduce"
+            return f"SUCCESS,job={job_id},kind={kind},command={name},state=queued,total=0"
         job_id = fields.get("id", "")
         if job_id not in self.jobs:
             return "ERROR,job_not_found"

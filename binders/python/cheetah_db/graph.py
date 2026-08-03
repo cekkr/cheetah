@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 from typing import Any, Iterable, Mapping, Sequence
 
+from . import jobs as job_ops
 from .client import CheetahError
 from .protocol import (
     Response,
@@ -44,11 +45,13 @@ __all__ = [
     "ambiguity_get",
     "ambiguity_resolve",
     "ambiguity_set",
+    "await_recall",
     "degree",
     "delete_edge",
     "delete_node",
     "edge_set_batch",
     "encode_json_argument",
+    "fetch_recall",
     "get_edge",
     "get_node",
     "neighbor_types",
@@ -56,6 +59,7 @@ __all__ = [
     "normalize_id",
     "query",
     "recall",
+    "recall_async",
     "recall_batched",
     "set_edge",
     "set_node",
@@ -423,6 +427,45 @@ def recall(
             f"GRAPH_RECALL accepts at most {MAX_RECALL_SEEDS} seeds, got {len(seed_list)}; "
             "use recall_batched"
         )
+    fields = _recall_fields(
+        seed_list,
+        hops=hops,
+        decay=decay,
+        precision=precision,
+        direction=direction,
+        edge_type=edge_type,
+        limit=limit,
+        branch_limit=branch_limit,
+        budget=budget,
+        min_sources=min_sources,
+        expand=expand,
+        references=references,
+        reference_limit=reference_limit,
+        include_seeds=include_seeds,
+    )
+    response = _send(
+        conn, "GRAPH_RECALL", fields, f"GRAPH_RECALL over {len(seed_list)} seeds"
+    )
+    return _recall_result(response)
+
+
+def _recall_fields(
+    seed_list: Sequence[str],
+    *,
+    hops: int,
+    decay: float,
+    precision: float,
+    direction: str,
+    edge_type: str | None,
+    limit: int,
+    branch_limit: int,
+    budget: int | None,
+    min_sources: int,
+    expand: bool | None,
+    references: bool,
+    reference_limit: int | None,
+    include_seeds: bool,
+) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "seeds": _encode_seeds(seed_list),
         "hops": max(1, min(int(hops), MAX_RECALL_HOPS)),
@@ -432,7 +475,7 @@ def recall(
         "type": edge_type,
         "limit": limit,
         "branch_limit": max(1, min(int(branch_limit), MAX_RECALL_BRANCH)),
-        "budget": max(1, min(int(budget), MAX_RECALL_BUDGET)),
+        "budget": None if budget is None else max(1, min(int(budget), MAX_RECALL_BUDGET)),
         "min_sources": min_sources,
     }
     if expand is not None:
@@ -443,16 +486,82 @@ def recall(
             fields["reference_limit"] = max(1, min(int(reference_limit), MAX_RECALL_REFERENCES))
     if include_seeds:
         fields["include_seeds"] = 1
-    response = _send(
-        conn, "GRAPH_RECALL", fields, f"GRAPH_RECALL over {len(seed_list)} seeds"
-    )
+    return fields
+
+
+def _recall_result(response: Response, job_id: str | None = None) -> dict[str, Any]:
     payload = response.payload() or {}
-    return {
+    result = {
         "seeds": payload.get("seeds") or [],
         "associations": payload.get("associations") or [],
         "truncated": (numeric_field(response.fields, "truncated", 0) or 0) > 0,
         "response": response,
     }
+    resolved_job_id = response.field_value("job", job_id)
+    if resolved_job_id:
+        result["job_id"] = resolved_job_id
+    return result
+
+
+def recall_async(
+    conn: Any,
+    seeds: Sequence[str],
+    *,
+    hops: int = 1,
+    decay: float = 1.0,
+    precision: float = 0.05,
+    direction: str = "out",
+    edge_type: str | None = None,
+    limit: int = 64,
+    branch_limit: int = 1024,
+    budget: int | None = None,
+    min_sources: int = 1,
+    expand: bool | None = None,
+    references: bool = False,
+    reference_limit: int | None = None,
+    include_seeds: bool = False,
+) -> str:
+    """Detach one recall and return its ``graph_recall_<n>`` id.
+
+    When ``budget`` is omitted the server assigns the maximum bounded async
+    sweep; passing a value keeps that explicit limit.
+    """
+    seed_list = [str(seed).strip() for seed in seeds if str(seed).strip()]
+    if not seed_list:
+        raise CheetahError("cheetah GRAPH_RECALL requires at least one seed")
+    if len(seed_list) > MAX_RECALL_SEEDS:
+        raise CheetahError(
+            f"GRAPH_RECALL accepts at most {MAX_RECALL_SEEDS} seeds, got {len(seed_list)}"
+        )
+    fields = _recall_fields(
+        seed_list,
+        hops=hops,
+        decay=decay,
+        precision=precision,
+        direction=direction,
+        edge_type=edge_type,
+        limit=limit,
+        branch_limit=branch_limit,
+        budget=budget,
+        min_sources=min_sources,
+        expand=expand,
+        references=references,
+        reference_limit=reference_limit,
+        include_seeds=include_seeds,
+    )
+    command = build_key_value_command("GRAPH_RECALL", fields)
+    return job_ops.submit(conn, command)
+
+
+def fetch_recall(conn: Any, job_id: str) -> dict[str, Any] | None:
+    """Retrieve and decode a detached recall by id, or ``None`` while running."""
+    response = job_ops.fetch(conn, job_id)
+    return None if response is None else _recall_result(response, job_id)
+
+
+def await_recall(conn: Any, job_id: str, **options: Any) -> dict[str, Any]:
+    """Poll a detached recall by id and decode its terminal result."""
+    return _recall_result(job_ops.await_job(conn, job_id, **options), job_id)
 
 
 def _encode_seeds(seeds: Sequence[str]) -> str:

@@ -8,7 +8,7 @@ because fetching consumes the job.
 Three things a caller has to know, all of them learned the hard way:
 
   - **Only registered commands are submittable** (today ``PAIR_REDUCE``,
-    ``PREDICT_INHERIT_BATCH`` and ``BATCH``); anything else answers
+    ``PREDICT_INHERIT_BATCH``, ``BATCH`` and ``GRAPH_RECALL``); anything else answers
     ``ERROR,command_not_submittable``.
   - **The command line travels base64** in ``command=``. The micro dialect
     splits on whitespace and a command line is full of it.

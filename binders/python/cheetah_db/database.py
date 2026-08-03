@@ -305,6 +305,15 @@ class CheetahDatabase:
     def recall(self, seeds: Sequence[str], **options: Any) -> list[dict[str, Any]]:
         return graph_ops.recall_batched(self.conn, seeds, **options)
 
+    def recall_async(self, seeds: Sequence[str], **options: Any) -> str:
+        return graph_ops.recall_async(self.conn, seeds, **options)
+
+    def fetch_recall(self, job_id: str) -> dict[str, Any] | None:
+        return graph_ops.fetch_recall(self.conn, job_id)
+
+    def await_recall(self, job_id: str, **options: Any) -> dict[str, Any]:
+        return graph_ops.await_recall(self.conn, job_id, **options)
+
     # -- record tables --------------------------------------------------- #
     #
     # Thin delegations, like the graph ones above: a subclass that keeps a

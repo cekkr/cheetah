@@ -226,6 +226,13 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   without consuming it; `JOB fetch` stays terminal and stays the aggregate. `available=` appears in
   `JOB status` **only** when partials exist — an always-present field would have broken the
   byte-for-byte responses of `PAIR_REDUCE_STATUS` and `PREDICT_INHERIT_STATUS`.
+- **A job id is the retrieval handle, independent of its alias.** A detached graph recall returns
+  `graph_recall_<n>`; both `JOB status/fetch id=<n>` and `GRAPH_RECALL_STATUS/FETCH <n>` address that
+  same in-memory row. Fetch consumes it. Family aliases pass an internal `kind=` guard so a reduce
+  id cannot be mistaken for a recall id; generic `JOB` deliberately accepts every kind. Recall jobs
+  default to `graphRecallMaxBudget` only when the
+  caller omitted `budget=`; synchronous recall keeps `graphRecallDefaultBudget` and an explicit
+  budget wins in either path.
 - **An alias reproduces its legacy response byte for byte.** Response field names (`purged=`,
   `matches=`, `degree=`, `count=`, `next_cursor=`, `job=`) are a wire contract — the Python adapter in
   the parent monorepo reads some of them positionally. A command decomposed into a micro-command
@@ -730,10 +737,12 @@ process-local and not persisted.
   `setProgress`/`advance`/`appendPartial`/`partialsFrom`/`snapshot`), `microJobSnapshot`
   (`progressPercent`, `counterFields`, `Available`), `microJobManager`
   (`newJob`/`getJob`/`deleteJob`), `jobTask`, `jobCommand`, `jobCommandRegistry`,
-  `registerDefaultJobCommands` (`PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`),
+  `registerDefaultJobCommands` (`PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`, `GRAPH_RECALL`),
   `Database.submitJob`.
 - **Common mistakes:** job ids stay `<kind>_<n>` with the sequence kept **per kind**
-  (`reduce_1`, `predict_inherit_1`) — a shared counter would renumber ids a client may have stored.
+  (`reduce_1`, `predict_inherit_1`, `graph_recall_1`) — a shared counter would renumber ids a client
+  may have stored. The id returned by any submit works with the generic `JOB status id=` / `fetch`
+  surface even when a family-specific alias created it.
   `jobTask.Counters` must list every counter an alias renders, or a poll arriving before the first
   progress callback prints an empty field where the legacy line printed `0`.
 
@@ -796,17 +805,19 @@ The `DEL` micro-command — one erasure verb with the scope in the arguments (`D
 
 #### [`src/micro_job.go`](src/micro_job.go)
 
-The `JOB` micro-command (`submit`/`status`/`fetch`/`results`) plus the two commands whose `Prepare`
+The `JOB` micro-command (`submit`/`status`/`fetch`/`results`) plus the three commands whose `Prepare`
 lives here (`BATCH`'s is in [`batch.go`](src/batch.go)).
 
 - **Key symbols:** `microJobCommand`, `microJobSubmit`/`microJobStatus`/`microJobFetch`/
   `microJobResults`, `jobResultsMaxPage`, `jobCommandLine`, `jobProgressFields`,
-  `preparePairReduceJob`, `preparePredictInheritJob`, `sanitizeJobError`, `microRawError`.
+  `preparePairReduceJob`, `preparePredictInheritJob`, `prepareGraphRecallJob`, `sanitizeJobError`,
+  `microRawError`.
 - **Common mistakes:** `JOB status` must **not** fail on a failed job (it reports `state=failed` plus
   `error=`), because `PAIR_REDUCE_STATUS` answered `SUCCESS` there while `PREDICT_INHERIT_STATUS`
   answered `ERROR,job_failed:`; `JOB fetch` is the one that errors, which is what both legacy fetches
   did. `Prepare` runs synchronously so a bad argument answers with an error instead of a job that
-  fails on its own.
+  fails on its own. A recall job with no `budget=` intentionally raises the default from 4 096 to
+  the bounded maximum 262 144; an explicit budget must not be replaced.
 
 #### [`src/command_alias.go`](src/command_alias.go)
 
@@ -821,7 +832,8 @@ formatter, registered at startup in one table.
   belongs in `Rewrite` (that is where the old error wordings and the positional forms live), not in
   the micro-command. Errors pass through unformatted except for the `ErrorTokens` remapping, which
   exists because `JOB` says `job_not_found` where the two trios said `reduce_job_not_found` /
-  `predict_inherit_job_not_found`.
+  `predict_inherit_job_not_found`. `GRAPH_RECALL_ASYNC/_STATUS/_FETCH` are newer convenience aliases,
+  so they keep the generic error tokens and the `graph_recall_<n>` id.
 
 ### Prediction tables
 
@@ -883,13 +895,14 @@ next query.
   `(*graphRecallOptions).applyTypeFilter`; seed resolution `graphResolveRecallSeeds`/
   `graphResolveRecallTerm`/`graphSynonymsOf`; traversal `graphRecallLinks`, `graphRecallSpread`,
   `(*graphRecallRun).touch`/`path`/`associations`; bounded sentence hydration
-  `graphHydrateAssociationEvidence` (node references + episodic `edge.props.src`); handlers `handleGraphRecall`, `handleGraphSimilar`
+  `graphHydrateAssociationEvidence` (node references + episodic `edge.props.src`); shared execution
+  `executeGraphRecall`/`graphRecallResponseFields`; handlers `handleGraphRecall`, `handleGraphSimilar`
   (with `graphSimilarMatches`), `handleGraphTermIndex`.
 - **Cache hooks:** `graphRecallInjectCache` puts remembered shortcuts into the frontier *alongside the
   seeds* (a link that had cost three hops now costs zero and the spread restarts from there with the
   budget intact), `graphCacheStore.observeRun` writes back what the run discovered, and
-  `graphRecallResponse` is the single formatter both the real recall and a `cache=serve` answer go
-  through — see [`graph_cache.go`](src/graph_cache.go).
+  `graphRecallResponseFields` is the single structured formatter used by sync, job and a
+  `cache=serve` answer — see [`graph_cache.go`](src/graph_cache.go).
 - **Depends on:** [`graph.go`](src/graph.go) (adjacency scan, node/edge records, pair-payload helpers)
   and [`graph_uncertainty.go`](src/graph_uncertainty.go) (`graphEffectiveConfidence`/`Modality`, and the
   modality scale, which `precision=` reuses so `precision=probable` means 0.75).
@@ -900,7 +913,8 @@ next query.
   `precision / seeds` (floored at `graphRecallMinActivation`), never at `precision`; tightening that
   cut silently drops convergences. `distance` is **conceptual depth** (synonym hops cost a hop but no
   depth), which is not the `hops` reported per source. Traversal never hydrates node records — labels
-  are read only for the items that survive the limit.
+  are read only for the items that survive the limit. When equal activations compete for the one
+  displayed `via`, choose the lexical seed; map iteration must not make identical recalls differ.
 
 #### [`src/graph_cache.go`](src/graph_cache.go)
 
@@ -1209,8 +1223,9 @@ micro-command must answer exactly what it answered before.
 `TestLegacyDeleteAliasesAreByteIdentical` (the five erasures, success and every error path, including
 `DELETE` on an unwritten row which answers `ERROR,key_not_found` *and* propagates `io.EOF`),
 `TestLegacyReduceJobAliasesAreByteIdentical` and `TestLegacyPredictJobAliasesAreByteIdentical` (the
-two async trios, with the async fetch asserted equal to the synchronous line),
-`TestJobIDSequencesStayPerFamily` (unifying the managers must not renumber `predict_inherit_1`),
+two historical async trios, with the async fetch asserted equal to the synchronous line),
+`TestGraphRecallJobsAreRetrievableByID` (both generic `id=` retrieval and the recall aliases),
+`TestJobIDSequencesStayPerFamily` (unifying the managers must not renumber any family),
 `TestPredictFailuresCarryTheErrorPrefix` and `TestNormalizeCommandResponse` (the `ERROR,` prefix fix).
 Provides `runCommand`, `mustCommand`, `assertResponse`, `waitForJobState`.
 
@@ -1325,7 +1340,8 @@ free-function command layers — [`lib/kv.js`](binders/nodejs/lib/kv.js) (the tw
 `pairSet`/`pairSummary`/`purgePrefix`/`deleteValue`, batches, scans),
 [`lib/graph.js`](binders/nodejs/lib/graph.js) (the whole `GRAPH_*` surface — nodes with
 `references`, edges single and batched, `neighbors`/`neighborsAll`/`neighborTypes`/`degree`,
-`query`, `recall`/`recallBatched`, `similar`, `termIndex`, and the `GRAPH_AMBIGUITY_*` trio),
+`query`, `recall`/`recallBatched`, id-based `recallAsync`/`fetchRecall`/`awaitRecall`, `similar`,
+`termIndex`, and the `GRAPH_AMBIGUITY_*` trio),
 [`lib/records.js`](binders/nodejs/lib/records.js) (the `RECORD` family plus `DEL records`, with
 `fieldSpec` validating a field declaration — reserved names included — before the wire),
 [`lib/jobs.js`](binders/nodejs/lib/jobs.js) (`JOB` submit/status/fetch plus `awaitJob`),
@@ -1395,7 +1411,8 @@ lock-serialized send+receive, reconnect and an *inactivity* grace so a long redu
 for a dead socket; `ThreadLocalClientPool`, one socket per thread, retaining registered client
 objects across `close_all()` so post-reset reconnects remain owned), the free-function layers
 [`kv.py`](binders/python/cheetah_db/kv.py) (including `PAIR_PUT_BATCH`),
-[`graph.py`](binders/python/cheetah_db/graph.py) (the whole `GRAPH_*` surface),
+[`graph.py`](binders/python/cheetah_db/graph.py) (the whole `GRAPH_*` surface, including
+`recall_async`/`fetch_recall`/`await_recall` by job id),
 [`records.py`](binders/python/cheetah_db/records.py) (the `RECORD` family plus `DEL records`, with
 `field_spec` validating a field declaration — reserved names included — before the wire),
 [`jobs.py`](binders/python/cheetah_db/jobs.py) (`JOB` submit/status/fetch plus a poll loop),
@@ -1824,14 +1841,14 @@ plus the two front-end handlers. There is no generated API manifest.
 | `ALIAS list/get/keys/types/profile/digest` | [`micro_alias.go`](src/micro_alias.go), [`command_index.go`](src/command_index.go), [`binary_profile.go`](src/binary_profile.go) |
 | The binary framing itself (no command of its own — a codec over every line) | [`binary_protocol.go`](src/binary_protocol.go), [`server.go`](src/server.go) `handleBinaryConnection` |
 | `RECORD define/alter/compact/schema/tables/set/get/scan`, `DEL records` | [`micro_record.go`](src/micro_record.go), [`record_table.go`](src/record_table.go), [`record_schema.go`](src/record_schema.go) |
-| `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL`, `GRAPH_EDGE_DEL`, `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH` (aliases over the above) | [`command_alias.go`](src/command_alias.go) |
+| `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL`, `GRAPH_EDGE_DEL`, `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH`, `GRAPH_RECALL_ASYNC/_STATUS/_FETCH` (aliases over the above) | [`command_alias.go`](src/command_alias.go) |
 | `INSERT`, `READ`, `EDIT` | [`commands.go`](src/commands.go) |
 | `PAIR_SET(_HIDDEN)`, `PAIR_GET` | [`commands.go`](src/commands.go) |
 | `PAIR_SCAN`, `PAIR_SUMMARY` | [`database.go`](src/database.go) (`PairScanWithOptions`, `PairSummaryWithOptions`) |
 | `PAIR_REDUCE` | [`database.go`](src/database.go) + [`reducers.go`](src/reducers.go); its async forms go through [`jobs.go`](src/jobs.go) |
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
-| `GRAPH_RECALL` (including bounded complete references), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go) |
+| `GRAPH_RECALL` (including bounded complete references and the shared sync/job execution path), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go), [`micro_job.go`](src/micro_job.go) |
 | `GRAPH_CACHE stats/config/get/links/common/put/prune`, `DEL graph_cache` | [`micro_graph_cache.go`](src/micro_graph_cache.go), [`graph_cache.go`](src/graph_cache.go) |
 | `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`jobs.go`](src/jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
@@ -2068,13 +2085,14 @@ seen in old docs are **client-side**; the server does not read them.
 | End-to-end graph pipeline over TCP (build+boot server, ingest→query→predict, gated) | [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go) (`CHEETAH_NELL_E2E=1`) |
 | Node binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors; binary transcoding preserves latin1-spelled UTF-8 payload bytes | [`binders/nodejs/test/protocol.test.js`](binders/nodejs/test/protocol.test.js), [`binders/nodejs/test/binary.test.js`](binders/nodejs/test/binary.test.js) (`node --test`) |
 | Node binder: fixed-width hex ordering, integer bucketing and tolerance sweeps | [`binders/nodejs/test/keys.test.js`](binders/nodejs/test/keys.test.js) |
+| Node binder: graph command shapes, recall evidence/merging, detached recall retrieval by id | [`binders/nodejs/test/graph.test.js`](binders/nodejs/test/graph.test.js) |
 | Node binder: `CheetahDatabase` layout guard, owned-pool binary transport forwarding, mutation chain, id allocation, accounting | [`binders/nodejs/test/database.test.js`](binders/nodejs/test/database.test.js) |
 | Node/Python server launchers select `cheetah-server.exe` on Windows | [`binders/nodejs/test/server.test.js`](binders/nodejs/test/server.test.js), [`binders/python/tests/test_server.py`](binders/python/tests/test_server.py) |
 | Node binder against a live server (KV, batch, scan paging, recall, reset, pipelining) | [`binders/nodejs/test/integration.test.js`](binders/nodejs/test/integration.test.js) (`CHEETAH_INTEGRATION=1`) |
 | Python binder: response grammar, `value=` to end of line, `x<HEX>` escaping, verbatim cursors | [`binders/python/tests/test_protocol.py`](binders/python/tests/test_protocol.py) (`python3 -m unittest`) |
 | Python binder: fixed-width hex ordering, integer bucketing and tolerance sweeps | [`binders/python/tests/test_keys.py`](binders/python/tests/test_keys.py) |
 | Python binder: two-step write, `PAIR_PUT_BATCH` item escaping and partial-batch refusal, cursor paging | [`binders/python/tests/test_kv.py`](binders/python/tests/test_kv.py) |
-| Python binder: `GRAPH_*` encoding, clamped recall bounds, batched noisy-OR merge | [`binders/python/tests/test_graph.py`](binders/python/tests/test_graph.py) |
+| Python binder: `GRAPH_*` encoding, clamped recall bounds, batched noisy-OR merge, detached recall retrieval by id | [`binders/python/tests/test_graph.py`](binders/python/tests/test_graph.py) |
 | Python binder: `JOB` submit/poll/fetch, consumed job, failure and timeout | [`binders/python/tests/test_jobs.py`](binders/python/tests/test_jobs.py) |
 | Python binder: socket handshake, reconnect, inactivity grace, thread-local pool and post-reset close ownership | [`binders/python/tests/test_client.py`](binders/python/tests/test_client.py) |
 | Python binder: `CheetahDatabase` layout guard, per-key mutation lock, id allocation, accounting | [`binders/python/tests/test_database.py`](binders/python/tests/test_database.py) |
@@ -2183,7 +2201,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - **Cluster fork overrides are not persisted** — `CLUSTER_MOVE` reassignments are lost on restart
   ([`cluster_scheduler.go`](src/cluster_scheduler.go) `load`). First open item in
   [`NEXT_STEPS.md`](NEXT_STEPS.md) after the roadmap items that shipped.
-- **Command-surface redundancy, partly factored out.** `JOB` now backs both async trios and `DEL`
+- **Command-surface redundancy, partly factored out.** `JOB` now backs all three async trios and `DEL`
   backs the five erasures, each historical name kept as an alias
   ([`command_alias.go`](src/command_alias.go)). Still redundant: the `_BATCH` forms, the four
   hydration levels of one adjacency/trie walk (`SCAN` + `view=`), and the point read/write pairs
@@ -2194,8 +2212,8 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))
 
-1. Recall consolidation: persist repeatedly co-activated pairs as derived edges (plus a forgetting
-   rule), an async recall variant, and frequency-weighted / misspelling-tolerant term matching.
+1. Finish the association-cache follow-ons (persist its config, seed its entry count after reopen,
+   share capacity across databases), then add frequency-weighted / misspelling-tolerant term matching.
 2. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
 3. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
 4. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.

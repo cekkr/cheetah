@@ -191,7 +191,7 @@ Three argument dialects coexist, which is why a command's family is easier to gu
 | Dialect | Used by | Example |
 | --- | --- | --- |
 | **positional** | the KV and `PAIR_*` families, `LOG_FLUSH`, `FORK_ASSIGN`, job polling | `PAIR_SCAN ctx: 64 x000104` |
-| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY`, every `PREDICT_*` except the two job-polling ones, every `CLUSTER_*`, the micro-commands (`ALIAS`, `BATCH`, `DEL`, `JOB`, `RECORD`) | `GRAPH_DEGREE id=alice direction=both` |
+| **`key=value` tokens** | every `GRAPH_*` except `GRAPH_QUERY` and the two recall job-polling aliases, every `PREDICT_*` except its two job-polling aliases, every `CLUSTER_*`, the micro-commands (`ALIAS`, `BATCH`, `DEL`, `JOB`, `RECORD`) | `GRAPH_DEGREE id=alice direction=both` |
 | **clause language** | `GRAPH_QUERY` only | `MATCH (id='alice')-[:follows]->(*) HOPS 1..2 RETURN paths` |
 
 `FILE_CHECKPOINT` adds a fourth, smaller convention: bare uppercase flags (`DROP_CACHE`,
@@ -223,9 +223,9 @@ them, so nothing below replaces anything you already use.
 | `DEL records table=<t> drop=1` | — | the whole record table: every row, every generation, and the schema |
 | `RECORD define \| alter \| compact \| schema \| tables \| set \| get \| scan` | — | multi-field tables, see [Record tables](#record-tables--one-thing-many-fields) |
 | `ALIAS list \| get \| keys \| types \| profile \| digest` | — | the protocol describing itself: the numeric index of every command, and a table's numeric widths. See [Byte-wise protocol](#byte-wise-binary-protocol) |
-| `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`), anything else is `ERROR,command_not_submittable` |
-| `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS` | `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters; `available=` appears only for a job that produces results per item |
-| `JOB fetch id=<job>` | `PAIR_REDUCE_FETCH`, `PREDICT_INHERIT_FETCH` | the submitted command's own response under `job=<id>` while completed, `PENDING,…` while running, and it consumes the job |
+| `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC`, `GRAPH_RECALL_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`, `GRAPH_RECALL`), anything else is `ERROR,command_not_submittable` |
+| `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS`, `GRAPH_RECALL_STATUS` | retrieves a job by its returned id and reports `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters; `available=` appears only for a job that produces results per item |
+| `JOB fetch id=<job>` | `PAIR_REDUCE_FETCH`, `PREDICT_INHERIT_FETCH`, `GRAPH_RECALL_FETCH` | retrieves the submitted command's response under `job=<id>` when completed, `PENDING,…` while running, and consumes the job |
 | `JOB results id=<job> [from=<n>] [limit=<n>]` | — | the results produced **so far**, without consuming the job: `from=`/`count=`/`next=`/`available=` plus `payload=<base64 json[]>`. Feed `next` back as `from` to page through a long `BATCH` while it runs. Page cap 1 000 |
 | `BATCH <COMMAND> items=<base64 json[]> [continue_on_error=1] [results=0] [async=1] [<shared>=<v>…]` | `PAIR_PUT_BATCH`, `GRAPH_EDGE_SET_BATCH`, `PREDICT_INHERIT_BATCH` (all three still work) | **run any command N times in one request** — see [BATCH](#batch--one-command-n-argument-sets) |
 
@@ -372,7 +372,7 @@ GRAPH_EDGE_DEL from=<a> to=<b> [type=<t>] [directed=<d>]
     → "SUCCESS,edge_deleted,id=" + r.edge
 ```
 
-The two async trios are the same shape over `JOB`. They differ only in which command they submit and
+The three async trios are the same shape over `JOB`. They differ only in which command they submit and
 which fields their formatter picks — which is exactly the redundancy the envelope removed:
 
 ```text
@@ -415,6 +415,20 @@ PREDICT_INHERIT_FETCH <job>
     on ERROR: job_not_found        → "ERROR,predict_inherit_job_not_found"
     if r is PENDING → "PENDING,job=,state=,progress=,completed=,total=,merged=,skipped=,failed="
     → "SUCCESS,job=,merged=,skipped=,failed=,total="                              (values from r)
+
+GRAPH_RECALL_ASYNC seeds=<t>[,…] [<recall options>]
+    r ← JOB submit command=base64("GRAPH_RECALL " + <arguments verbatim>)
+    → "SUCCESS,command=GRAPH_RECALL,job=" + r.job + ",state=queued,total=" + r.total + ",budget=" + r.budget
+      # without an explicit budget, a detached recall gets the maximum bounded sweep (262144)
+
+GRAPH_RECALL_STATUS <job>
+    r ← JOB status id=<job>
+    → "SUCCESS,job=,state=,progress=,completed=,total="                           (values from r)
+
+GRAPH_RECALL_FETCH <job>
+    r ← JOB fetch id=<job>
+    if r is PENDING → "PENDING,job=,state=,progress=,completed=,total="
+    → "SUCCESS," + r without its job= field       # the GRAPH_RECALL response
 ```
 
 Note what the last two blocks say about `JOB status` on a **failed** job: it answers `SUCCESS` with
@@ -779,6 +793,9 @@ ERROR,graph_query_parse_failed:left_node_must_be_anchored_by_id
 | Command | What it means |
 | --- | --- |
 | `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [references=0\|1] [reference_limit=] [limit=] [branch_limit=] [budget=] [cache=on\|off\|serve] [cache_limit=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. `references=1` also hydrates complete node sentences and episodic payloads cited by `edge.props.src`, under a separate bound. |
+| `GRAPH_RECALL_ASYNC seeds=<t>[,…] [<recall options>]` | The same recall detached under a `graph_recall_<n>` job id. Without an explicit `budget=`, it uses the maximum bounded sweep (262 144) instead of the synchronous default (4 096). |
+| `GRAPH_RECALL_STATUS <job_id>` | Retrieves that recall by id and reports state/progress. The equivalent generic form is `JOB status id=<job_id>`. |
+| `GRAPH_RECALL_FETCH <job_id>` | `PENDING` while it runs, then the `GRAPH_RECALL` response; consumes the job. `JOB fetch id=<job_id>` keeps `job=` on the terminal response for correlation. |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=] [precision=]` | **"What else behaves like this?"** — nodes with the same neighbours (distributional) or the same words in their id (lexical). No edge between them is required. |
 | `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=] [cursor=]` | Maintenance of the derived `\x05gt:` lexical index that free-text seeds resolve through. It is never authoritative: exact ids and synonym edges keep working without it, and `rebuild` is resumable through `next_cursor`. |
 | `GRAPH_CACHE stats\|config\|get\|links\|common\|put\|prune …` | **What recall learned.** A cache of *parallel, implicit tables* under `\x07gc:` holding the shortcuts and the convergences that earlier recalls paid for. It is never authoritative — erasing it changes no answer, only how long one takes. See [Association cache](#association-cache--what-recall-learned). |
@@ -809,6 +826,14 @@ SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=3
 SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,references=0,count=3,bridges=0,truncated=0,precision=0.100,cache=miss,cache_injected=0,cache_links=<n>,cache_common=0,payload=<base64>
 # "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"}]}]
 # a bare word, not an id — resolved through the term index, and it says so
+
+[cheetah_data/notes]> GRAPH_RECALL_ASYNC seeds=cat:luna,person:marco hops=4 precision=0.02 cache=off
+SUCCESS,command=GRAPH_RECALL,job=graph_recall_1,state=queued,total=262144,budget=262144
+[cheetah_data/notes]> JOB status id=graph_recall_1
+SUCCESS,job=graph_recall_1,kind=graph_recall,state=running,progress=…,completed=…,total=262144,seeds=2,budget=262144
+[cheetah_data/notes]> JOB fetch id=graph_recall_1
+SUCCESS,job=graph_recall_1,command=GRAPH_RECALL,…,payload=<base64>
+# the returned id works with generic JOB status/fetch as well as GRAPH_RECALL_STATUS/FETCH
 
 [cheetah_data/notes]> GRAPH_SIMILAR id=cat:luna limit=3
 SUCCESS,command=GRAPH_SIMILAR,id=cat:luna,count=3,truncated=0,payload=<base64>
@@ -1415,6 +1440,7 @@ node that does not exist yet (disable with `autocreate=0`).
 | `GRAPH_NEIGHBOR_TYPES id=<id> [direction=out\|in\|both] [limit=<n>] [cursor=<tok>] [weighted=0\|1]` | `payload=` a compact relation histogram `[{type,count,weighted}]`. |
 | `GRAPH_AMBIGUITY_GET from=<id> group=<g> [direction=out\|in] [limit=<n>]` | `count`, `confidence_sum`, `top`, `top_modality`, and `payload=` the alternatives, strongest first. |
 | `GRAPH_RECALL seeds=<t>[,…] [precision=…] [hops=…] [min_sources=…] [references=0\|1] [reference_limit=…] […]` | `resolved`, `visited`, `expanded`, `references`, `count`, `bridges`, `truncated`, and `payload=` the resolved seeds plus the ranked associations. With `references=1`, each association may include complete stored sentences and episodic source payloads. See [associative recall](#associative-recall--graph_recall-graph_similar). |
+| `GRAPH_RECALL_ASYNC <same arguments>` / `GRAPH_RECALL_STATUS <job_id>` / `GRAPH_RECALL_FETCH <job_id>` | Submit, retrieve progress by id, then consume the final recall response. Generic `JOB status id=` / `JOB fetch id=` accept the same `graph_recall_<n>` id; the generic terminal response retains `job=`. |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=<n>]` | `count`, `truncated`, and `payload=` `[{id,score,context,lexical,shared_count,shared,labels}]`. |
 | `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=<n>] [cursor=<tok>]` | `entries`/`enabled` (stats), `nodes`+`terms`+`next_cursor` (rebuild), `removed` (drop). |
 
@@ -1507,7 +1533,16 @@ GRAPH_RECALL seeds=<term>[,<term>…]     # free text or node ids; base64:<list>
   [references=0|1]           # hydrate complete sentence evidence, default 0
   [reference_limit=<n>]      # global sentence cap for this recall, default 32, max 256
   [limit=<n>] [branch_limit=<n>] [budget=<n>] [include_seeds=0|1] [seed_limit=<n>]
+
+GRAPH_RECALL_ASYNC <the same arguments> # returns job=graph_recall_<n>
+GRAPH_RECALL_STATUS <job_id>            # or JOB status id=<job_id>
+GRAPH_RECALL_FETCH <job_id>             # or JOB fetch id=<job_id>
 ```
+
+The synchronous call defaults to a 4 096-unit hydration budget so an interactive round trip stays
+bounded. The async form validates before allocating an id, then defaults to the safe maximum of
+262 144 and reports progress through that id. An explicit `budget=` is honored in both forms. Jobs
+are process-local, and a successful fetch consumes the id.
 
 Scoring, in one line each:
 

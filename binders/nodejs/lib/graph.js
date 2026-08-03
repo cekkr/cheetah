@@ -24,6 +24,7 @@
 // a second time. The `async` functions are those builders plus one `send`.
 
 const { CheetahError } = require('./client');
+const jobs = require('./jobs');
 const { buildKeyValueCommand, decodePayload, numericField, parseCursor } = require('./protocol');
 
 /** Hard server-side cap on `seeds=`; batching above it is the caller's job. */
@@ -496,13 +497,49 @@ async function recall(conn, {
         references,
         referenceLimit,
     }), `GRAPH_RECALL over ${seeds.length} seeds`);
+    return recallResult(response);
+}
+
+/** Decode the GRAPH_RECALL response returned directly or through JOB fetch. */
+function recallResult(response, jobId = null) {
     const payload = decodePayload(response.fields) || {};
-    return {
+    const result = {
         seeds: payload.seeds || [],
         associations: payload.associations || [],
         references: numericField(response.fields, 'references', 0),
         truncated: numericField(response.fields, 'truncated', 0) > 0,
     };
+    const resolvedJobId = response.fields.job || jobId;
+    if (resolvedJobId) result.jobId = resolvedJobId;
+    return result;
+}
+
+/**
+ * Detach one recall and return its `graph_recall_<n>` id.
+ *
+ * `budget` intentionally stays absent unless the caller supplies it: the
+ * server gives detached recall its maximum bounded sweep by default, unlike
+ * the smaller interactive default used by synchronous GRAPH_RECALL.
+ */
+async function recallAsync(conn, options = {}) {
+    if (Array.isArray(options.seeds) && options.seeds.length > MAX_RECALL_SEEDS) {
+        throw new RangeError(
+            `GRAPH_RECALL accepts at most ${MAX_RECALL_SEEDS} seeds, got ${options.seeds.length}`
+        );
+    }
+    return jobs.submit(conn, buildRecall(options));
+}
+
+/** Retrieve and decode a detached recall by job id, or null while it runs. */
+async function fetchRecall(conn, jobId) {
+    const response = await jobs.fetch(conn, jobId);
+    return response === null ? null : recallResult(response, jobId);
+}
+
+/** Poll a detached recall by id and decode its terminal result. */
+async function awaitRecall(conn, jobId, options = {}) {
+    const response = await jobs.awaitJob(conn, jobId, options);
+    return recallResult(response, jobId);
 }
 
 /**
@@ -645,6 +682,7 @@ module.exports = {
     ambiguityGet,
     ambiguityResolve,
     ambiguitySet,
+    awaitRecall,
     buildAmbiguityGet,
     buildAmbiguityResolve,
     buildAmbiguitySet,
@@ -666,6 +704,7 @@ module.exports = {
     deleteEdge,
     deleteNode,
     encodeJsonArgument,
+    fetchRecall,
     getEdge,
     getNode,
     neighborTypes,
@@ -674,7 +713,9 @@ module.exports = {
     normalizeReferences,
     query,
     recall,
+    recallAsync,
     recallBatched,
+    recallResult,
     setEdge,
     setEdgeBatch,
     setNode,
