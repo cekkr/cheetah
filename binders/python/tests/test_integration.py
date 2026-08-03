@@ -135,6 +135,13 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn(name, listed)
         self.assertTrue(listed[name].ad_hoc)
         self.assertEqual(listed[name].settings["payload_cache_bytes"], 8 << 20)
+        changed = admin.configure_database(
+            self.conn, name, payload_cache_entries=17, graph_cache_sample=0.5
+        )
+        self.assertTrue(changed.loaded)
+        self.assertEqual(
+            changed.applied, ("payload_cache_entries", "graph_cache_sample")
+        )
 
     def test_server_gauges_are_readable(self) -> None:
         stats = admin.system_stats(self.conn)

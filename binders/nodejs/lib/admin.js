@@ -9,7 +9,7 @@
 // Two scopes are deliberately kept apart here, because the server keeps them
 // apart:
 //
-//   - `DB_CREATE`/`DB_LIST` address the **engine** — the registry — and change
+//   - `DB_CREATE`/`DB_CONFIG`/`DB_LIST` address the **engine** — the registry — and change
 //     nothing about the connection that issues them.
 //   - `DATABASE`/`RESET_DB` are **connection-scoped**: they change what *this*
 //     socket is pointing at, so on a pool they must be broadcast or the pool
@@ -19,7 +19,7 @@ const { CheetahError } = require('./client');
 const { buildKeyValueCommand, decodePayload, numericField } = require('./protocol');
 
 /**
- * The per-database settings `DB_CREATE`/`DATABASE`/`RESET_DB` accept. They
+ * The per-database settings `DB_CONFIG`/`DB_CREATE`/`DATABASE`/`RESET_DB` accept. They
  * override the server's own `[database]` section for that database alone and
  * are persisted next to its data (`<db>/settings.ini`), so they survive a
  * restart. The trie-geometry ones only bite when the directory is *created*:
@@ -35,6 +35,15 @@ const DATABASE_SETTINGS = Object.freeze([
     'payload_cache_entries',
     'payload_cache_mb',
     'payload_cache_bytes',
+    'graph_cache_enabled',
+    'graph_cache_sample',
+    'graph_cache_capacity',
+    'graph_cache_half_life',
+    'graph_cache_min_utility',
+    'graph_cache_budget',
+    'graph_cache_interval',
+    'graph_cache_page',
+    'graph_cache_page_size',
 ]);
 
 function settingTokens(settings) {
@@ -71,6 +80,10 @@ function buildCreateDatabase(name, settings) {
     return ['DB_CREATE', String(name), ...settingTokens(settings)].join(' ');
 }
 
+function buildConfigureDatabase(name, settings) {
+    return ['DB_CONFIG', String(name), ...settingTokens(settings)].join(' ');
+}
+
 /**
  * `DB_CREATE` — a **new** database, optionally with settings of its own.
  *
@@ -86,6 +99,30 @@ async function createDatabase(conn, name, settings) {
     const created = { ...response.fields };
     delete created.database_created;
     return { name: response.fields.database_created || String(name), settings: created, response };
+}
+
+/**
+ * Persist settings for an existing database. Cache settings apply immediately
+ * when loaded; trie geometry is reported in `reset` and remains pinned until
+ * `RESET_DB` rebuilds the database.
+ */
+async function configureDatabase(conn, name, settings) {
+    const response = await sendOrThrow(conn, buildConfigureDatabase(name, settings), `DB_CONFIG ${name}`);
+    const actions = (field) => !field || field === '-' ? [] : field.split(';').filter(Boolean);
+    const effective = { ...response.fields };
+    for (const key of ['database_configured', 'loaded', 'applied', 'on_open', 'reopen', 'reset']) {
+        delete effective[key];
+    }
+    return {
+        name: response.fields.database_configured || String(name),
+        loaded: response.fields.loaded === '1',
+        applied: actions(response.fields.applied),
+        onOpen: actions(response.fields.on_open),
+        reopen: actions(response.fields.reopen),
+        reset: actions(response.fields.reset),
+        settings: effective,
+        response,
+    };
 }
 
 /**
@@ -234,11 +271,13 @@ async function clusterMove(conn, { node, prefix = null, fork = null } = {}) {
 
 module.exports = {
     DATABASE_SETTINGS,
+    buildConfigureDatabase,
     buildCreateDatabase,
     clusterMove,
     clusterStatus,
     clusterUpdate,
     createDatabase,
+    configureDatabase,
     fileCheckpoint,
     forkAssign,
     listDatabases,

@@ -45,6 +45,23 @@ class DatabaseOperationTests(unittest.TestCase):
         with self.assertRaises(CheetahError):
             admin.create_database(self.conn, "bench")
 
+    def test_configure_database_reports_hot_and_reset_actions(self) -> None:
+        admin.create_database(self.conn, "bench")
+        changed = admin.configure_database(
+            self.conn,
+            "bench",
+            payload_cache_entries=7,
+            graph_cache_sample=0.5,
+            pair_bytes=2,
+        )
+        self.assertEqual(
+            self.conn.commands[-1],
+            "DB_CONFIG bench payload_cache_entries=7 graph_cache_sample=0.5 pair_bytes=2",
+        )
+        self.assertIn("payload_cache_entries", changed.applied)
+        self.assertIn("graph_cache_sample", changed.applied)
+        self.assertEqual(changed.reset, ("pair_index_bytes",))
+
     def test_unknown_settings_are_caught_before_the_wire(self) -> None:
         with self.assertRaises(CheetahError):
             admin.create_database(self.conn, "bench", cache_size_mb=16)

@@ -67,6 +67,26 @@ test('an existing database is an error, not a silent adoption', async () => {
     await assert.rejects(() => admin.createDatabase(conn, 'bench'), /database_exists/);
 });
 
+test('configureDatabase separates hot changes from trie resets', async () => {
+    const conn = fakeConn(
+        () => 'SUCCESS,database_configured=bench,loaded=1,' +
+            'applied=payload_cache_entries;graph_cache_sample,on_open=-,reopen=-,' +
+            'reset=pair_index_bytes,pair_index_bytes=2,payload_cache_entries=7,graph_cache_sample=0.5'
+    );
+    const changed = await admin.configureDatabase(conn, 'bench', {
+        payload_cache_entries: 7,
+        graph_cache_sample: 0.5,
+        pair_bytes: 2,
+    });
+    assert.equal(
+        conn.lines[0],
+        'DB_CONFIG bench payload_cache_entries=7 graph_cache_sample=0.5 pair_bytes=2'
+    );
+    assert.deepEqual(changed.applied, ['payload_cache_entries', 'graph_cache_sample']);
+    assert.deepEqual(changed.reset, ['pair_index_bytes']);
+    assert.equal(changed.settings.graph_cache_sample, '0.5');
+});
+
 test('resetDatabase refuses to carry settings without a name', async () => {
     const conn = fakeConn(() => 'SUCCESS,database_reset_to_notes');
     await assert.rejects(() => admin.resetDatabase(conn, null, { pair_bytes: 2 }), /explicit database name/);

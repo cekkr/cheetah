@@ -33,7 +33,7 @@ Each is usable on its own; higher ones are conveniences over lower ones.
 | `jobs` | Detached commands over the `JOB` envelope: `submit`, `status`, `fetch`, `results`, `awaitJob`, `supportsJobApi`. |
 | `batch` | `BATCH` — one command, N argument sets, one round trip: `buildBatch`, `runBatch`, `runBatchChunked`, `runBatchAsync`, `batch`, `parseBatchResponse`, plus `CommandBatcher`, the coalescer `CheetahClient` runs by itself. |
 | `predict` | Prediction tables: `setValue`, `query`, `train`, `contextAdjust`, `inherit`, `inheritBatch`, `backend`, `bench`. |
-| `admin` | The server and the registry of databases, not the data: `createDatabase`, `listDatabases`, `useDatabase`, `resetDatabase`, `systemStats`, `logFlush`, `fileCheckpoint`, `clusterUpdate`/`clusterStatus`/`clusterMove`, `forkAssign`. |
+| `admin` | The server and the registry of databases, not the data: `createDatabase`, `configureDatabase`, `listDatabases`, `useDatabase`, `resetDatabase`, `systemStats`, `logFlush`, `fileCheckpoint`, `clusterUpdate`/`clusterStatus`/`clusterMove`, `forkAssign`. |
 | `keys` | Key-building primitives: fixed-width `hex`/`unhex`, `sha1`, and integer `quantize`/`bucketize`/`bucketSweep`. |
 | `vocabulary` | `TokenVocabulary` — a persisted string → uint32 allocator, both directions. |
 | `database` | `CheetahDatabase` — the plumbing an application writes around all of the above. Subclass it; its owned pool accepts the same `binary` transport option as `CheetahClient`/`CheetahPool`. |
@@ -259,6 +259,7 @@ const { admin, graph, jobs } = require('cheetah-db');
 // A database of its own, with settings that override the server's [database]
 // section for this database alone and persist next to its data.
 await admin.createDatabase(pool, 'bench', { pair_bytes: 2, payload_cache_mb: 256 });
+await admin.configureDatabase(pool, 'bench', { payload_cache_mb: 128, graph_cache_sample: 0.5 });
 await admin.listDatabases(pool);        // name, path, loaded, adHoc, settings
 
 // A sweep too long for one round trip.

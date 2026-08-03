@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config describes server-wide settings loaded from config.ini/environment variables.
@@ -21,9 +23,17 @@ type Config struct {
 
 // DatabaseConfig holds concrete per-database tunables.
 type DatabaseConfig struct {
-	PairIndexBytes      int
-	PayloadCacheEntries int
-	PayloadCacheBytes   int64
+	PairIndexBytes       int
+	PayloadCacheEntries  int
+	PayloadCacheBytes    int64
+	GraphCacheEnabled    bool
+	GraphCacheSample     float64
+	GraphCacheCapacity   int
+	GraphCacheHalfLife   time.Duration
+	GraphCacheMinUtility float64
+	GraphCacheBudget     int
+	GraphCacheInterval   time.Duration
+	GraphCachePageSize   int
 	// AdaptivePairIndex enables the adaptive per-node trie container: sparse
 	// nodes are stored as a binary-searched sorted list and only densify into a
 	// direct-mapped array once populated. Disabling it forces every node to the
@@ -41,28 +51,46 @@ type DatabaseConfig struct {
 
 // DatabaseOverrides carries optional overrides collected via CLI/API commands.
 type DatabaseOverrides struct {
-	PairIndexBytes      *int
-	PayloadCacheEntries *int
-	PayloadCacheBytes   *int64
-	AdaptivePairIndex   *bool
-	PairListMaxBytes    *int
-	PairListMaxFillPct  *int
+	PairIndexBytes       *int
+	PayloadCacheEntries  *int
+	PayloadCacheBytes    *int64
+	AdaptivePairIndex    *bool
+	PairListMaxBytes     *int
+	PairListMaxFillPct   *int
+	GraphCacheEnabled    *bool
+	GraphCacheSample     *float64
+	GraphCacheCapacity   *int
+	GraphCacheHalfLife   *time.Duration
+	GraphCacheMinUtility *float64
+	GraphCacheBudget     *int
+	GraphCacheInterval   *time.Duration
+	GraphCachePageSize   *int
 }
 
 const defaultPairListMaxBytes = 4096
 
 func defaultConfig() Config {
+	graphCache := defaultGraphCacheConfig()
+	graphCache.Enabled = graphCacheEnabledByEnv()
 	return Config{
 		ListenAddr:          "0.0.0.0:4455",
 		DataDir:             "cheetah_data",
 		DefaultDatabase:     "default",
 		TCPKeepAliveSeconds: 60,
 		DatabaseDefaults: DatabaseConfig{
-			PairIndexBytes:      1,
-			PayloadCacheEntries: defaultPayloadCacheEntries,
-			PayloadCacheBytes:   defaultPayloadCacheBytes,
-			AdaptivePairIndex:   true,
-			PairListMaxBytes:    defaultPairListMaxBytes,
+			PairIndexBytes:       1,
+			PayloadCacheEntries:  defaultPayloadCacheEntries,
+			PayloadCacheBytes:    defaultPayloadCacheBytes,
+			AdaptivePairIndex:    true,
+			PairListMaxBytes:     defaultPairListMaxBytes,
+			GraphCacheEnabled:    graphCache.Enabled,
+			GraphCacheSample:     graphCache.Sample,
+			GraphCacheCapacity:   graphCache.Capacity,
+			GraphCacheHalfLife:   graphCache.HalfLife,
+			GraphCacheMinUtility: graphCache.MinUtility,
+			GraphCacheBudget:     graphCache.Budget,
+			GraphCacheInterval:   graphCache.Interval,
+			GraphCachePageSize:   graphCache.PageSize,
 		},
 	}
 }
@@ -143,6 +171,28 @@ func assignConfigValue(section, key, val string, cfg *Config) {
 			}
 		case "adaptive_pair_index":
 			cfg.DatabaseDefaults.AdaptivePairIndex = parseBool(val, cfg.DatabaseDefaults.AdaptivePairIndex)
+		case "graph_cache_enabled":
+			cfg.DatabaseDefaults.GraphCacheEnabled = parseBool(val, cfg.DatabaseDefaults.GraphCacheEnabled)
+		case "graph_cache_sample":
+			cfg.DatabaseDefaults.GraphCacheSample = parseFloat(val, cfg.DatabaseDefaults.GraphCacheSample)
+		case "graph_cache_capacity":
+			cfg.DatabaseDefaults.GraphCacheCapacity = parseIntAllowZero(val, cfg.DatabaseDefaults.GraphCacheCapacity)
+		case "graph_cache_half_life":
+			if parsed, ok := graphCacheParseDuration(val); ok {
+				cfg.DatabaseDefaults.GraphCacheHalfLife = parsed
+			}
+		case "graph_cache_min_utility":
+			cfg.DatabaseDefaults.GraphCacheMinUtility = parseFloat(val, cfg.DatabaseDefaults.GraphCacheMinUtility)
+		case "graph_cache_budget":
+			cfg.DatabaseDefaults.GraphCacheBudget = parseIntAllowZero(val, cfg.DatabaseDefaults.GraphCacheBudget)
+		case "graph_cache_interval":
+			if parsed, ok := graphCacheParseDuration(val); ok {
+				cfg.DatabaseDefaults.GraphCacheInterval = parsed
+			}
+		case "graph_cache_page", "graph_cache_page_size":
+			if parsed := parsePositiveInt(val); parsed > 0 {
+				cfg.DatabaseDefaults.GraphCachePageSize = parsed
+			}
 		}
 	case "tuning":
 		switch key {
@@ -194,6 +244,25 @@ func parseBool(val string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func parseFloat(val string, fallback float64) float64 {
+	parsed, err := parseFiniteFloat(val)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseFiniteFloat(val string) (float64, error) {
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("value must be finite")
+	}
+	return parsed, nil
 }
 
 func parseInt64AllowZero(val string, fallback int64) int64 {
@@ -249,6 +318,9 @@ func applyEnvOverrides(cfg *Config) {
 	if raw := strings.TrimSpace(os.Getenv("CHEETAH_PAIR_LIST_MAX_FILL_PERCENT")); raw != "" {
 		cfg.DatabaseDefaults.PairListMaxFillPercent = parseIntAllowZero(raw, cfg.DatabaseDefaults.PairListMaxFillPercent)
 	}
+	if raw := strings.TrimSpace(os.Getenv("CHEETAH_GRAPH_CACHE")); raw != "" {
+		cfg.DatabaseDefaults.GraphCacheEnabled = parseBool(raw, cfg.DatabaseDefaults.GraphCacheEnabled)
+	}
 }
 
 func (cfg *Config) normalize() {
@@ -279,6 +351,28 @@ func (cfg *Config) normalize() {
 	if cfg.DatabaseDefaults.PairListMaxFillPercent < 0 || cfg.DatabaseDefaults.PairListMaxFillPercent > 100 {
 		cfg.DatabaseDefaults.PairListMaxFillPercent = 0
 	}
+	graphDefaults := defaultGraphCacheConfig()
+	if cfg.DatabaseDefaults.GraphCacheSample < 0 || cfg.DatabaseDefaults.GraphCacheSample > 1 {
+		cfg.DatabaseDefaults.GraphCacheSample = graphDefaults.Sample
+	}
+	if cfg.DatabaseDefaults.GraphCacheCapacity < 0 {
+		cfg.DatabaseDefaults.GraphCacheCapacity = graphDefaults.Capacity
+	}
+	if cfg.DatabaseDefaults.GraphCacheHalfLife <= 0 {
+		cfg.DatabaseDefaults.GraphCacheHalfLife = graphDefaults.HalfLife
+	}
+	if cfg.DatabaseDefaults.GraphCacheMinUtility < 0 {
+		cfg.DatabaseDefaults.GraphCacheMinUtility = graphDefaults.MinUtility
+	}
+	if cfg.DatabaseDefaults.GraphCacheBudget < 0 {
+		cfg.DatabaseDefaults.GraphCacheBudget = graphDefaults.Budget
+	}
+	if cfg.DatabaseDefaults.GraphCacheInterval <= 0 {
+		cfg.DatabaseDefaults.GraphCacheInterval = graphDefaults.Interval
+	}
+	if cfg.DatabaseDefaults.GraphCachePageSize <= 0 {
+		cfg.DatabaseDefaults.GraphCachePageSize = graphDefaults.PageSize
+	}
 	if cfg.MaxPairTables < 0 {
 		cfg.MaxPairTables = 0
 	}
@@ -306,6 +400,30 @@ func mergeDatabaseConfig(base DatabaseConfig, override DatabaseOverrides) Databa
 	}
 	if override.PairListMaxFillPct != nil {
 		result.PairListMaxFillPercent = *override.PairListMaxFillPct
+	}
+	if override.GraphCacheEnabled != nil {
+		result.GraphCacheEnabled = *override.GraphCacheEnabled
+	}
+	if override.GraphCacheSample != nil {
+		result.GraphCacheSample = *override.GraphCacheSample
+	}
+	if override.GraphCacheCapacity != nil {
+		result.GraphCacheCapacity = *override.GraphCacheCapacity
+	}
+	if override.GraphCacheHalfLife != nil {
+		result.GraphCacheHalfLife = *override.GraphCacheHalfLife
+	}
+	if override.GraphCacheMinUtility != nil {
+		result.GraphCacheMinUtility = *override.GraphCacheMinUtility
+	}
+	if override.GraphCacheBudget != nil {
+		result.GraphCacheBudget = *override.GraphCacheBudget
+	}
+	if override.GraphCacheInterval != nil {
+		result.GraphCacheInterval = *override.GraphCacheInterval
+	}
+	if override.GraphCachePageSize != nil {
+		result.GraphCachePageSize = *override.GraphCachePageSize
 	}
 	return result
 }
@@ -356,6 +474,54 @@ func parseDatabaseOverrideTokens(tokens []string) (DatabaseOverrides, error) {
 				return overrides, fmt.Errorf("pair_list_max_fill_percent must be 0..100")
 			}
 			overrides.PairListMaxFillPct = ptrInt(v)
+		case "graph_cache_enabled":
+			parsed, ok := parseStrictBool(val)
+			if !ok {
+				return overrides, fmt.Errorf("graph_cache_enabled must be 0 or 1")
+			}
+			overrides.GraphCacheEnabled = ptrBool(parsed)
+		case "graph_cache_sample":
+			parsed, err := parseFiniteFloat(val)
+			if err != nil || parsed < 0 || parsed > 1 {
+				return overrides, fmt.Errorf("graph_cache_sample must be 0..1")
+			}
+			overrides.GraphCacheSample = ptrFloat64(parsed)
+		case "graph_cache_capacity":
+			parsed, err := strconv.Atoi(val)
+			if err != nil || parsed < 0 {
+				return overrides, fmt.Errorf("graph_cache_capacity must be >=0")
+			}
+			overrides.GraphCacheCapacity = ptrInt(parsed)
+		case "graph_cache_half_life":
+			parsed, ok := graphCacheParseDuration(val)
+			if !ok {
+				return overrides, fmt.Errorf("invalid graph_cache_half_life")
+			}
+			overrides.GraphCacheHalfLife = ptrDuration(parsed)
+		case "graph_cache_min_utility":
+			parsed, err := parseFiniteFloat(val)
+			if err != nil || parsed < 0 {
+				return overrides, fmt.Errorf("graph_cache_min_utility must be >=0")
+			}
+			overrides.GraphCacheMinUtility = ptrFloat64(parsed)
+		case "graph_cache_budget":
+			parsed, err := strconv.Atoi(val)
+			if err != nil || parsed < 0 {
+				return overrides, fmt.Errorf("graph_cache_budget must be >=0")
+			}
+			overrides.GraphCacheBudget = ptrInt(parsed)
+		case "graph_cache_interval":
+			parsed, ok := graphCacheParseDuration(val)
+			if !ok {
+				return overrides, fmt.Errorf("invalid graph_cache_interval")
+			}
+			overrides.GraphCacheInterval = ptrDuration(parsed)
+		case "graph_cache_page", "graph_cache_page_size":
+			parsed, err := strconv.Atoi(val)
+			if err != nil || parsed < 1 {
+				return overrides, fmt.Errorf("graph_cache_page must be >0")
+			}
+			overrides.GraphCachePageSize = ptrInt(parsed)
 		default:
 			return overrides, fmt.Errorf("unknown override %s", key)
 		}
@@ -363,9 +529,22 @@ func parseDatabaseOverrideTokens(tokens []string) (DatabaseOverrides, error) {
 	return overrides, nil
 }
 
-func ptrInt(v int) *int       { return &v }
-func ptrInt64(v int64) *int64 { return &v }
-func ptrBool(v bool) *bool    { return &v }
+func ptrInt(v int) *int                          { return &v }
+func ptrInt64(v int64) *int64                    { return &v }
+func ptrBool(v bool) *bool                       { return &v }
+func ptrFloat64(v float64) *float64              { return &v }
+func ptrDuration(v time.Duration) *time.Duration { return &v }
+
+func parseStrictBool(val string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "1", "true", "yes", "on", "enable", "enabled":
+		return true, true
+	case "0", "false", "no", "off", "disable", "disabled":
+		return false, true
+	default:
+		return false, false
+	}
+}
 
 // --- impostazioni ad hoc per database ---------------------------------------
 //
@@ -388,7 +567,15 @@ func (ov DatabaseOverrides) isEmpty() bool {
 		ov.PayloadCacheBytes == nil &&
 		ov.AdaptivePairIndex == nil &&
 		ov.PairListMaxBytes == nil &&
-		ov.PairListMaxFillPct == nil
+		ov.PairListMaxFillPct == nil &&
+		ov.GraphCacheEnabled == nil &&
+		ov.GraphCacheSample == nil &&
+		ov.GraphCacheCapacity == nil &&
+		ov.GraphCacheHalfLife == nil &&
+		ov.GraphCacheMinUtility == nil &&
+		ov.GraphCacheBudget == nil &&
+		ov.GraphCacheInterval == nil &&
+		ov.GraphCachePageSize == nil
 }
 
 // mergeDatabaseOverrides sovrappone extra a base, campo per campo.
@@ -411,6 +598,30 @@ func mergeDatabaseOverrides(base DatabaseOverrides, extra DatabaseOverrides) Dat
 	}
 	if extra.PairListMaxFillPct != nil {
 		result.PairListMaxFillPct = extra.PairListMaxFillPct
+	}
+	if extra.GraphCacheEnabled != nil {
+		result.GraphCacheEnabled = extra.GraphCacheEnabled
+	}
+	if extra.GraphCacheSample != nil {
+		result.GraphCacheSample = extra.GraphCacheSample
+	}
+	if extra.GraphCacheCapacity != nil {
+		result.GraphCacheCapacity = extra.GraphCacheCapacity
+	}
+	if extra.GraphCacheHalfLife != nil {
+		result.GraphCacheHalfLife = extra.GraphCacheHalfLife
+	}
+	if extra.GraphCacheMinUtility != nil {
+		result.GraphCacheMinUtility = extra.GraphCacheMinUtility
+	}
+	if extra.GraphCacheBudget != nil {
+		result.GraphCacheBudget = extra.GraphCacheBudget
+	}
+	if extra.GraphCacheInterval != nil {
+		result.GraphCacheInterval = extra.GraphCacheInterval
+	}
+	if extra.GraphCachePageSize != nil {
+		result.GraphCachePageSize = extra.GraphCachePageSize
 	}
 	return result
 }
@@ -436,6 +647,30 @@ func renderDatabaseOverrides(ov DatabaseOverrides) []string {
 	}
 	if ov.PayloadCacheBytes != nil {
 		lines = append(lines, fmt.Sprintf("payload_cache_bytes=%d", *ov.PayloadCacheBytes))
+	}
+	if ov.GraphCacheEnabled != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_enabled=%d", boolToInt(*ov.GraphCacheEnabled)))
+	}
+	if ov.GraphCacheSample != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_sample=%s", formatGraphCacheFloat(*ov.GraphCacheSample)))
+	}
+	if ov.GraphCacheCapacity != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_capacity=%d", *ov.GraphCacheCapacity))
+	}
+	if ov.GraphCacheHalfLife != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_half_life=%s", ov.GraphCacheHalfLife.String()))
+	}
+	if ov.GraphCacheMinUtility != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_min_utility=%s", formatGraphCacheFloat(*ov.GraphCacheMinUtility)))
+	}
+	if ov.GraphCacheBudget != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_budget=%d", *ov.GraphCacheBudget))
+	}
+	if ov.GraphCacheInterval != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_interval=%s", ov.GraphCacheInterval.String()))
+	}
+	if ov.GraphCachePageSize != nil {
+		lines = append(lines, fmt.Sprintf("graph_cache_page=%d", *ov.GraphCachePageSize))
 	}
 	return lines
 }
@@ -493,6 +728,14 @@ func databaseSettingTokens(cfg DatabaseConfig) []string {
 		fmt.Sprintf("pair_list_max_fill_percent=%d", cfg.PairListMaxFillPercent),
 		fmt.Sprintf("payload_cache_entries=%d", cfg.PayloadCacheEntries),
 		fmt.Sprintf("payload_cache_bytes=%d", cfg.PayloadCacheBytes),
+		fmt.Sprintf("graph_cache_enabled=%d", boolToInt(cfg.GraphCacheEnabled)),
+		fmt.Sprintf("graph_cache_sample=%s", formatGraphCacheFloat(cfg.GraphCacheSample)),
+		fmt.Sprintf("graph_cache_capacity=%d", cfg.GraphCacheCapacity),
+		fmt.Sprintf("graph_cache_half_life=%s", cfg.GraphCacheHalfLife.String()),
+		fmt.Sprintf("graph_cache_min_utility=%s", formatGraphCacheFloat(cfg.GraphCacheMinUtility)),
+		fmt.Sprintf("graph_cache_budget=%d", cfg.GraphCacheBudget),
+		fmt.Sprintf("graph_cache_interval=%s", cfg.GraphCacheInterval.String()),
+		fmt.Sprintf("graph_cache_page=%d", cfg.GraphCachePageSize),
 	}
 }
 
@@ -504,6 +747,14 @@ func databaseSettingMap(cfg DatabaseConfig) map[string]any {
 		"pair_list_max_fill_percent": cfg.PairListMaxFillPercent,
 		"payload_cache_entries":      cfg.PayloadCacheEntries,
 		"payload_cache_bytes":        cfg.PayloadCacheBytes,
+		"graph_cache_enabled":        cfg.GraphCacheEnabled,
+		"graph_cache_sample":         cfg.GraphCacheSample,
+		"graph_cache_capacity":       cfg.GraphCacheCapacity,
+		"graph_cache_half_life":      cfg.GraphCacheHalfLife.String(),
+		"graph_cache_min_utility":    cfg.GraphCacheMinUtility,
+		"graph_cache_budget":         cfg.GraphCacheBudget,
+		"graph_cache_interval":       cfg.GraphCacheInterval.String(),
+		"graph_cache_page":           cfg.GraphCachePageSize,
 	}
 }
 

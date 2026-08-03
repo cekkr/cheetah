@@ -471,6 +471,8 @@ func TestGraphCacheRejectsUnknownTargets(t *testing.T) {
 	assertCommandPrefix(t, db, "DEL graph_cache scope=nonsense", "ERROR,unknown_graph_cache_scope")
 	assertCommandPrefix(t, db, "GRAPH_CACHE get from=a", "ERROR,graph_cache_get_requires_from_and_to")
 	assertCommandPrefix(t, db, "GRAPH_RECALL seeds=cat:luna cache=nonsense", "ERROR,invalid_cache")
+	assertCommandPrefix(t, db, "GRAPH_CACHE config sample=NaN", "ERROR,invalid_sample")
+	assertCommandPrefix(t, db, "GRAPH_CACHE config min_utility=Inf", "ERROR,invalid_min_utility")
 }
 
 // Il maintainer gira da solo: nessun comando deve essere necessario perché la

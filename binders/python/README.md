@@ -262,6 +262,7 @@ from cheetah_db import admin
 # Settings that override the server's [database] section for this database
 # alone, persisted next to its data so they survive a restart.
 admin.create_database(conn, "bench", pair_bytes=2, payload_cache_mb=256)
+admin.configure_database(conn, "bench", payload_cache_mb=128, graph_cache_sample=0.5)
 admin.list_databases(conn)      # name, path, loaded, ad_hoc, settings
 ```
 

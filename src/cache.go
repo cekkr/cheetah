@@ -48,9 +48,6 @@ type payloadCacheStats struct {
 }
 
 func newPayloadCache(maxEntries int, maxBytes int64) *payloadCache {
-	if maxEntries <= 0 || maxBytes <= 0 {
-		return nil
-	}
 	return &payloadCache{
 		maxEntries: maxEntries,
 		maxBytes:   maxBytes,
@@ -71,6 +68,9 @@ func (c *payloadCache) Get(key payloadCacheKey) ([]byte, bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.enabledLocked() {
+		return nil, false
+	}
 
 	if elem, ok := c.entries[key]; ok {
 		c.hits++
@@ -87,10 +87,12 @@ func (c *payloadCache) Add(key payloadCacheKey, payload []byte) {
 		return
 	}
 
-	data := cloneBytes(payload)
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.enabledLocked() {
+		return
+	}
+	data := cloneBytes(payload)
 
 	if elem, ok := c.entries[key]; ok {
 		existing := elem.Value.(*payloadCacheEntry)
@@ -127,6 +129,39 @@ func (c *payloadCache) evictIfNeeded() {
 		}
 		c.removeElement(elem)
 	}
+}
+
+func (c *payloadCache) enabledLocked() bool {
+	return c.maxEntries > 0 && c.maxBytes > 0
+}
+
+func (c *payloadCache) Enabled() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.enabledLocked()
+}
+
+// Resize applica i due limiti insieme. Il puntatore alla cache non cambia,
+// quindi lettori e scrittori concorrenti vedono o il vecchio profilo o quello
+// nuovo senza una finestra in cui una cache riattivata possa essere persa.
+func (c *payloadCache) Resize(maxEntries int, maxBytes int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.maxEntries = maxEntries
+	c.maxBytes = maxBytes
+	if !c.enabledLocked() {
+		for elem := c.order.Back(); elem != nil; elem = c.order.Back() {
+			c.removeElement(elem)
+		}
+		return
+	}
+	c.evictIfNeeded()
 }
 
 func (c *payloadCache) removeElement(elem *list.Element) {

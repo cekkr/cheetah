@@ -76,7 +76,7 @@ func (c *connSession) execute(line string) string {
 	if len(parts) > 1 {
 		controlArgs = parts[1]
 	}
-	// I comandi di scope engine (DB_CREATE, DB_LIST) stanno in engine.go, in
+	// I comandi di scope engine (DB_CONFIG, DB_CREATE, DB_LIST) stanno in engine.go, in
 	// una funzione condivisa con la CLI: non toccano il database corrente,
 	// ma non possono nemmeno passare da ExecuteCommand.
 	if handled, ok := engineControlCommand(c.engine, command, controlArgs); ok {

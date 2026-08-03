@@ -149,7 +149,7 @@ func (db *Database) microGraphCacheConfig(args microArgs) (microResponse, error)
 		cfg.Enabled = args.flag("enabled", cfg.Enabled)
 	}
 	if raw := args.get("sample"); raw != "" {
-		parsed, err := strconv.ParseFloat(raw, 64)
+		parsed, err := parseFiniteFloat(raw)
 		if err != nil || parsed < 0 || parsed > 1 {
 			return microFail("invalid_sample"), nil
 		}
@@ -170,7 +170,7 @@ func (db *Database) microGraphCacheConfig(args microArgs) (microResponse, error)
 		cfg.HalfLife = parsed
 	}
 	if raw := args.get("min_utility", "utility"); raw != "" {
-		parsed, err := strconv.ParseFloat(raw, 64)
+		parsed, err := parseFiniteFloat(raw)
 		if err != nil || parsed < 0 {
 			return microFail("invalid_min_utility"), nil
 		}
@@ -198,7 +198,12 @@ func (db *Database) microGraphCacheConfig(args microArgs) (microResponse, error)
 		cfg.PageSize = parsed
 	}
 
+	if err := db.persistDatabaseOverrides(graphCacheDatabaseOverrides(cfg)); err != nil {
+		logErrorf("failed to persist graph cache config for database %s: %v", db.name, err)
+		return microFail("cannot_persist_graph_cache_config"), nil
+	}
 	store.setConfig(cfg)
+	db.rememberGraphCacheConfig(cfg)
 	if cfg.Enabled {
 		store.ensureMaintainer()
 	}

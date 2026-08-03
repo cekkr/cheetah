@@ -16,6 +16,7 @@ from .protocol import Response, build_command, build_key_value_command, numeric_
 
 __all__ = [
     "DATABASE_SETTINGS",
+    "DatabaseConfigChange",
     "DatabaseInfo",
     "SystemStats",
     "cluster_gossip",
@@ -23,6 +24,7 @@ __all__ = [
     "cluster_status",
     "cluster_update",
     "create_database",
+    "configure_database",
     "file_checkpoint",
     "fork_assign",
     "list_databases",
@@ -32,7 +34,7 @@ __all__ = [
     "use_database",
 ]
 
-#: The per-database settings ``DB_CREATE``/``DATABASE``/``RESET_DB`` accept.
+#: The per-database settings ``DB_CONFIG``/``DB_CREATE``/``DATABASE``/``RESET_DB`` accept.
 #: They override the server's own ``[database]`` section for that database
 #: alone and are persisted next to its data (``<db>/settings.ini``), so they
 #: survive a restart. The trie-geometry ones only bite when the directory is
@@ -47,6 +49,15 @@ DATABASE_SETTINGS = (
     "payload_cache_entries",
     "payload_cache_mb",
     "payload_cache_bytes",
+    "graph_cache_enabled",
+    "graph_cache_sample",
+    "graph_cache_capacity",
+    "graph_cache_half_life",
+    "graph_cache_min_utility",
+    "graph_cache_budget",
+    "graph_cache_interval",
+    "graph_cache_page",
+    "graph_cache_page_size",
 )
 
 
@@ -96,6 +107,20 @@ class DatabaseInfo:
     settings: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class DatabaseConfigChange:
+    """Result of :func:`configure_database`, including deferred actions."""
+
+    name: str
+    loaded: bool
+    applied: tuple[str, ...]
+    on_open: tuple[str, ...]
+    reopen: tuple[str, ...]
+    reset: tuple[str, ...]
+    settings: dict[str, str]
+    response: Response
+
+
 def _settings_fields(settings: Mapping[str, Any] | None, **kwargs: Any) -> dict[str, Any]:
     merged: dict[str, Any] = dict(settings or {})
     merged.update({key: value for key, value in kwargs.items() if value is not None})
@@ -138,6 +163,38 @@ def create_database(
         "settings": created,
         "response": response,
     }
+
+
+def configure_database(
+    conn: Any, name: str, settings: Mapping[str, Any] | None = None, **kwargs: Any
+) -> DatabaseConfigChange:
+    """Persist and hot-apply settings for an existing database.
+
+    Payload and graph-cache fields apply immediately when the database is
+    loaded. Trie geometry remains pinned and is returned in ``reset``.
+    """
+    parts = ["DB_CONFIG", str(name)]
+    for key, value in _settings_fields(settings, **kwargs).items():
+        parts.append(f"{key}={value}")
+    response = conn.send(" ".join(parts))
+    if not response.ok:
+        raise CheetahError(f"cheetah DB_CONFIG {name} failed: {response.reason}", response=response)
+
+    def actions(field: str) -> tuple[str, ...]:
+        value = response.field_value(field, "") or ""
+        return tuple(item for item in value.split(";") if item and item != "-")
+
+    metadata = {"database_configured", "loaded", "applied", "on_open", "reopen", "reset"}
+    return DatabaseConfigChange(
+        name=response.field_value("database_configured", name) or name,
+        loaded=response.field_value("loaded", "0") == "1",
+        applied=actions("applied"),
+        on_open=actions("on_open"),
+        reopen=actions("reopen"),
+        reset=actions("reset"),
+        settings={key: value for key, value in response.fields.items() if key not in metadata},
+        response=response,
+    )
 
 
 def list_databases(conn: Any) -> list[DatabaseInfo]:

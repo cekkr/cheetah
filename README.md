@@ -70,8 +70,8 @@ holds documentation, `config.example.ini`, `build.sh`, and the two standalone bu
   fixed-byte schema file per table (`records/<name>.schema`) plus rows stored as ordinary payloads
   under a reserved trie prefix, with fields addressable by declared offset and width.
 - `src/server.go` accepts newline-delimited commands (`INSERT`, `READ`, `PAIR_SCAN`, `PAIR_REDUCE`, …)
-  over TCP so external adapters can talk to the engine without embedding Go code. `DB_CREATE` and
-  `DB_LIST` are answered one level up, by `engineControlCommand` in `src/engine.go`, because they
+  over TCP so external adapters can talk to the engine without embedding Go code. `DB_CONFIG`,
+  `DB_CREATE` and `DB_LIST` are answered one level up, by `engineControlCommand` in `src/engine.go`, because they
   address the registry of databases rather than one database.
 
 ## Heavy Statistical Workloads
@@ -127,15 +127,17 @@ Prefer declarative settings? Copy `config.example.ini` to `config.ini` (or point
 
 - `[server]` covers `listen_addr`, `data_dir`, and `default_database`.
 - `[database]` sets `pair_index_bytes` (1 or 2) and `adaptive_pair_index` (default `true`), plus
-  payload-cache sizing.
+  payload-cache sizing and the persisted `graph_cache_*` profile.
 - `[tuning]` exposes `max_pair_tables` so you can pin the open-file budget,
   `pair_list_max_bytes` (default 4096) — the sorted-list size at which an adaptive node expands into
   a direct-mapped array, which also decides which nodes use a list at all — and the optional
   `pair_list_max_fill_percent` (default 0, off).
 
-Per-database overrides can be forced at runtime via CLI/TCP commands—append
-`key=value` tokens such as `pair_bytes=1`, `adaptive_pair_index=0`, or `payload_cache_entries=0` to
-the `DATABASE`/`RESET_DB` commands to rebuild a trie with different settings.
+Per-database overrides can be forced at runtime via CLI/TCP commands: `DB_CREATE` and `DATABASE`
+accept them at creation, `DB_CONFIG <name> key=value …` hot-applies cache fields on an existing
+database, and `RESET_DB` rebuilds a trie with recorded geometry. For example,
+`DB_CONFIG default payload_cache_entries=0 graph_cache_sample=0.1` disables the payload cache and
+retunes association admission without reopening the handle.
 
 `pair_index_bytes` and `adaptive_pair_index` are recorded in `pairs/format.dat` when a database is
 created and that marker wins on every later open, so editing `config.ini` never reinterprets existing
@@ -456,7 +458,7 @@ name  layer   PAIR_SET / PAIR_GET / PAIR_DEL …   byte prefixes in a trie → n
   ├─ recall               GRAPH_RECALL / GRAPH_SIMILAR / GRAPH_TERM_INDEX
   └─ association cache    GRAPH_CACHE — what recall learned, under the reserved \x07 prefix
 side tables   PREDICT_*                          prediction_<name>.table files, not the trie
-control       DATABASE / RESET_DB / DB_CREATE / DB_LIST · CLUSTER_* / FORK_ASSIGN
+control       DATABASE / RESET_DB / DB_CONFIG / DB_CREATE / DB_LIST · CLUSTER_* / FORK_ASSIGN
               SYSTEM_STATS / LOG_FLUSH / FILE_CHECKPOINT
 ```
 
@@ -468,16 +470,17 @@ why four different commands delete four different things.
 
 Handled in the front-ends ([`src/main.go`](src/main.go), [`src/server.go`](src/server.go)) rather
 than in the dispatcher, for two different reasons: `DATABASE`/`RESET_DB`/`EXIT` mutate per-connection
-state, while `DB_CREATE`/`DB_LIST` address the *engine* — the registry of databases — which a single
-`Database` handle knows nothing about. The latter two are implemented once in
+state, while `DB_CONFIG`/`DB_CREATE`/`DB_LIST` address the *engine* — the registry of databases — which a single
+`Database` handle knows nothing about. The latter three are implemented once in
 [`src/engine.go`](src/engine.go) (`engineControlCommand`) and called from both front-ends, so CLI and
 TCP cannot drift.
 
 | Command | What it means |
 | --- | --- |
+| `DB_CONFIG <name> [key=value …]` | Persist settings for an existing database. Payload-cache and graph-cache fields apply immediately when it is loaded; an unloaded database reports them in `on_open=`. `applied=`, `on_open=`, `reopen=` and `reset=` are semicolon-separated action lists (`-` when empty). Trie settings are recorded under `reset=` because `pairs/format.dat` remains authoritative until `RESET_DB`. With no settings, this is a non-mutating settings read. |
 | `DB_CREATE <name> [key=value …]` | **Create a new database with settings of its own**, without pointing the connection at it. The `key=value` tokens override, *for this database only*, the `[database]` section the server was started with; they are written to `cheetah_data/<name>/settings.ini` and re-read at every open, so they outlive the process. Refuses an existing name (`ERROR,database_exists:<name>`) — that refusal is the difference from `DATABASE`, which opens-or-creates and would silently adopt a populated directory. Answers with the settings the database was actually created with. |
 | `DB_LIST` | Every database directory under `data_dir`, with the settings each one would open with and whether it carries its own `settings.ini` (`ad_hoc_settings`). Reads the disk, not the registry: a database never opened in this process is still listed. Records travel in `payload=<base64 json>`. |
-| `DATABASE <name> [key=value …]` | Point **this connection** at another logical database (`cheetah_data/<name>`), creating it on first use. Overrides are remembered for that name and persisted next to its data exactly as with `DB_CREATE`: `pair_bytes=`/`pair_index_bytes=`, `adaptive_pair_index=`, `pair_list_max_bytes=`, `pair_list_max_fill_percent=`, `payload_cache_entries=`, `payload_cache_mb=`, `payload_cache_bytes=`. The trie-geometry ones only bite when the directory is *created*. |
+| `DATABASE <name> [key=value …]` | Point **this connection** at another logical database (`cheetah_data/<name>`), creating it on first use. Overrides are remembered for that name and persisted next to its data exactly as with `DB_CREATE`. Accepted fields cover trie geometry, payload-cache budgets and the `graph_cache_*` profile. Trie geometry only bites when the directory is created; use `DB_CONFIG` for later live cache tuning. |
 | `RESET_DB [name] [key=value …]` | Close the database, delete `cheetah_data/<name>` on disk, reopen it empty. The only way to adopt a new trie geometry, since `pairs/format.dat` wins on every ordinary open. Omitting the name resets whichever database the connection currently holds. |
 | `EXIT` | CLI only: leave the interactive loop. A TCP client just closes the socket. |
 
@@ -489,7 +492,9 @@ budget, and the settings survive a restart because they live beside the data:
 
 ```text
 [cheetah_data/default]> DB_CREATE bench pair_bytes=2 payload_cache_mb=256
-SUCCESS,database_created=bench,pair_index_bytes=2,adaptive_pair_index=1,pair_list_max_bytes=4096,pair_list_max_fill_percent=0,payload_cache_entries=16384,payload_cache_bytes=268435456
+SUCCESS,database_created=bench,pair_index_bytes=2,adaptive_pair_index=1,pair_list_max_bytes=4096,pair_list_max_fill_percent=0,payload_cache_entries=16384,payload_cache_bytes=268435456,graph_cache_enabled=1,graph_cache_sample=0.25,graph_cache_capacity=65536,graph_cache_half_life=6h0m0s,graph_cache_min_utility=0.05,graph_cache_budget=64,graph_cache_interval=15s,graph_cache_page=256
+[cheetah_data/default]> DB_CONFIG bench payload_cache_mb=128 graph_cache_sample=0.5
+SUCCESS,database_configured=bench,loaded=1,applied=payload_cache_bytes;graph_cache_sample,on_open=-,reopen=-,reset=-,…
 [cheetah_data/default]> DB_CREATE bench
 ERROR,database_exists:bench
 [cheetah_data/default]> DB_LIST
@@ -891,7 +896,7 @@ operator or a test that wants the result *now*.
 | Command | What it means |
 | --- | --- |
 | `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration. `recount=1` re-walks the namespace to resynchronise the entry count, which is otherwise an estimate. |
-| `GRAPH_CACHE config [enabled=] [sample=] [capacity=] [half_life=] [min_utility=] [budget=] [interval=] [page=]` | Steers the training live. **Not persisted** — a restart returns to the defaults. |
+| `GRAPH_CACHE config [enabled=] [sample=] [capacity=] [half_life=] [min_utility=] [budget=] [interval=] [page=]` | Steers the training live and persists the resulting profile in this database's `settings.ini`; a reopen restores it. The same fields are accepted with a `graph_cache_` prefix by `DB_CONFIG`. |
 | `GRAPH_CACHE get from=<id> to=<id>` / `signature=<sig>` | One row, with both recurrence counters, its usage probability and its current utility. |
 | `GRAPH_CACHE links id=<id> [limit=]` | Every shortcut known from a node. |
 | `GRAPH_CACHE common seeds=<a,b,…> [<recall options>]` | The memorised answer to "what do these have in common?", without redoing the comparison. Takes the same options as `GRAPH_RECALL` because a convergence found at three hops is not the answer to the same question at one. |

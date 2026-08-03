@@ -216,6 +216,12 @@ test('cheetah binder round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRA
         assert.ok(adhoc, 'DB_LIST reports the database that was just created');
         assert.equal(adhoc.adHoc, true);
         assert.equal(adhoc.settings.payload_cache_bytes, 8 * 1024 * 1024);
+        const configured = await admin.configureDatabase(pool, 'binder_adhoc', {
+            payload_cache_entries: 17,
+            graph_cache_sample: 0.5,
+        });
+        assert.equal(configured.loaded, true);
+        assert.deepEqual(configured.applied, ['payload_cache_entries', 'graph_cache_sample']);
     });
 
     await t.test('a detached reduce runs through the JOB envelope', async () => {

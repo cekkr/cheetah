@@ -128,7 +128,7 @@ the connection-scoped `DATABASE` / `RESET_DB` / `EXIT` commands, which are handl
 because they mutate per-connection "current database" state.
 
 Between those two layers sits a third, smaller one: commands that address the **engine** rather than a
-database (`DB_CREATE`, `DB_LIST`). A `Database` cannot see the registry it belongs to, so they cannot
+database (`DB_CONFIG`, `DB_CREATE`, `DB_LIST`). A `Database` cannot see the registry it belongs to, so they cannot
 live in `ExecuteCommand`; but they are not connection-scoped either, so they are implemented once in
 [`engine.go`](src/engine.go) (`engineControlCommand`) and merely *called* by both front-ends. Prefer
 that shape over a second copy in each loop.
@@ -327,9 +327,11 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   tables in full* — that last part is required, not an optimisation, because a response names its
   fields by index and a client without the argument-key dictionary could not decode even the answer
   to `ALIAS keys`.
-- **Per-database settings are persisted, and the pair format still wins.** `DB_CREATE`/`DATABASE`
+- **Per-database settings are persisted, hot where safe, and the pair format still wins.**
+  `DB_CONFIG`/`DB_CREATE`/`DATABASE`
   overrides are written to `<db>/settings.ini` and re-read at every open, layered
-  defaults → file → session ([`config.go`](src/config.go), [`engine.go`](src/engine.go)). This does
+  defaults → file → session ([`config.go`](src/config.go), [`engine.go`](src/engine.go)). Payload-cache
+  and graph-cache fields apply hot to a loaded handle; `GRAPH_CACHE config` writes the same file. This does
   **not** make trie geometry mutable: `pairs/format.dat` remains authoritative on reopen, so a changed
   `pair_index_bytes` still needs a `RESET_DB`.
 
@@ -399,14 +401,14 @@ handling.
   - `setupGracefulShutdown` — closes the engine + monitor on SIGINT/SIGTERM.
 - **Common mistakes:** A new connection-scoped command must be added to **both** `runCLI` here and
   `handleConnection` in [`server.go`](src/server.go); adding it to only one silently diverges CLI and
-  TCP. A command that is engine-scoped but *not* connection-scoped (`DB_CREATE`, `DB_LIST`) belongs in
+  TCP. A command that is engine-scoped but *not* connection-scoped (`DB_CONFIG`, `DB_CREATE`, `DB_LIST`) belongs in
   `engineControlCommand` ([`engine.go`](src/engine.go)) instead, which both front-ends already call —
   that is the only shape here that cannot drift.
 
 #### [`src/server.go`](src/server.go)
 
 The TCP front-end. Accepts connections, optionally enables OS keep-alives, reads newline-delimited
-commands, and routes them exactly like the CLI (`DB_CREATE`/`DB_LIST` through
+commands, and routes them exactly like the CLI (`DB_CONFIG`/`DB_CREATE`/`DB_LIST` through
 `engineControlCommand`, `DATABASE`/`RESET_DB` locally, else `ExecuteCommand`).
 
 It serves two wire formats over one dispatch. A connection whose **first byte is `0xC7`** is a
@@ -429,16 +431,18 @@ mode is detectable from byte one and needs no negotiation.
 
 Multi-tenant database registry. Lazily constructs and caches [`Database`](src/database.go) handles under
 `basePath/<name>`, applies per-name overrides, and closes all databases on shutdown. It also owns the
-two engine-scoped commands, since a `Database` cannot see the registry it belongs to.
+engine-scoped commands, since a `Database` cannot see the registry it belongs to.
 
 - **Key symbols:** `Engine`, `GetDatabase`/`getDatabaseLocked` (lazy create + cache),
-  `ResetDatabase` (close + `RemoveAll` + drop from map), `SetDatabaseOverrides`,
+  `ResetDatabase` (close + `RemoveAll` + drop from map), `SetDatabaseOverrides`, `ConfigureDatabase`,
   `resolveSettingsLocked`, `EffectiveSettings`, `CreateDatabase`, `ListDatabases`/`DatabaseInfo`,
   `engineControlCommand`, `DefaultDatabaseName`, `Close`.
 - **Settings layering:** `resolveSettingsLocked` composes `cfg.DatabaseDefaults` →
   `<db>/settings.ini` → the session overrides recorded by `SetDatabaseOverrides`. `getDatabaseLocked`
   then writes the session overrides back to that file, which is what makes an ad-hoc setting outlive
-  the process. `CreateDatabase` differs from `GetDatabase` only in refusing an existing directory
+  the process. `ConfigureDatabase` persists changes to an existing database and applies runtime-safe
+  cache fields through `Database.applyHotDatabaseConfig`; its response separates `applied`, `on_open`,
+  `reopen`, and trie-geometry `reset` actions. `CreateDatabase` differs from `GetDatabase` only in refusing an existing directory
   (`errDatabaseExists`) — ad-hoc geometry has no effect on one that already exists.
 - **Shutdown is idempotent end to end.** `Engine.Close` empties the registry, so a second call does
   nothing and a later `GetDatabase` reopens instead of handing back a closed handle;
@@ -453,7 +457,7 @@ two engine-scoped commands, since a `Database` cannot see the registry it belong
 
 Loads settings from `config.ini` (path overridable via `CHEETAH_CONFIG_PATH`), applies environment
 overrides, normalizes/clamps, and parses inline `key=value` database overrides for
-`DATABASE`/`RESET_DB`.
+`DB_CONFIG`/`DB_CREATE`/`DATABASE`/`RESET_DB`.
 
 - **Key symbols:** `Config`, `DatabaseConfig`, `DatabaseOverrides`; `defaultConfig`, `loadConfig`,
   `assignConfigValue` (`[server]`/`[database]`/`[tuning]` sections), `applyEnvOverrides`, `normalize`,
@@ -462,7 +466,9 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
   `saveDatabaseSettings`, `renderDatabaseOverrides`, `databaseSettingTokens`, `databaseSettingMap`).
 - **Config keys** (`config.ini`): `[server] listen_addr, data_dir, default_database,
   keepalive_seconds|tcp_keepalive_seconds`; `[database] pair_bytes|pair_index_bytes,
-  payload_cache_entries, payload_cache_mb, payload_cache_bytes, adaptive_pair_index`;
+  payload_cache_entries, payload_cache_mb, payload_cache_bytes, adaptive_pair_index,
+  graph_cache_enabled, graph_cache_sample, graph_cache_capacity, graph_cache_half_life,
+  graph_cache_min_utility, graph_cache_budget, graph_cache_interval, graph_cache_page`;
   `[tuning] max_pair_tables, pair_list_max_bytes, pair_list_max_fill_percent`.
 - **`<data_dir>/<db>/settings.ini`** holds the same keys for one database, written in the dialect the
   commands accept, and is applied on top of `[database]` at every open. It is deleted (not emptied)
@@ -470,6 +476,18 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
   overrides recorded on the name are rewritten on the reopen that follows.
 - **Common mistakes:** `normalize` clamps `pair_index_bytes` into `[1,2]` but maps `≤0`→**2** (not the
   `defaultConfig` value of 1). All env keys are enumerated in [Configuration reference](#configuration-reference).
+
+#### [`src/database_config.go`](src/database_config.go)
+
+Bridges persisted `DatabaseConfig` values to live database components. It converts the graph-cache
+profile, persists `GRAPH_CACHE config` through the Engine callback (with a direct-`NewDatabase`
+fallback), and applies only runtime-safe settings.
+
+- **Key symbols:** `graphCacheConfigFromDatabaseConfig`, `graphCacheDatabaseOverrides`,
+  `setSettingsPersister`, `persistDatabaseOverrides`, `applyHotDatabaseConfig`,
+  `rememberGraphCacheConfig`.
+- **Common mistakes:** do not copy trie geometry into the live `Database.settings` here. The pair
+  marker is authoritative; geometry changes stay classified as `reset` until the database is rebuilt.
 
 #### [`src/types.go`](src/types.go)
 
@@ -609,10 +627,13 @@ Small value/key utilities used across the engine.
 
 Bounded LRU payload cache keyed by `<value_size, table_id, entry_id>`.
 
-- **Key symbols:** `payloadCache`, `newPayloadCacheFromConfig`, `Get`/`Add`/`Invalidate`,
+- **Key symbols:** `payloadCache`, `newPayloadCacheFromConfig`, `Get`/`Add`/`Invalidate`, `Resize`/`Enabled`,
   `evictIfNeeded`, `Stats` (feeds `SYSTEM_STATS`), `advisoryBypassBytesLocked`, `cloneBytes`.
+- **Tests:** [`cache_test.go`](src/cache_test.go) covers copy isolation, bounded eviction,
+  disable/re-enable and concurrent access while the limits change (`-race`).
 - **Common mistakes:** entries are copied in and out; do not retain or mutate the returned slice. Size
-  budget is entries **and** bytes — both caps apply.
+  budget is entries **and** bytes — both caps apply. The object stays non-nil while disabled so
+  `DB_CONFIG` can re-enable it without racing a pointer replacement; use `Enabled`, not `nil`, for state.
 
 #### [`src/pair_codec.go`](src/pair_codec.go)
 
@@ -1282,7 +1303,10 @@ width, round-tripped).
 
 The engine-scoped commands and per-database settings: `TestDatabaseCreateWithAdHocSettings`
 (`DB_CREATE` overrides only that database, refuses an existing name, and survives a restart),
-`TestDatabaseOverridesFromDatabaseCommandPersist`, `TestDatabaseListReportsSettings`, and
+`TestDatabaseOverridesFromDatabaseCommandPersist`, `TestDatabaseListReportsSettings`,
+`TestDatabaseConfigAppliesHotSettingsAndReportsTrieReset`,
+`TestDatabaseConfigReportsOnOpenForUnloadedDatabase`,
+`TestGraphCacheConfigPersistsThroughDatabaseSettings`, and
 `TestDatabaseNameStaysInsideDataDir` — the traversal guard, which is the one that protects a
 `RESET_DB` from deleting outside `data_dir`.
 
@@ -1348,7 +1372,7 @@ free-function command layers — [`lib/kv.js`](binders/nodejs/lib/kv.js) (the tw
 [`lib/predict.js`](binders/nodejs/lib/predict.js) (`PREDICT_*`),
 [`lib/alias.js`](binders/nodejs/lib/alias.js) (the `ALIAS` family: the command index, the
 argument-key dictionary and a table's numeric widths, plus `loadSession`) and
-[`lib/admin.js`](binders/nodejs/lib/admin.js) (`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
+[`lib/admin.js`](binders/nodejs/lib/admin.js) (`DB_CONFIG`/`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
 `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, `CLUSTER_*`, `FORK_ASSIGN`); each of these exports a
 pure `build*` for its commands, so a caller that writes several commands to a connection as one batch
 shares the binder's encoding instead of re-deriving base64 and `x<hex>` — and finally
@@ -1418,7 +1442,7 @@ objects across `close_all()` so post-reset reconnects remain owned), the free-fu
 [`jobs.py`](binders/python/cheetah_db/jobs.py) (`JOB` submit/status/fetch plus a poll loop),
 [`predict.py`](binders/python/cheetah_db/predict.py),
 [`alias.py`](binders/python/cheetah_db/alias.py) (the `ALIAS` family) and
-[`admin.py`](binders/python/cheetah_db/admin.py) (`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
+[`admin.py`](binders/python/cheetah_db/admin.py) (`DB_CONFIG`/`DB_CREATE`/`DB_LIST`/`DATABASE`/`RESET_DB`,
 `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT`, `CLUSTER_*`, `FORK_ASSIGN`), and
 [`database.py`](binders/python/cheetah_db/database.py) (`CheetahDatabase`, the subclassable handle).
 [`binary.py`](binders/python/cheetah_db/binary.py) is the byte-wise transport, the same transcoder
@@ -1630,9 +1654,10 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   **truncated** run never memoises its convergence, because its "nothing in common" is a budget
   artifact and not a fact; `cache=serve` answers carry `cached: true` and no `via` path, which is
   why serving is opt-in while recording and injection are not.
-- **Gaps:** `GRAPH_CACHE config` is per-process and **not persisted** — a restart returns to the
-  defaults (only `CHEETAH_GRAPH_CACHE=0` survives, and only as off). The entry counter is seeded at
-  0 on open and is an estimate until `GRAPH_CACHE stats recount=1`; `capacity` therefore only starts
+- **Persistence:** `GRAPH_CACHE config` writes the complete profile to `<db>/settings.ini`; the next
+  open restores it, and `DB_CONFIG <name> graph_cache_*=…` reaches the same runtime configuration.
+- **Gaps:** The entry counter is seeded at 0 on open and is an estimate until
+  `GRAPH_CACHE stats recount=1`; `capacity` therefore only starts
   biting once the counter has caught up. There is no cross-database budget: each database trains and
   prunes its own cache in isolation.
 
@@ -1674,14 +1699,15 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 - **Behavior:** `DB_CREATE <name> [key=value …]` creates a database with settings that override the
   server's `[database]` defaults for that database alone, refusing an existing name; `DB_LIST` reports
   every database with its effective settings. Overrides given to `DATABASE`/`RESET_DB` are recorded the
-  same way. They persist in `<data_dir>/<name>/settings.ini` and are re-read at every open.
+  same way. `DB_CONFIG <name> [key=value …]` changes an existing database without retargeting the
+  connection: payload/graph cache fields apply hot, unloaded handles report `on_open`, and trie
+  geometry reports `reset`. They persist in `<data_dir>/<name>/settings.ini` and are re-read at every open.
 - **Owners:** [`engine.go`](src/engine.go) (`CreateDatabase`, `resolveSettingsLocked`,
   `engineControlCommand`), [`config.go`](src/config.go) (file format, `validateDatabaseName`).
-- **Clients:** `admin.createDatabase`/`listDatabases`/`useDatabase`/`resetDatabase` in both binders,
+- **Clients:** `admin.createDatabase`/`configureDatabase`/`listDatabases`/`useDatabase`/`resetDatabase`
+  (snake_case in Python) in both binders,
   which also refuse a setting name the server does not know before sending it.
-- **Gaps:** changing a persisted setting on an existing database means editing the file (or reissuing
-  `DATABASE <name> key=value`) and reopening — there is no live re-tune command; trie geometry still
-  needs `RESET_DB` because `pairs/format.dat` is authoritative.
+- **Constraint:** trie geometry still needs `RESET_DB` because `pairs/format.dat` is authoritative.
 
 <a id="feature-binary-protocol"></a>
 ### Byte-wise (binary) protocol — Shipped
@@ -1823,7 +1849,7 @@ value; encoding those code units as UTF-8 a second time turns `é` into `Ã©` a
   [`server.go`](src/server.go) `handleConnection`; everything else routes through `ExecuteCommand`.
 - **Safe pattern:** put new logic in `ExecuteCommand` whenever possible; if it needs the engine but
   not the connection, put it in `engineControlCommand` ([`engine.go`](src/engine.go)) — both
-  front-ends call it, so there is one implementation (`DB_CREATE`, `DB_LIST`). Only a genuinely
+  front-ends call it, so there is one implementation (`DB_CONFIG`, `DB_CREATE`, `DB_LIST`). Only a genuinely
   connection-scoped command justifies editing both front-ends together.
 
 ---
@@ -1836,7 +1862,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | Command(s) | Owner |
 | --- | --- |
 | `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](src/main.go) `runCLI`, [`server.go`](src/server.go) `handleConnection`, [`engine.go`](src/engine.go) |
-| `DB_CREATE`, `DB_LIST` (engine-scoped) | [`engine.go`](src/engine.go) `engineControlCommand`, called by both front-ends |
+| `DB_CONFIG`, `DB_CREATE`, `DB_LIST` (engine-scoped) | [`engine.go`](src/engine.go) `engineControlCommand`, called by both front-ends |
 | `ALIAS`, `BATCH`, `DEL`, `GRAPH_CACHE`, `JOB`, `RECORD` (micro-commands) | [`micro_alias.go`](src/micro_alias.go), [`batch.go`](src/batch.go), [`micro_del.go`](src/micro_del.go), [`micro_graph_cache.go`](src/micro_graph_cache.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
 | `ALIAS list/get/keys/types/profile/digest` | [`micro_alias.go`](src/micro_alias.go), [`command_index.go`](src/command_index.go), [`binary_profile.go`](src/binary_profile.go) |
 | The binary framing itself (no command of its own — a codec over every line) | [`binary_protocol.go`](src/binary_protocol.go), [`server.go`](src/server.go) `handleBinaryConnection` |
@@ -1969,7 +1995,7 @@ single binary.
 
 Settings resolve as: `config.ini` (or `CHEETAH_CONFIG_PATH`) → environment overrides → normalize.
 Per **database**, one more layer follows: `[database]` defaults → `<data_dir>/<name>/settings.ini` →
-the overrides passed to `DB_CREATE`/`DATABASE`/`RESET_DB` (which are then written back to that file).
+the overrides passed to `DB_CONFIG`/`DB_CREATE`/`DATABASE`/`RESET_DB` (which are then written back to that file).
 There are no environment variables for a single database — the file *is* the per-database channel.
 
 Environment variables read by the server (all verified in-tree):
@@ -1991,9 +2017,9 @@ Environment variables read by the server (all verified in-tree):
   (default on; `0/false/no/off/disable(d)` turns off the automatic maintenance on node write —
   `GRAPH_TERM_INDEX action=rebuild` indexes regardless, since it is an explicit request).
 - **Graph association cache** ([`graph_cache.go`](src/graph_cache.go)): `CHEETAH_GRAPH_CACHE`
-  (default on; `0/false/off/no` disables admission, injection and the maintainer for every database
-  in the process). Everything else is tuned live per database with `GRAPH_CACHE config` and is
-  **not** persisted — see the gaps in [Graph association cache](#feature-graph-cache).
+  (default on; `0/false/off/no` sets the server-wide enabled default to off). Everything else is
+  tuned live per database with `GRAPH_CACHE config` or `DB_CONFIG`;
+  the profile is persisted in that database's `settings.ini`.
 - **Prediction:** `CHEETAH_PREDICT_DEEPEN`, `CHEETAH_PREDICT_FLUSH_MILLIS`,
   `CHEETAH_PREDICT_PURGE_THRESHOLD`, `CHEETAH_PREDICT_MERGER`.
 - **Cluster:** `CHEETAH_NODE_ID`, `CHEETAH_TRACK_STANDALONE_FORKS`.
@@ -2062,6 +2088,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Per-query-shape admission bias follows the observed hit rate | [`TestGraphCacheClassBiasFollowsHitRate`](src/graph_cache_test.go) |
 | Cache rows stay hidden from ordinary scans; the epoch survives a reopen | [`TestGraphCacheEntriesStayHidden`, `TestGraphCacheEpochSurvivesReopen`](src/graph_cache_test.go) |
 | `GRAPH_CACHE` surface + `DEL graph_cache` + `CHEETAH_GRAPH_CACHE=0` | [`TestGraphCacheCommandSurface`, `TestGraphCacheRejectsUnknownTargets`, `TestGraphCacheCanBeDisabledByEnv`](src/graph_cache_test.go) |
+| `GRAPH_CACHE config` survives a reopen through `settings.ini` | [`TestGraphCacheConfigPersistsThroughDatabaseSettings`](src/engine_control_test.go) |
 | Exhausted recall budget answers `truncated=1` on one line instead of stalling | [`TestGraphRecallBudgetDegradesInsteadOfStalling`](src/graph_recall_test.go) |
 | Distributional similarity: shared neighbours and shared id words | [`TestGraphSimilarSharesContextAndWords`](src/graph_recall_test.go) |
 | Term index maintained on write, dropped with the node, rebuildable, switchable | [`TestGraphTermIndexLifecycle`](src/graph_recall_test.go) |
@@ -2075,6 +2102,7 @@ seen in old docs are **client-side**; the server does not read them.
 | Record schema round-trips through the `CHRS` file across a reopen | [`TestRecordSchemaSurvivesReopen`](src/record_test.go) |
 | Every field type at every declared width, encode → decode | [`TestRecordFieldWidthsAndTypes`](src/record_test.go) |
 | `DB_CREATE` ad-hoc settings apply to one database and survive a restart | [`TestDatabaseCreateWithAdHocSettings`](src/engine_control_test.go) |
+| `DB_CONFIG` applies cache fields hot, reports trie reset, and handles unloaded databases | [`TestDatabaseConfigAppliesHotSettingsAndReportsTrieReset`, `TestDatabaseConfigReportsOnOpenForUnloadedDatabase`](src/engine_control_test.go) |
 | `DATABASE key=value` overrides persist next to the data | [`TestDatabaseOverridesFromDatabaseCommandPersist`](src/engine_control_test.go) |
 | `DB_LIST` reports effective settings + `ad_hoc_settings` | [`TestDatabaseListReportsSettings`](src/engine_control_test.go) |
 | A database name cannot escape `data_dir` | [`TestDatabaseNameStaysInsideDataDir`](src/engine_control_test.go) |
@@ -2157,7 +2185,8 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   without being asked. `GRAPH_CACHE` + `DEL graph_cache`.
 - Multi-field record tables: declared per-field byte widths, rows packed into one payload, add/drop a
   field on a live table without rewriting rows, explicit `RECORD compact` to reclaim dead space.
-- Per-database ad-hoc settings (`DB_CREATE`/`DB_LIST`, persisted in `<db>/settings.ini`) and a
+- Per-database ad-hoc settings (`DB_CONFIG`/`DB_CREATE`/`DB_LIST`, persisted in `<db>/settings.ini`),
+  live cache re-tuning, and a
   database-name guard that keeps a name inside `data_dir`.
 - **Byte-wise (binary) protocol over TCP**: a connection declared by its first byte (`0xC7`), a
   handshake fixing the default numeric widths, commands as 2-byte indices and values in their own
@@ -2171,16 +2200,16 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - **Node.js binder** ([`binders/nodejs/`](binders/nodejs/)) — dependency-free client: codec, pooled
   TCP client, KV/graph/record/job/prediction/admin helpers, key primitives, token vocabulary,
   subclassable `CheetahDatabase`, the binary transport and the `ALIAS` discovery layer, and a
-  test-server launcher. Verified by its own suite (136 unit tests) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
+  test-server launcher. Verified by its own suite (138 passing unit tests, one gated integration test) plus a live round-trip against a spawned server (`CHEETAH_INTEGRATION=1`, 19 subtests: KV,
   UTF-8 payloads, batch writes, cursor paging, the `continuations` reducer, vocabulary allocation,
   `GRAPH_RECALL` convergence, a record table through define/partial-write/add/drop/compact/drop,
   `DB_CREATE` with its own settings, a detached `JOB` reduce, server gauges, subclass lifecycle,
   layout-mismatch refusal, `RESET_DB` across a pool, pipelining).
 - **Python binder** ([`binders/python/`](binders/python/)) — standard-library-only client covering
   the same surface, with the differences that follow from a synchronous host (no pipelining; one
-  socket per thread; binary payloads base64 rather than latin1). Verified by its own suite (174 unit
-  tests against an in-memory stand-in) plus a live round-trip against a spawned server
-  (`CHEETAH_INTEGRATION=1`, 11 tests: UTF-8 and binary payloads, `PAIR_PUT_BATCH`, hidden pairs,
+  socket per thread; binary payloads base64 rather than latin1). Verified by its own suite (176 passing
+  tests against an in-memory stand-in, 14 gated integration skips) plus a live round-trip against a spawned server
+  (`CHEETAH_INTEGRATION=1`, 14 tests: UTF-8 and binary payloads, `PAIR_PUT_BATCH`, hidden pairs,
   cursor paging, the `continuations` reducer, graph write/degree/recall, record-table lifecycle and
   schema evolution, `DB_CREATE` settings, a detached `JOB` reduce,
   `SYSTEM_STATS`/`FILE_CHECKPOINT`, vocabulary allocation, layout guard and `RESET_DB`).

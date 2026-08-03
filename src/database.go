@@ -46,7 +46,9 @@ type Database struct {
 	jumpIndexPath       string
 	jumpMu              sync.Mutex
 	resources           *ResourceMonitor
+	settingsMu          sync.RWMutex
 	settings            DatabaseConfig
+	settingsPersist     func(DatabaseOverrides) error
 	branchCodec         pairBranchCodec
 	adaptivePairs       bool // adaptive per-node LIST/DENSE container enabled
 	pairListMaxBytes    int  // LIST densify byte budget
@@ -470,7 +472,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	}
 	db.predictStore = newPredictionManager(path)
 	db.recordStore = newRecordManager(filepath.Join(path, "records"))
-	db.graphCache = newGraphCacheStore(db)
+	db.graphCache = newGraphCacheStore(db, graphCacheConfigFromDatabaseConfig(effective))
 	db.protocolProfiles = newNumericProfileStore(filepath.Join(path, numericProfileFile))
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
 	db.registerDefaultReducers()
@@ -3981,7 +3983,7 @@ func (db *Database) systemStatsResponse() string {
 		return "ERROR,resource_monitor_unavailable"
 	}
 	var cacheStats *payloadCacheStats
-	if db.payloadCache != nil {
+	if db.payloadCache != nil && db.payloadCache.Enabled() {
 		stats := db.payloadCache.Stats()
 		cacheStats = &stats
 	}

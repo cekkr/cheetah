@@ -111,11 +111,11 @@ var builtinCommandNames = []string{
 	"FILE_CHECKPOINT",
 }
 
-// engineCommandNames sono i due comandi di scope engine (engine.go), e
+// engineCommandNames sono i comandi di scope engine (engine.go), e
 // frontEndCommandNames i tre di scope connessione (main.go / server.go). Non
 // passano da ExecuteCommand ma il front-end binario li instrada lo stesso,
 // quindi hanno un indice come gli altri.
-var engineCommandNames = []string{"DB_CREATE", "DB_LIST"}
+var engineCommandNames = []string{"DB_CONFIG", "DB_CREATE", "DB_LIST"}
 
 var frontEndCommandNames = []string{"DATABASE", "RESET_DB", "EXIT"}
 

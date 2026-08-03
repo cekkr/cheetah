@@ -660,6 +660,53 @@ class FakeCheetahServer:
         rendered = ",".join(f"{key}={value}" for key, value in effective.items())
         return f"SUCCESS,database_created={name},{rendered}"
 
+    def _do_db_config(self, rest: str) -> str:
+        parts = rest.split()
+        name = parts[0] if parts else ""
+        if name not in self.databases:
+            return f"ERROR,database_not_found:{name}"
+        changed = _kv_args(" ".join(parts[1:]))
+        self.databases[name].update(changed)
+        hot_names = {
+            "payload_cache_entries",
+            "payload_cache_mb",
+            "payload_cache_bytes",
+            "graph_cache_enabled",
+            "graph_cache_sample",
+            "graph_cache_capacity",
+            "graph_cache_half_life",
+            "graph_cache_min_utility",
+            "graph_cache_budget",
+            "graph_cache_interval",
+            "graph_cache_page",
+            "graph_cache_page_size",
+        }
+        reset_names = {
+            "pair_bytes": "pair_index_bytes",
+            "pair_index_bytes": "pair_index_bytes",
+            "adaptive_pair_index": "adaptive_pair_index",
+            "pair_list_max_bytes": "pair_list_max_bytes",
+            "pair_list_max_fill_percent": "pair_list_max_fill_percent",
+        }
+        hot = [key for key in changed if key in hot_names]
+        reset = [reset_names[key] for key in changed if key in reset_names]
+        # DB_CREATE opens the handle in the real engine even though it does not
+        # retarget this connection.
+        loaded = True
+        effective = {
+            "pair_index_bytes": self.databases[name].get("pair_bytes", self.databases[name].get("pair_index_bytes", "1")),
+            "payload_cache_entries": self.databases[name].get("payload_cache_entries", "16384"),
+            "graph_cache_sample": self.databases[name].get("graph_cache_sample", "0.25"),
+        }
+        rendered = ",".join(f"{key}={value}" for key, value in effective.items())
+        applied = ";".join(hot) if loaded and hot else "-"
+        on_open = ";".join(hot) if not loaded and hot else "-"
+        needs_reset = ";".join(reset) if reset else "-"
+        return (
+            f"SUCCESS,database_configured={name},loaded={int(loaded)},"
+            f"applied={applied},on_open={on_open},reopen=-,reset={needs_reset},{rendered}"
+        )
+
     def _do_db_list(self, rest: str) -> str:
         infos = [
             {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func controlCommand(t *testing.T, engine *Engine, command string, args string) string {
@@ -16,6 +17,143 @@ func controlCommand(t *testing.T, engine *Engine, command string, args string) s
 		t.Fatalf("%s is not an engine control command", command)
 	}
 	return resp
+}
+
+func TestDatabaseConfigAppliesHotSettingsAndReportsTrieReset(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := defaultConfig()
+	cfg.DataDir = dataDir
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	db, err := engine.GetDatabase(cfg.DefaultDatabase)
+	if err != nil {
+		t.Fatalf("GetDatabase: %v", err)
+	}
+
+	resp := controlCommand(t, engine, "DB_CONFIG", "default payload_cache_entries=7 payload_cache_bytes=4096 graph_cache_sample=0.5 pair_bytes=2")
+	if !strings.HasPrefix(resp, "SUCCESS,database_configured=default,loaded=1") {
+		t.Fatalf("DB_CONFIG = %q", resp)
+	}
+	for _, want := range []string{
+		"applied=payload_cache_entries;payload_cache_bytes;graph_cache_sample",
+		"reopen=-",
+		"reset=pair_index_bytes",
+	} {
+		if !strings.Contains(resp, want) {
+			t.Fatalf("DB_CONFIG response missing %q: %s", want, resp)
+		}
+	}
+	cache := db.payloadCache.Stats()
+	if cache.MaxEntries != 7 || cache.MaxBytes != 4096 {
+		t.Fatalf("live payload cache = %+v", cache)
+	}
+	if got := db.graphCache.config().Sample; got != 0.5 {
+		t.Fatalf("live graph cache sample = %v, want 0.5", got)
+	}
+	controlCommand(t, engine, "DB_CONFIG", "default payload_cache_entries=0")
+	if db.payloadCache.Enabled() {
+		t.Fatal("DB_CONFIG did not disable the live payload cache")
+	}
+	controlCommand(t, engine, "DB_CONFIG", "default payload_cache_entries=7")
+	if !db.payloadCache.Enabled() {
+		t.Fatal("DB_CONFIG did not re-enable the live payload cache")
+	}
+	if db.branchCodec.chunkBytes != 1 {
+		t.Fatalf("DB_CONFIG reinterpreted live trie as stride %d", db.branchCodec.chunkBytes)
+	}
+
+	engine.Close()
+	reopened, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine (reopen): %v", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	settings := reopened.EffectiveSettings("default")
+	if settings.PayloadCacheEntries != 7 || settings.PayloadCacheBytes != 4096 || settings.GraphCacheSample != 0.5 {
+		t.Fatalf("persisted hot settings = %+v", settings)
+	}
+	db2, err := reopened.GetDatabase("default")
+	if err != nil {
+		t.Fatalf("GetDatabase (reopen): %v", err)
+	}
+	if db2.branchCodec.chunkBytes != 1 {
+		t.Fatalf("pair marker did not win after restart: stride=%d", db2.branchCodec.chunkBytes)
+	}
+}
+
+func TestGraphCacheConfigPersistsThroughDatabaseSettings(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := defaultConfig()
+	cfg.DataDir = dataDir
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	db, err := engine.GetDatabase("default")
+	if err != nil {
+		t.Fatalf("GetDatabase: %v", err)
+	}
+	resp, err := db.ExecuteCommand("GRAPH_CACHE config enabled=0 sample=0.75 half_life=2h interval=3s page=99")
+	if err != nil {
+		t.Fatalf("GRAPH_CACHE config: %v", err)
+	}
+	if !strings.HasPrefix(resp, "SUCCESS") {
+		t.Fatalf("GRAPH_CACHE config = %q", resp)
+	}
+	engine.Close()
+
+	reopened, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine (reopen): %v", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	db2, err := reopened.GetDatabase("default")
+	if err != nil {
+		t.Fatalf("GetDatabase (reopen): %v", err)
+	}
+	got := db2.graphCache.config()
+	if got.Enabled || got.Sample != 0.75 || got.HalfLife != 2*time.Hour || got.Interval != 3*time.Second || got.PageSize != 99 {
+		t.Fatalf("graph cache config after restart = %+v", got)
+	}
+}
+
+func TestDatabaseConfigReportsOnOpenForUnloadedDatabase(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := defaultConfig()
+	cfg.DataDir = dataDir
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	if resp := controlCommand(t, engine, "DB_CREATE", "cold"); !strings.HasPrefix(resp, "SUCCESS") {
+		t.Fatalf("DB_CREATE = %q", resp)
+	}
+	engine.Close()
+
+	reopened, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine (reopen): %v", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	resp := controlCommand(t, reopened, "DB_CONFIG", "cold payload_cache_entries=3 graph_cache_enabled=0")
+	if !strings.Contains(resp, "loaded=0,applied=-,on_open=payload_cache_entries;graph_cache_enabled") {
+		t.Fatalf("DB_CONFIG unloaded = %q", resp)
+	}
+	db, err := reopened.GetDatabase("cold")
+	if err != nil {
+		t.Fatalf("GetDatabase: %v", err)
+	}
+	if db.payloadCache.Stats().MaxEntries != 3 || db.graphCache.enabled() {
+		t.Fatalf("on-open settings not applied: cache=%+v graph_enabled=%v", db.payloadCache.Stats(), db.graphCache.enabled())
+	}
+	if resp := controlCommand(t, reopened, "DB_CONFIG", "missing payload_cache_entries=1"); resp != "ERROR,database_not_found:missing" {
+		t.Fatalf("DB_CONFIG missing = %q", resp)
+	}
+	if resp := controlCommand(t, reopened, "DB_CONFIG", "cold graph_cache_sample=NaN"); !strings.HasPrefix(resp, "ERROR,graph_cache_sample must be 0..1") {
+		t.Fatalf("DB_CONFIG accepted a non-finite sample: %q", resp)
+	}
 }
 
 // TestDatabaseCreateWithAdHocSettings: creare un database dichiarando

@@ -515,9 +515,7 @@ type graphCacheStore struct {
 	done           chan struct{}
 }
 
-func newGraphCacheStore(db *Database) *graphCacheStore {
-	cfg := defaultGraphCacheConfig()
-	cfg.Enabled = graphCacheEnabledByEnv()
+func newGraphCacheStore(db *Database, cfg graphCacheConfig) *graphCacheStore {
 	store := &graphCacheStore{
 		db:     db,
 		cfg:    cfg,
