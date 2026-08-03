@@ -895,7 +895,7 @@ operator or a test that wants the result *now*.
 
 | Command | What it means |
 | --- | --- |
-| `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration. `recount=1` re-walks the namespace to resynchronise the entry count, which is otherwise an estimate. |
+| `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration. The background maintainer resynchronises the entry estimate after every complete lap (including after a reopen); `recount=1` pays for a full walk immediately and additionally reports the link/query split. |
 | `GRAPH_CACHE config [enabled=] [sample=] [capacity=] [half_life=] [min_utility=] [budget=] [interval=] [page=]` | Steers the training live and persists the resulting profile in this database's `settings.ini`; a reopen restores it. The same fields are accepted with a `graph_cache_` prefix by `DB_CONFIG`. |
 | `GRAPH_CACHE get from=<id> to=<id>` / `signature=<sig>` | One row, with both recurrence counters, its usage probability and its current utility. |
 | `GRAPH_CACHE links id=<id> [limit=]` | Every shortcut known from a node. |

@@ -503,10 +503,18 @@ type graphCacheStore struct {
 	epochMu        sync.Mutex
 
 	entries atomic.Int64
+	// Il contatore resta un'ottimizzazione, ma una passata completa deve poter
+	// sostituire lo zero di una riapertura senza perdere ammissioni concorrenti.
+	// entryCountMu serializza gli aggiustamenti brevi; sweepRevision invalida il
+	// censimento se una mutazione esterna cade mentre la trie viene percorsa.
+	entryCountMu  sync.Mutex
+	entryRevision uint64
 
-	sweepMu     sync.Mutex
-	sweepCursor []byte
-	idleRounds  int
+	sweepMu       sync.Mutex
+	sweepCursor   []byte
+	sweepEntries  int64
+	sweepRevision uint64
+	idleRounds    int
 
 	maintainerOnce sync.Once
 	started        atomic.Bool
@@ -590,6 +598,49 @@ func (store *graphCacheStore) setConfig(cfg graphCacheConfig) {
 
 func (store *graphCacheStore) unixNow() uint32 {
 	return uint32(store.now().Unix())
+}
+
+// adjustEntries aggiorna la stima senza lasciarla scendere sotto zero. Le
+// mutazioni esterne invalidano un eventuale censimento in corso: una voce
+// inserita mentre la passata ha già superato la sua posizione non deve essere
+// persa dal valore adottato alla chiusura del giro.
+func (store *graphCacheStore) adjustEntries(delta int64, invalidateSweep bool) int64 {
+	if store == nil {
+		return 0
+	}
+	store.entryCountMu.Lock()
+	defer store.entryCountMu.Unlock()
+	next := store.entries.Load() + delta
+	if next < 0 {
+		next = 0
+	}
+	store.entries.Store(next)
+	if invalidateSweep {
+		store.entryRevision++
+	}
+	return next
+}
+
+func (store *graphCacheStore) invalidateEntrySweep() {
+	if store == nil {
+		return
+	}
+	store.entryCountMu.Lock()
+	store.entryRevision++
+	store.entryCountMu.Unlock()
+}
+
+func (store *graphCacheStore) replaceEntryCount(count int64) {
+	if store == nil {
+		return
+	}
+	if count < 0 {
+		count = 0
+	}
+	store.entryCountMu.Lock()
+	store.entries.Store(count)
+	store.entryRevision++
+	store.entryCountMu.Unlock()
 }
 
 // --- epoca del grafo ---------------------------------------------------------
@@ -758,11 +809,12 @@ func (store *graphCacheStore) observeLink(from string, to string, score float64,
 		Created:      now,
 		Refreshed:    now,
 	}
+	store.invalidateEntrySweep()
 	if err := store.write(key, &entry); err != nil {
 		return false
 	}
 	store.metrics.Admitted.Add(1)
-	store.entries.Add(1)
+	store.adjustEntries(1, false)
 	if class >= 0 && class < graphCacheClassSlots {
 		store.classes[class].Writes.Add(1)
 	}
@@ -812,11 +864,12 @@ func (store *graphCacheStore) observeCommon(signature string, members []graphCac
 		Refreshed:    now,
 		Epoch:        epoch,
 	}
+	store.invalidateEntrySweep()
 	if err := store.write(key, &entry); err != nil {
 		return false
 	}
 	store.metrics.Admitted.Add(1)
-	store.entries.Add(1)
+	store.adjustEntries(1, false)
 	if class >= 0 && class < graphCacheClassSlots {
 		store.classes[class].Writes.Add(1)
 	}
@@ -1056,9 +1109,18 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 		page = cfg.PageSize
 	}
 
+	// Una passata manuale e quella del maintainer condividono cursore e
+	// censimento: devono essere una sola sequenza, non due paginazioni
+	// interlacciate sullo stesso namespace.
 	store.sweepMu.Lock()
-	cursor := store.sweepCursor
-	store.sweepMu.Unlock()
+	defer store.sweepMu.Unlock()
+	cursor := append([]byte(nil), store.sweepCursor...)
+	if len(cursor) == 0 {
+		store.sweepEntries = 0
+		store.entryCountMu.Lock()
+		store.sweepRevision = store.entryRevision
+		store.entryCountMu.Unlock()
+	}
 
 	results, nextCursor, err := store.db.PairScanWithOptions([]byte(graphCachePrefix), page, cursor, true)
 	if err != nil {
@@ -1074,12 +1136,15 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 	}
 	halfLife := cfg.HalfLife.Seconds()
 	now := store.unixNow()
+	pageEntries := int64(0)
 
 	for i := range results {
 		key := results[i].Value
-		// La riga dell'epoca vive nello stesso namespace ma non è una voce:
-		// potarla farebbe ringiovanire l'intera cache di colpo.
-		if string(key) == graphCacheEpochKey {
+		rawKey := string(key)
+		// Solo l/ e q/ sono voci. L'epoca (e qualunque futura metariga)
+		// condivide il namespace ma non deve entrare né nel censimento né nella
+		// potatura.
+		if !strings.HasPrefix(rawKey, graphCacheLinkPrefix) && !strings.HasPrefix(rawKey, graphCacheQueryPrefix) {
 			continue
 		}
 		entry, err := decodeGraphCacheEntryAt(store.db, results[i].Key)
@@ -1088,7 +1153,7 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 			// toglie invece di tenerlo per sempre.
 			if _, delErr := store.db.deletePairAndPayload(key); delErr == nil {
 				result.Pruned++
-				store.entries.Add(-1)
+				store.adjustEntries(-1, false)
 			}
 			continue
 		}
@@ -1096,10 +1161,11 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 		if entry.utility(now, halfLife) < threshold {
 			if _, delErr := store.db.deletePairAndPayload(key); delErr == nil {
 				result.Pruned++
-				store.entries.Add(-1)
+				store.adjustEntries(-1, false)
 			}
 			continue
 		}
+		pageEntries++
 		if age {
 			// Compressione: i contatori si dimezzano. La riga resta, la sua
 			// storia si accorcia — così i numeri non crescono senza fine e una
@@ -1115,14 +1181,22 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 		}
 	}
 
-	store.sweepMu.Lock()
+	store.sweepEntries += pageEntries
 	if len(nextCursor) == 0 {
 		store.sweepCursor = nil
 		result.Wrapped = true
+		// Il giro è un censimento gratuito delle righe sopravvissute. Lo si
+		// adotta soltanto se nessuna ammissione/cancellazione esterna ha
+		// attraversato la passata; in quel caso il giro successivo riprova.
+		store.entryCountMu.Lock()
+		if store.entryRevision == store.sweepRevision {
+			store.entries.Store(store.sweepEntries)
+		}
+		store.entryCountMu.Unlock()
+		store.sweepEntries = 0
 	} else {
 		store.sweepCursor = nextCursor
 	}
-	store.sweepMu.Unlock()
 
 	store.metrics.Pruned.Add(uint64(result.Pruned))
 	store.metrics.Aged.Add(uint64(result.Aged))
@@ -1130,9 +1204,9 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 	return result, nil
 }
 
-// countEntries riconta le voci vive. Serve allo stato e a risincronizzare il
-// contatore approssimato dopo un riavvio: `entries` è un'ottimizzazione, non la
-// verità.
+// countEntries riconta le voci vive. Serve allo stato quando l'operatore vuole
+// il numero esatto subito; il maintainer ottiene la stessa risincronizzazione
+// senza una passata bloccante, accumulando il censimento pagina per pagina.
 func (store *graphCacheStore) countEntries() (int, int, int) {
 	links, queries := 0, 0
 	var cursor []byte
@@ -1156,7 +1230,7 @@ func (store *graphCacheStore) countEntries() (int, int, int) {
 		cursor = next
 	}
 	total := links + queries
-	store.entries.Store(int64(total))
+	store.replaceEntryCount(int64(total))
 	return total, links, queries
 }
 

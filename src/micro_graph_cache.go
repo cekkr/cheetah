@@ -100,9 +100,9 @@ func (db *Database) microGraphCacheStats(args microArgs) (microResponse, error) 
 
 	entries := int(store.entries.Load())
 	links, queries := -1, -1
-	// Il contatore in memoria è un'approssimazione (parte da zero a ogni
-	// apertura): recount=1 lo risincronizza con una passata vera, che costa una
-	// scansione del namespace e quindi non si fa di default.
+	// Il maintainer risincronizza gratuitamente il contatore a ogni giro
+	// completo. recount=1 forza la stessa risposta esatta adesso, pagando una
+	// scansione del namespace invece di aspettare la chiusura della passata.
 	if args.flag("recount", false) {
 		entries, links, queries = store.countEntries()
 	}
@@ -399,11 +399,14 @@ func (db *Database) microGraphCachePut(args microArgs) (microResponse, error) {
 			Refreshed:    now,
 		}
 	}
+	if !found {
+		store.invalidateEntrySweep()
+	}
 	if err := store.write(key, &entry); err != nil {
 		return microSilent(), err
 	}
 	if !found {
-		store.entries.Add(1)
+		store.adjustEntries(1, false)
 		store.metrics.Admitted.Add(1)
 	} else {
 		store.metrics.Reinforce.Add(1)
@@ -489,6 +492,10 @@ func (db *Database) microDelGraphCache(args microArgs) (microResponse, error) {
 		limit = parsed
 	}
 	removed := 0
+	// Invalida il censimento prima della prima cancellazione: farlo soltanto
+	// dopo PairPurge lascerebbe una finestra in cui la passata può adottare una
+	// riga già scomparsa e poi sottrarla una seconda volta.
+	store.invalidateEntrySweep()
 	for _, prefix := range prefixes {
 		count, err := db.PairPurgeWithOptions([]byte(prefix), limit, true)
 		if err != nil {
@@ -498,10 +505,16 @@ func (db *Database) microDelGraphCache(args microArgs) (microResponse, error) {
 	}
 	// L'epoca sopravvive di proposito: è il contatore delle scritture del grafo,
 	// non una voce di cache, e azzerarlo farebbe passare per fresca ogni
-	// convergenza scritta prima di adesso.
-	store.entries.Store(0)
+	// convergenza scritta prima di adesso. Uno scope parziale conserva invece il
+	// conto dell'altra famiglia.
+	if len(prefixes) == 2 && limit == 0 {
+		store.replaceEntryCount(0)
+	} else {
+		store.adjustEntries(-int64(removed), false)
+	}
 	store.sweepMu.Lock()
 	store.sweepCursor = nil
+	store.sweepEntries = 0
 	store.sweepMu.Unlock()
 	return microOK(mfi("deleted", removed), mf("scope", scope)), nil
 }

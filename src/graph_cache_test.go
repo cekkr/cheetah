@@ -629,3 +629,134 @@ func TestGraphCacheRecountResynchronisesTheCounter(t *testing.T) {
 		t.Fatalf("recount must fix the in-memory counter, got %d", got)
 	}
 }
+
+// Una riapertura parte senza una scansione bloccante. Il primo giro completo
+// del maintainer deve però adottare le righe che ha già visitato, così la
+// capacità torna a mordere senza richiedere GRAPH_CACHE stats recount=1.
+func TestGraphCacheSweepRecountsAfterReopenAndEnforcesCapacity(t *testing.T) {
+	dir := t.TempDir()
+	cfg := defaultConfig()
+	cfg.DataDir = dir + "/data"
+
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("engine failed: %v", err)
+	}
+	db, err := engine.GetDatabase(cfg.DefaultDatabase)
+	if err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	store := forceGraphCache(t, db, true)
+	store.observeLink("a", "b", 0.9, 3, 2, 0)
+	store.observeLink("a", "c", 0.9, 3, 2, 0)
+	store.observeLink("a", "d", 0.9, 3, 2, 0)
+	if got := store.entries.Load(); got != 3 {
+		t.Fatalf("expected three entries before close, got %d", got)
+	}
+	engine.Close()
+
+	reopened, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("reopen engine failed: %v", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	db, err = reopened.GetDatabase(cfg.DefaultDatabase)
+	if err != nil {
+		t.Fatalf("reopen database failed: %v", err)
+	}
+	store = forceGraphCache(t, db, true)
+	if got := store.entries.Load(); got != 0 {
+		t.Fatalf("reopen should stay lazy before the first sweep, got %d", got)
+	}
+
+	// A 0.3 le voci fresche sopravvivono. Con tre righe contro capacity=1 la
+	// soglia sale invece a 0.9 e le elimina: questo distingue il conteggio
+	// risincronizzato dallo zero con cui il processo si è aperto.
+	cacheCfg := store.config()
+	cacheCfg.Capacity = 1
+	cacheCfg.MinUtility = 0.3
+	store.setConfig(cacheCfg)
+
+	first, err := store.sweep(64, false)
+	if err != nil {
+		t.Fatalf("first sweep failed: %v", err)
+	}
+	if !first.Wrapped || first.Pruned != 0 {
+		t.Fatalf("the census lap must retain fresh rows and wrap: %+v", first)
+	}
+	if got := store.entries.Load(); got != 3 {
+		t.Fatalf("the completed lap must adopt all three rows, got %d", got)
+	}
+
+	second, err := store.sweep(64, false)
+	if err != nil {
+		t.Fatalf("capacity sweep failed: %v", err)
+	}
+	if second.Pruned != 3 {
+		t.Fatalf("capacity must apply after the census, got %+v", second)
+	}
+	if got := store.entries.Load(); got != 0 {
+		t.Fatalf("expected the counter to follow pruning, got %d", got)
+	}
+}
+
+func TestGraphCacheSweepCensusRetriesAfterConcurrentMutation(t *testing.T) {
+	db := newRecallTestDB(t)
+	store := forceGraphCache(t, db, true)
+	store.observeLink("a", "b", 0.9, 3, 2, 0)
+	store.observeLink("a", "c", 0.9, 3, 2, 0)
+
+	// Simula lo zero di una riapertura, poi lascia partire un censimento a
+	// pagine. L'ammissione fra due pagine invalida quella fotografia.
+	store.entries.Store(0)
+	first, err := store.sweep(1, false)
+	if err != nil {
+		t.Fatalf("first census page failed: %v", err)
+	}
+	if first.Wrapped {
+		t.Fatal("one row out of two must leave another census page")
+	}
+	store.observeLink("a", "d", 0.9, 3, 2, 0)
+
+	wrapped := false
+	for i := 0; i < 8 && !wrapped; i++ {
+		result, err := store.sweep(1, false)
+		if err != nil {
+			t.Fatalf("census continuation failed: %v", err)
+		}
+		wrapped = result.Wrapped
+	}
+	if !wrapped {
+		t.Fatal("the invalidated census did not finish")
+	}
+	if got := store.entries.Load(); got != 1 {
+		t.Fatalf("the invalidated lap overwrote the concurrent admission: %d", got)
+	}
+
+	result, err := store.sweep(64, false)
+	if err != nil {
+		t.Fatalf("retry census failed: %v", err)
+	}
+	if !result.Wrapped {
+		t.Fatal("the quiet retry must finish in one page")
+	}
+	if got := store.entries.Load(); got != 3 {
+		t.Fatalf("the quiet retry must adopt all rows, got %d", got)
+	}
+}
+
+func TestGraphCacheScopedDeletePreservesRemainingEntryCount(t *testing.T) {
+	db := newRecallTestDB(t)
+	store := forceGraphCache(t, db, true)
+	store.observeLink("a", "b", 0.9, 3, 2, 0)
+	store.observeCommon("signature", []graphCacheMember{{ID: "c", Score: 0.8, Sources: 2}}, 0)
+	store.countEntries()
+
+	resp := assertCommandPrefix(t, db, "DEL graph_cache scope=links", "SUCCESS")
+	if responseField(resp, "deleted") != "1" {
+		t.Fatalf("expected one deleted link, got %s", resp)
+	}
+	if got := store.entries.Load(); got != 1 {
+		t.Fatalf("the convergence must remain counted after a link-only delete, got %d", got)
+	}
+}

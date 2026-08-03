@@ -287,6 +287,14 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   single answer — only how fast it arrives. A cached shortcut therefore enters a recall as evidence
   marked `cached` (a dedicated `graphRecallEdgeView.Cached` bool, **not** a reserved edge type, which
   a user-declared type could always collide with), never as an edge.
+- **A completed graph-cache maintenance lap is also its entry-count census.** The process-local
+  counter intentionally starts at zero on reopen so startup never blocks on a namespace scan. Each
+  sweep page counts the live `l/` and `q/` rows it retains; on wrap, the census replaces the estimate
+  only if no external cache admission/deletion crossed the lap. An invalidated lap retries, while
+  the maintainer's following aging page already applies `capacity` with the restored count.
+  `GRAPH_CACHE stats recount=1` remains the explicit, immediate full scan. Keep metarows such as
+  `\x07gc:e` outside both the census and pruning, and invalidate the census *before* an external
+  cache mutation so its final count cannot overwrite the mutation.
 - **Every graph write advances the cache epoch, and there is exactly one place that does it.**
   `graphUpsertPairPayload`/`graphDeletePairAndPayload` ([`graph.go`](src/graph.go)) are the choke
   point for records, adjacency, property indexes and the term index alike, so a *new* graph write
@@ -951,7 +959,8 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
   case where the cost is in comparing many things rather than in any one of them.
 - **Key symbols:** `graphCacheEntry` (+`encode`/`decodeGraphCacheEntry`, `utility`,
   `usageProbability`), `graphCacheStore` (`observeLink`, `observeCommon`, `observeRun`,
-  `lookupCommon`, `linksOf`, `sweep`, `maintain`, `countEntries`, `CloseAndWait`),
+  `lookupCommon`, `linksOf`, `sweep`, `maintain`, `countEntries`, `adjustEntries`,
+  `invalidateEntrySweep`, `CloseAndWait`),
   `admissionProbability`, `graphCacheClass`/`retune`, `graphCacheSignature`, `graphCacheClassOf`,
   `graphCacheLinkKey`/`graphCacheQueryKey`, the epoch (`currentEpoch`, `bumpEpoch`,
   `graphCacheBumpEpoch`), `graphCacheConfig`.
@@ -971,6 +980,11 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
   starts lazily on the first cache operation (a database that never touches the graph pays no
   goroutine) and `CloseAndWait` joins it **first** in `shutdown`, before the files it writes through
   are closed. `GRAPH_CACHE prune` is an operator/test override, not part of normal operation.
+- **Every completed lap doubles as a lazy entry-count census.** Startup leaves the estimate at zero;
+  the paged sweep counts survivors and adopts that count on wrap, provided an external admission or
+  deletion did not invalidate the pass. This makes `capacity` effective again after reopen without
+  adding a blocking startup scan or a metadata write to every admission. A concurrent mutation makes
+  the next lap retry instead of letting the census overwrite its increment/decrement.
 - **Depends on:** [`commands.go`](src/commands.go) (`getPairPayload`/`upsertPairPayload`/
   `deletePairAndPayload`), [`database.go`](src/database.go) (`PairScanWithOptions`),
   [`graph_recall.go`](src/graph_recall.go) (options, run, associations).
@@ -979,7 +993,8 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
   facts with two different recurrences. Do not skip the `read` before admitting: reinforcement of an
   existing row must never be sampled, or recurrence stops meaning recurrence. Do not let the sweep
   prune `\x07gc:e`: it is the graph write counter, not a cache row, and removing it would make every
-  stale convergence read as fresh.
+  stale convergence read as fresh. Invalidate an in-progress count census before an external cache
+  insert/delete, and never zero the whole estimate for a link-only or query-only `DEL graph_cache`.
 
 #### [`src/micro_graph_cache.go`](src/micro_graph_cache.go)
 
@@ -1233,7 +1248,10 @@ one hop could not have reached, with `cache=off` restoring the old behavior exac
 both shortcuts and convergences and `cache=serve` answering from them; a truncated run refusing to
 memoise; the whole `GRAPH_CACHE` surface plus `DEL graph_cache`; the maintainer pruning **without
 being asked**; per-query-shape bias following hit rate; cache rows staying out of ordinary scans;
-the epoch surviving a reopen; and `CHEETAH_GRAPH_CACHE=0`. Provides `forceGraphCache`, which makes
+the epoch surviving a reopen; a completed post-reopen lap restoring the entry count so `capacity`
+applies again; a concurrent admission invalidating that census and a quiet lap retrying it; scoped
+deletion retaining the other family's count; and `CHEETAH_GRAPH_CACHE=0`.
+Provides `forceGraphCache`, which makes
 the sampling and the clock deterministic. Builds on `newRecallTestDB`/`seedRecallGraph` from
 [`graph_recall_test.go`](src/graph_recall_test.go).
 
@@ -1656,10 +1674,9 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   why serving is opt-in while recording and injection are not.
 - **Persistence:** `GRAPH_CACHE config` writes the complete profile to `<db>/settings.ini`; the next
   open restores it, and `DB_CONFIG <name> graph_cache_*=…` reaches the same runtime configuration.
-- **Gaps:** The entry counter is seeded at 0 on open and is an estimate until
-  `GRAPH_CACHE stats recount=1`; `capacity` therefore only starts
-  biting once the counter has caught up. There is no cross-database budget: each database trains and
-  prunes its own cache in isolation.
+- **Gaps:** There is no cross-database budget: each database trains and prunes its own cache in
+  isolation. The entry counter no longer needs operator intervention after reopen: a completed
+  maintenance lap adopts its live-row census and the following page applies `capacity`.
 
 ### Edge uncertainty + ambiguity — Shipped
 
@@ -2087,6 +2104,8 @@ seen in old docs are **client-side**; the server does not read them.
 | The maintainer prunes with no command issued | [`TestGraphCacheMaintainerRunsWithoutBeingAsked`](src/graph_cache_test.go) |
 | Per-query-shape admission bias follows the observed hit rate | [`TestGraphCacheClassBiasFollowsHitRate`](src/graph_cache_test.go) |
 | Cache rows stay hidden from ordinary scans; the epoch survives a reopen | [`TestGraphCacheEntriesStayHidden`, `TestGraphCacheEpochSurvivesReopen`](src/graph_cache_test.go) |
+| A post-reopen cache lap restores the count; a concurrent admission invalidates the lap and a quiet retry converges | [`TestGraphCacheSweepRecountsAfterReopenAndEnforcesCapacity`, `TestGraphCacheSweepCensusRetriesAfterConcurrentMutation`](src/graph_cache_test.go) |
+| Scoped graph-cache deletion preserves the other family's entry count | [`TestGraphCacheScopedDeletePreservesRemainingEntryCount`](src/graph_cache_test.go) |
 | `GRAPH_CACHE` surface + `DEL graph_cache` + `CHEETAH_GRAPH_CACHE=0` | [`TestGraphCacheCommandSurface`, `TestGraphCacheRejectsUnknownTargets`, `TestGraphCacheCanBeDisabledByEnv`](src/graph_cache_test.go) |
 | `GRAPH_CACHE config` survives a reopen through `settings.ini` | [`TestGraphCacheConfigPersistsThroughDatabaseSettings`](src/engine_control_test.go) |
 | Exhausted recall budget answers `truncated=1` on one line instead of stalling | [`TestGraphRecallBudgetDegradesInsteadOfStalling`](src/graph_recall_test.go) |
@@ -2182,7 +2201,8 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - Real-time association cache under `\x07gc:`: `GRAPH_RECALL` writes back the shortcuts and the
   convergences it discovers and reads them again for free, with sampled admission, `hits`/
   `observations` recurrence, and a resource-aware maintainer that prunes and compresses continuously
-  without being asked. `GRAPH_CACHE` + `DEL graph_cache`.
+  without being asked. Each completed lap also repairs the entry estimate after reopen, so capacity
+  enforcement resumes without an explicit recount. `GRAPH_CACHE` + `DEL graph_cache`.
 - Multi-field record tables: declared per-field byte widths, rows packed into one payload, add/drop a
   field on a live table without rewriting rows, explicit `RECORD compact` to reclaim dead space.
 - Per-database ad-hoc settings (`DB_CONFIG`/`DB_CREATE`/`DB_LIST`, persisted in `<db>/settings.ini`),
@@ -2241,8 +2261,8 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 
 ### Near-term priorities (from [`NEXT_STEPS.md`](NEXT_STEPS.md))
 
-1. Finish the association-cache follow-ons (persist its config, seed its entry count after reopen,
-   share capacity across databases), then add frequency-weighted / misspelling-tolerant term matching.
+1. Share association-cache capacity across databases, then add frequency-weighted /
+   misspelling-tolerant term matching.
 2. Persist cluster fork overrides + gossip snapshots so reassignments survive restarts.
 3. Ship full fork *data* (not just the current metadata/payload subset) when reassigning shards.
 4. Optional reducer digests (entropy/CDF/rolling hashes) and trie-level rolling-hash mirrors.
