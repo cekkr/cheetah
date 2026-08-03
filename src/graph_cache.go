@@ -507,8 +507,13 @@ type graphCacheStore struct {
 	// sostituire lo zero di una riapertura senza perdere ammissioni concorrenti.
 	// entryCountMu serializza gli aggiustamenti brevi; sweepRevision invalida il
 	// censimento se una mutazione esterna cade mentre la trie viene percorsa.
-	entryCountMu  sync.Mutex
-	entryRevision uint64
+	entryCountMu      sync.Mutex
+	entryRevision     uint64
+	entryReservations int64
+
+	globalBudget     *graphCacheBudget
+	budgetRegistered atomic.Bool
+	entryLocks       [64]sync.Mutex
 
 	sweepMu       sync.Mutex
 	sweepCursor   []byte
@@ -596,6 +601,79 @@ func (store *graphCacheStore) setConfig(cfg graphCacheConfig) {
 	store.mu.Unlock()
 }
 
+func (store *graphCacheStore) attachGlobalBudget(budget *graphCacheBudget) {
+	if store == nil || budget == nil || !store.budgetRegistered.CompareAndSwap(false, true) {
+		return
+	}
+	store.globalBudget = budget
+	budget.register()
+}
+
+func (store *graphCacheStore) detachGlobalBudget() {
+	if store == nil || !store.budgetRegistered.CompareAndSwap(true, false) {
+		return
+	}
+	store.globalBudget.unregister(store.entries.Load())
+	store.globalBudget = nil
+}
+
+func (store *graphCacheStore) entryLock(key []byte) *sync.Mutex {
+	sum := sha256.Sum256(key)
+	return &store.entryLocks[int(sum[0])%len(store.entryLocks)]
+}
+
+// reserveEntrySlot prende insieme il posto locale e quello di processo prima
+// della scrittura. Il contatore globale include anche le prenotazioni, quindi
+// due database non possono oltrepassare il tetto nello stesso istante.
+func (store *graphCacheStore) reserveEntrySlot() bool {
+	if store == nil {
+		return false
+	}
+	cfg := store.config()
+	store.entryCountMu.Lock()
+	if cfg.Capacity > 0 && store.entries.Load()+store.entryReservations >= int64(cfg.Capacity) {
+		store.entryCountMu.Unlock()
+		return false
+	}
+	store.entryReservations++
+	store.entryCountMu.Unlock()
+	if store.globalBudget != nil && !store.globalBudget.reserve() {
+		store.entryCountMu.Lock()
+		store.entryReservations--
+		store.entryCountMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (store *graphCacheStore) cancelEntrySlot() {
+	if store == nil {
+		return
+	}
+	store.entryCountMu.Lock()
+	if store.entryReservations > 0 {
+		store.entryReservations--
+	}
+	store.entryCountMu.Unlock()
+	if store.globalBudget != nil {
+		store.globalBudget.adjust(-1)
+	}
+}
+
+func (store *graphCacheStore) commitEntrySlot() int64 {
+	if store == nil {
+		return 0
+	}
+	store.entryCountMu.Lock()
+	defer store.entryCountMu.Unlock()
+	if store.entryReservations > 0 {
+		store.entryReservations--
+	}
+	next := store.entries.Load() + 1
+	store.entries.Store(next)
+	return next
+}
+
 func (store *graphCacheStore) unixNow() uint32 {
 	return uint32(store.now().Unix())
 }
@@ -610,11 +688,15 @@ func (store *graphCacheStore) adjustEntries(delta int64, invalidateSweep bool) i
 	}
 	store.entryCountMu.Lock()
 	defer store.entryCountMu.Unlock()
-	next := store.entries.Load() + delta
+	previous := store.entries.Load()
+	next := previous + delta
 	if next < 0 {
 		next = 0
 	}
 	store.entries.Store(next)
+	if store.globalBudget != nil {
+		store.globalBudget.adjust(next - previous)
+	}
 	if invalidateSweep {
 		store.entryRevision++
 	}
@@ -638,7 +720,10 @@ func (store *graphCacheStore) replaceEntryCount(count int64) {
 		count = 0
 	}
 	store.entryCountMu.Lock()
-	store.entries.Store(count)
+	previous := store.entries.Swap(count)
+	if store.globalBudget != nil {
+		store.globalBudget.adjust(count - previous)
+	}
 	store.entryRevision++
 	store.entryCountMu.Unlock()
 }
@@ -777,6 +862,9 @@ func (store *graphCacheStore) observeLink(from string, to string, score float64,
 		return false
 	}
 	key := graphCacheLinkKey(from, to)
+	lock := store.entryLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 	now := store.unixNow()
 	if entry, found := store.read(key); found {
 		entry.Observations++
@@ -800,6 +888,10 @@ func (store *graphCacheStore) observeLink(from string, to string, score float64,
 		store.metrics.Rejected.Add(1)
 		return false
 	}
+	if !store.reserveEntrySlot() {
+		store.metrics.Rejected.Add(1)
+		return false
+	}
 	entry := graphCacheEntry{
 		Kind:         graphCacheKindLink,
 		Score:        graphRecallClamp01(score),
@@ -811,10 +903,11 @@ func (store *graphCacheStore) observeLink(from string, to string, score float64,
 	}
 	store.invalidateEntrySweep()
 	if err := store.write(key, &entry); err != nil {
+		store.cancelEntrySlot()
 		return false
 	}
 	store.metrics.Admitted.Add(1)
-	store.adjustEntries(1, false)
+	store.commitEntrySlot()
 	if class >= 0 && class < graphCacheClassSlots {
 		store.classes[class].Writes.Add(1)
 	}
@@ -830,6 +923,9 @@ func (store *graphCacheStore) observeCommon(signature string, members []graphCac
 		return false
 	}
 	key := graphCacheQueryKey(signature)
+	lock := store.entryLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 	now := store.unixNow()
 	epoch := store.currentEpoch()
 	if len(members) > graphCacheMaxMembers {
@@ -864,12 +960,17 @@ func (store *graphCacheStore) observeCommon(signature string, members []graphCac
 		Refreshed:    now,
 		Epoch:        epoch,
 	}
+	if !store.reserveEntrySlot() {
+		store.metrics.Rejected.Add(1)
+		return false
+	}
 	store.invalidateEntrySweep()
 	if err := store.write(key, &entry); err != nil {
+		store.cancelEntrySlot()
 		return false
 	}
 	store.metrics.Admitted.Add(1)
-	store.adjustEntries(1, false)
+	store.commitEntrySlot()
 	if class >= 0 && class < graphCacheClassSlots {
 		store.classes[class].Writes.Add(1)
 	}
@@ -1128,12 +1229,22 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 	}
 
 	threshold := cfg.MinUtility
+	pressure := 1.0
 	if cfg.Capacity > 0 {
 		live := float64(store.entries.Load())
 		if live > float64(cfg.Capacity) {
-			threshold *= live / float64(cfg.Capacity)
+			pressure = live / float64(cfg.Capacity)
 		}
 	}
+	if store.globalBudget != nil {
+		global := store.globalBudget.snapshot()
+		if global.Capacity > 0 && global.Entries > global.Capacity {
+			if ratio := float64(global.Entries) / float64(global.Capacity); ratio > pressure {
+				pressure = ratio
+			}
+		}
+	}
+	threshold *= pressure
 	halfLife := cfg.HalfLife.Seconds()
 	now := store.unixNow()
 	pageEntries := int64(0)
@@ -1190,7 +1301,10 @@ func (store *graphCacheStore) sweep(page int, age bool) (graphCacheSweepResult, 
 		// attraversato la passata; in quel caso il giro successivo riprova.
 		store.entryCountMu.Lock()
 		if store.entryRevision == store.sweepRevision {
-			store.entries.Store(store.sweepEntries)
+			previous := store.entries.Swap(store.sweepEntries)
+			if store.globalBudget != nil {
+				store.globalBudget.adjust(store.sweepEntries - previous)
+			}
 		}
 		store.entryCountMu.Unlock()
 		store.sweepEntries = 0
@@ -1364,6 +1478,7 @@ func (store *graphCacheStore) CloseAndWait() {
 	if store == nil {
 		return
 	}
+	defer store.detachGlobalBudget()
 	store.stopOnce.Do(func() {
 		close(store.stop)
 	})

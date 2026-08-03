@@ -121,6 +121,7 @@ Environment variables:
 - `CHEETAH_DATA_DIR` — root directory for database folders (defaults to `cheetah_data`).
 - `CHEETAH_PAYLOAD_CACHE_ENTRIES` / `_MB` / `_BYTES` — cache tuning knobs.
 - `CHEETAH_SHARDED_KEY_SLOTS` / `CHEETAH_KEY_SLOT_BITS` — opt-in adaptive main-key sharding and its slot width.
+- `CHEETAH_GRAPH_CACHE_GLOBAL_CAPACITY` — process-wide association-cache ceiling (default 65,536; `0` means unlimited).
 - `CHEETAH_LOG_LEVEL` — set to `3`/`debug` for level 3 traces (command ingress, reducer/trie steps).
 
 - `CHEETAH_PREDICT_DEEPEN` - set to `0` to disable context-matrix deepening in prediction tables (derived layers now scale with context diversity).
@@ -128,7 +129,8 @@ Environment variables:
 Prefer declarative settings? Copy `config.example.ini` to `config.ini` (or point
 `CHEETAH_CONFIG_PATH` at a custom file) and edit:
 
-- `[server]` covers `listen_addr`, `data_dir`, and `default_database`.
+- `[server]` covers `listen_addr`, `data_dir`, `default_database`, and the process-wide
+  `graph_cache_global_capacity`.
 - `[database]` sets `pair_index_bytes` (1 or 2), `adaptive_pair_index` (default `true`),
   `sharded_key_slots` (default `false`) and `key_slot_bits` (default 12), plus
   payload-cache sizing and the persisted `graph_cache_*` profile.
@@ -913,17 +915,24 @@ the first two:
    numbers stay small and comparable and an old, famous row cannot outrank a new, useful one forever.
    It paces itself on free CPU and memory and skips its turn when the machine is busy.
 
+Capacity has two levels. Each database keeps its hot-configurable `graph_cache_capacity`; the engine
+also shares one `graph_cache_global_capacity` across every loaded database (default 65,536). A new
+row reserves both slots before it is written, so two databases racing cannot cross the process
+ceiling; reinforcement costs no new slot, and delete/prune returns it. Startup remains lazy: a
+reopened database reconciles its contribution through the same paged census its maintainer already
+performs rather than blocking the open on a full scan.
+
 **None of this needs a command.** The maintainer runs on its own; `GRAPH_CACHE prune` exists for an
 operator or a test that wants the result *now*.
 
 | Command | What it means |
 | --- | --- |
-| `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration. The background maintainer resynchronises the entry estimate after every complete lap (including after a reopen); `recount=1` pays for a full walk immediately and additionally reports the link/query split. |
+| `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration, plus `global_entries`, `global_capacity`, and loaded `global_databases`. The background maintainer resynchronises the entry estimate after every complete lap (including after a reopen); `recount=1` pays for a full walk immediately and additionally reports the link/query split. |
 | `GRAPH_CACHE config [enabled=] [sample=] [capacity=] [half_life=] [min_utility=] [budget=] [interval=] [page=]` | Steers the training live and persists the resulting profile in this database's `settings.ini`; a reopen restores it. The same fields are accepted with a `graph_cache_` prefix by `DB_CONFIG`. |
 | `GRAPH_CACHE get from=<id> to=<id>` / `signature=<sig>` | One row, with both recurrence counters, its usage probability and its current utility. |
 | `GRAPH_CACHE links id=<id> [limit=]` | Every shortcut known from a node. |
 | `GRAPH_CACHE common seeds=<a,b,…> [<recall options>]` | The memorised answer to "what do these have in common?", without redoing the comparison. Takes the same options as `GRAPH_RECALL` because a convergence found at three hops is not the answer to the same question at one. |
-| `GRAPH_CACHE put from=<id> to=<id> [score=] [distance=] [sources=]` | Teach a shortcut directly, **bypassing the sampling**. This is the hook for a client that already paid an expensive comparison *outside* the graph — two descriptors, two colour fields, two image signatures — and wants the next search to start from the answer. |
+| `GRAPH_CACHE put from=<id> to=<id> [score=] [distance=] [sources=]` | Teach a shortcut directly, **bypassing the sampling but not either capacity ceiling** (`ERROR,graph_cache_capacity_reached` when full). This is the hook for a client that already paid an expensive comparison *outside* the graph — two descriptors, two colour fields, two image signatures — and wants the next search to start from the answer. |
 | `GRAPH_CACHE prune [limit=] [min_utility=] [age=1]` | Force a sweep. `min_utility=` applies to this pass only and is restored afterwards. |
 | `DEL graph_cache [scope=links\|queries\|all] [limit=]` | Erase it. Erasure goes through `DEL` because `DEL` is the protocol's only erasure verb. |
 
@@ -951,7 +960,8 @@ SUCCESS,command=GRAPH_RECALL,…,cache=hit,cache_injected=0,cache_links=0,cache_
 
 [cheetah_data/notes]> GRAPH_CACHE stats recount=1
 SUCCESS,entries=11,lookups=7,hits=5,misses=2,stale=0,admitted=11,rejected=0,reinforced=18,pruned=0,
-        aged=0,sweeps=0,skipped=0,hit_rate=0.714286,epoch=39,links=10,queries=1,enabled=1,…
+        aged=0,sweeps=0,skipped=0,hit_rate=0.714286,epoch=39,global_entries=11,
+        global_capacity=65536,global_databases=1,links=10,queries=1,enabled=1,…
 [cheetah_data/notes]> GRAPH_CACHE get from=cat:luna to=country:germany
 SUCCESS,score=0.302495,distance=2,sources=2,observations=3,hits=2,usage=0.4,utility=1.7088…,…
 # usage=0.4 — two reads for three rediscoveries. A row near 0 is one the maintainer will drop.

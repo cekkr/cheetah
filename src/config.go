@@ -13,12 +13,13 @@ import (
 
 // Config describes server-wide settings loaded from config.ini/environment variables.
 type Config struct {
-	ListenAddr          string
-	DataDir             string
-	DefaultDatabase     string
-	MaxPairTables       int
-	TCPKeepAliveSeconds int
-	DatabaseDefaults    DatabaseConfig
+	ListenAddr               string
+	DataDir                  string
+	DefaultDatabase          string
+	MaxPairTables            int
+	TCPKeepAliveSeconds      int
+	GraphCacheGlobalCapacity int
+	DatabaseDefaults         DatabaseConfig
 }
 
 // DatabaseConfig holds concrete per-database tunables.
@@ -77,10 +78,11 @@ func defaultConfig() Config {
 	graphCache := defaultGraphCacheConfig()
 	graphCache.Enabled = graphCacheEnabledByEnv()
 	return Config{
-		ListenAddr:          "0.0.0.0:4455",
-		DataDir:             "cheetah_data",
-		DefaultDatabase:     "default",
-		TCPKeepAliveSeconds: 60,
+		ListenAddr:               "0.0.0.0:4455",
+		DataDir:                  "cheetah_data",
+		DefaultDatabase:          "default",
+		TCPKeepAliveSeconds:      60,
+		GraphCacheGlobalCapacity: graphCache.Capacity,
 		DatabaseDefaults: DatabaseConfig{
 			PairIndexBytes:       1,
 			ShardedKeySlots:      false,
@@ -158,6 +160,8 @@ func assignConfigValue(section, key, val string, cfg *Config) {
 			}
 		case "keepalive_seconds", "tcp_keepalive_seconds":
 			cfg.TCPKeepAliveSeconds = parseIntAllowZero(val, cfg.TCPKeepAliveSeconds)
+		case "graph_cache_global_capacity", "graph_cache_total_capacity":
+			cfg.GraphCacheGlobalCapacity = parseIntAllowZero(val, cfg.GraphCacheGlobalCapacity)
 		}
 	case "database":
 		switch key {
@@ -339,6 +343,9 @@ func applyEnvOverrides(cfg *Config) {
 	if raw := strings.TrimSpace(os.Getenv("CHEETAH_GRAPH_CACHE")); raw != "" {
 		cfg.DatabaseDefaults.GraphCacheEnabled = parseBool(raw, cfg.DatabaseDefaults.GraphCacheEnabled)
 	}
+	if raw := strings.TrimSpace(os.Getenv("CHEETAH_GRAPH_CACHE_GLOBAL_CAPACITY")); raw != "" {
+		cfg.GraphCacheGlobalCapacity = parseIntAllowZero(raw, cfg.GraphCacheGlobalCapacity)
+	}
 }
 
 func (cfg *Config) normalize() {
@@ -373,6 +380,9 @@ func (cfg *Config) normalize() {
 		cfg.DatabaseDefaults.PairListMaxFillPercent = 0
 	}
 	graphDefaults := defaultGraphCacheConfig()
+	if cfg.GraphCacheGlobalCapacity < 0 {
+		cfg.GraphCacheGlobalCapacity = graphDefaults.Capacity
+	}
 	if cfg.DatabaseDefaults.GraphCacheSample < 0 || cfg.DatabaseDefaults.GraphCacheSample > 1 {
 		cfg.DatabaseDefaults.GraphCacheSample = graphDefaults.Sample
 	}

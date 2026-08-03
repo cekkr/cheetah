@@ -123,6 +123,14 @@ func (db *Database) microGraphCacheStats(args microArgs) (microResponse, error) 
 		mf("hit_rate", formatGraphCacheFloat(graphRoundConfidence(store.hitRate()))),
 		mfu("epoch", store.currentEpoch()),
 	}
+	if store.globalBudget != nil {
+		global := store.globalBudget.snapshot()
+		fields = append(fields,
+			mfi("global_entries", int(global.Entries)),
+			mfi("global_capacity", int(global.Capacity)),
+			mfi("global_databases", int(global.Databases)),
+		)
+	}
 	if links >= 0 {
 		fields = append(fields, mfi("links", links), mfi("queries", queries))
 	}
@@ -380,6 +388,9 @@ func (db *Database) microGraphCachePut(args microArgs) (microResponse, error) {
 	}
 
 	key := graphCacheLinkKey(fromID, toID)
+	lock := store.entryLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 	now := store.unixNow()
 	entry, found := store.read(key)
 	if found {
@@ -400,13 +411,20 @@ func (db *Database) microGraphCachePut(args microArgs) (microResponse, error) {
 		}
 	}
 	if !found {
+		if !store.reserveEntrySlot() {
+			store.metrics.Rejected.Add(1)
+			return microFail("graph_cache_capacity_reached"), nil
+		}
 		store.invalidateEntrySweep()
 	}
 	if err := store.write(key, &entry); err != nil {
+		if !found {
+			store.cancelEntrySlot()
+		}
 		return microSilent(), err
 	}
 	if !found {
-		store.adjustEntries(1, false)
+		store.commitEntrySlot()
 		store.metrics.Admitted.Add(1)
 	} else {
 		store.metrics.Reinforce.Add(1)

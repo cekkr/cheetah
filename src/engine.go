@@ -14,12 +14,13 @@ import (
 )
 
 type Engine struct {
-	cfg       *Config
-	basePath  string
-	databases map[string]*Database
-	overrides map[string]DatabaseOverrides
-	mu        sync.Mutex
-	monitor   *ResourceMonitor
+	cfg              *Config
+	basePath         string
+	databases        map[string]*Database
+	overrides        map[string]DatabaseOverrides
+	mu               sync.Mutex
+	monitor          *ResourceMonitor
+	graphCacheBudget *graphCacheBudget
 }
 
 func NewEngine(cfg *Config, monitor *ResourceMonitor) (*Engine, error) {
@@ -27,11 +28,12 @@ func NewEngine(cfg *Config, monitor *ResourceMonitor) (*Engine, error) {
 		return nil, err
 	}
 	return &Engine{
-		cfg:       cfg,
-		basePath:  cfg.DataDir,
-		databases: make(map[string]*Database),
-		overrides: make(map[string]DatabaseOverrides),
-		monitor:   monitor,
+		cfg:              cfg,
+		basePath:         cfg.DataDir,
+		databases:        make(map[string]*Database),
+		overrides:        make(map[string]DatabaseOverrides),
+		monitor:          monitor,
+		graphCacheBudget: newGraphCacheBudget(cfg.GraphCacheGlobalCapacity),
 	}, nil
 }
 
@@ -58,6 +60,7 @@ func (e *Engine) getDatabaseLocked(name string) (*Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load database %s: %w", name, err)
 	}
+	db.graphCache.attachGlobalBudget(e.graphCacheBudget)
 
 	// Gli override arrivati dal comando si scrivono accanto ai dati: è ciò che
 	// li fa sopravvivere al riavvio invece di valere per la sola sessione.

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -627,6 +630,151 @@ func TestGraphCacheRecountResynchronisesTheCounter(t *testing.T) {
 	}
 	if got := store.entries.Load(); got != 2 {
 		t.Fatalf("recount must fix the in-memory counter, got %d", got)
+	}
+}
+
+func TestGraphCacheGlobalBudgetCapsAdmissionsAcrossDatabases(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.DataDir = t.TempDir() + "/data"
+	cfg.GraphCacheGlobalCapacity = 2
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(engine.Close)
+
+	leftDB, err := engine.GetDatabase("left")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightDB, err := engine.GetDatabase("right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := forceGraphCache(t, leftDB, true)
+	right := forceGraphCache(t, rightDB, true)
+	if !left.observeLink("a", "b", 0.9, 3, 2, 0) || !right.observeLink("c", "d", 0.9, 3, 2, 0) {
+		t.Fatal("the first two process-wide slots should be admitted")
+	}
+	if left.observeLink("a", "e", 0.9, 3, 2, 0) {
+		t.Fatal("a third admission crossed the process-wide capacity")
+	}
+	// Rinforzare una riga esistente non consuma un altro posto.
+	if !right.observeLink("c", "d", 0.95, 2, 2, 0) {
+		t.Fatal("the global ceiling must not block reinforcement")
+	}
+	snapshot := engine.graphCacheBudget.snapshot()
+	if snapshot.Entries != 2 || snapshot.Capacity != 2 || snapshot.Databases != 2 {
+		t.Fatalf("unexpected global budget: %+v", snapshot)
+	}
+	resp := assertCommandPrefix(t, leftDB, "GRAPH_CACHE stats", "SUCCESS")
+	if responseField(resp, "global_entries") != "2" || responseField(resp, "global_capacity") != "2" || responseField(resp, "global_databases") != "2" {
+		t.Fatalf("stats omit the process budget: %s", resp)
+	}
+	assertCommandPrefix(t, leftDB, "GRAPH_CACHE put from=a to=f", "ERROR,graph_cache_capacity_reached")
+
+	assertCommandPrefix(t, rightDB, "DEL graph_cache", "SUCCESS")
+	if got := engine.graphCacheBudget.snapshot().Entries; got != 1 {
+		t.Fatalf("deletion did not return a global slot: %d", got)
+	}
+	if !left.observeLink("a", "e", 0.9, 3, 2, 0) {
+		t.Fatal("a returned global slot was not reusable")
+	}
+}
+
+func TestGraphCacheGlobalBudgetReconcilesLazyReopenCounts(t *testing.T) {
+	dir := t.TempDir() + "/data"
+	cfg := defaultConfig()
+	cfg.DataDir = dir
+	cfg.GraphCacheGlobalCapacity = 1
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := engine.GetDatabase("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !forceGraphCache(t, db, true).observeLink("a", "b", 0.9, 3, 2, 0) {
+		t.Fatal("initial admission failed")
+	}
+	engine.Close()
+
+	reopened, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reopened.Close)
+	oldDB, err := reopened.GetDatabase("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStore := forceGraphCache(t, oldDB, true)
+	if got := reopened.graphCacheBudget.snapshot().Entries; got != 0 {
+		t.Fatalf("reopen should remain lazy before a census, got %d", got)
+	}
+	oldStore.countEntries()
+	if got := reopened.graphCacheBudget.snapshot().Entries; got != 1 {
+		t.Fatalf("census did not reconcile the process total: %d", got)
+	}
+	newDB, err := reopened.GetDatabase("new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forceGraphCache(t, newDB, true).observeLink("x", "y", 0.9, 3, 2, 0) {
+		t.Fatal("a reopened row was not charged against the global budget")
+	}
+}
+
+func TestGraphCacheGlobalBudgetReservationsAreConcurrent(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.DataDir = t.TempDir() + "/data"
+	cfg.GraphCacheGlobalCapacity = 32
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(engine.Close)
+	leftDB, err := engine.GetDatabase("left")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightDB, err := engine.GetDatabase("right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores := []*graphCacheStore{forceGraphCache(t, leftDB, true), forceGraphCache(t, rightDB, true)}
+
+	var admitted atomic.Int64
+	var workers sync.WaitGroup
+	for i := 0; i < 128; i++ {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			if stores[index%len(stores)].observeLink("root", fmt.Sprintf("node-%03d", index), 0.9, 3, 2, 0) {
+				admitted.Add(1)
+			}
+		}(i)
+	}
+	workers.Wait()
+	if got := admitted.Load(); got != 32 {
+		t.Fatalf("concurrent admissions=%d, want exactly 32", got)
+	}
+	if got := engine.graphCacheBudget.snapshot().Entries; got != 32 {
+		t.Fatalf("global reservations=%d, want 32", got)
+	}
+	if local := stores[0].entries.Load() + stores[1].entries.Load(); local != 32 {
+		t.Fatalf("local counters sum to %d, want 32", local)
+	}
+}
+
+func TestGraphCacheGlobalCapacityEnvironment(t *testing.T) {
+	t.Setenv("CHEETAH_GRAPH_CACHE_GLOBAL_CAPACITY", "17")
+	cfg := defaultConfig()
+	applyEnvOverrides(&cfg)
+	cfg.normalize()
+	if cfg.GraphCacheGlobalCapacity != 17 {
+		t.Fatalf("global graph-cache capacity=%d", cfg.GraphCacheGlobalCapacity)
 	}
 }
 

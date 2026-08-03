@@ -315,6 +315,13 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   `GRAPH_CACHE stats recount=1` remains the explicit, immediate full scan. Keep metarows such as
   `\x07gc:e` outside both the census and pruning, and invalidate the census *before* an external
   cache mutation so its final count cannot overwrite the mutation.
+- **Graph-cache capacity is local *and* process-wide.** `graph_cache_capacity` remains the hot,
+  per-database ceiling; the Engine-owned [`graphCacheBudget`](src/graph_cache_budget.go) applies
+  `graph_cache_global_capacity` (default 65,536) across every loaded database. A new row reserves both
+  before writing, commit converts the reservation into the local count, and failure/delete/prune/
+  recount returns or reconciles it. Reinforcement never reserves. Reopen stays lazy: the first quiet
+  census charges existing rows to the global total, after which over-capacity raises pruning pressure.
+  Never increment locally and globally after the write—the global reservation already counted it.
 - **Every graph write advances the cache epoch, and there is exactly one place that does it.**
   `graphUpsertPairPayload`/`graphDeletePairAndPayload` ([`graph.go`](src/graph.go)) are the choke
   point for records, adjacency, property indexes and the term index alike, so a *new* graph write
@@ -459,12 +466,13 @@ mode is detectable from byte one and needs no negotiation.
 
 Multi-tenant database registry. Lazily constructs and caches [`Database`](src/database.go) handles under
 `basePath/<name>`, applies per-name overrides, and closes all databases on shutdown. It also owns the
+Engine-wide [`graphCacheBudget`](src/graph_cache_budget.go), attached to every loaded database, and the
 engine-scoped commands, since a `Database` cannot see the registry it belongs to.
 
 - **Key symbols:** `Engine`, `GetDatabase`/`getDatabaseLocked` (lazy create + cache),
   `ResetDatabase` (close + `RemoveAll` + drop from map), `SetDatabaseOverrides`, `ConfigureDatabase`,
   `resolveSettingsLocked`, `EffectiveSettings`, `CreateDatabase`, `ListDatabases`/`DatabaseInfo`,
-  `engineControlCommand`, `DefaultDatabaseName`, `Close`.
+  `engineControlCommand`, `graphCacheBudget`, `DefaultDatabaseName`, `Close`.
 - **Settings layering:** `resolveSettingsLocked` composes `cfg.DatabaseDefaults` →
   `<db>/settings.ini` → the session overrides recorded by `SetDatabaseOverrides`. `getDatabaseLocked`
   then writes the session overrides back to that file, which is what makes an ad-hoc setting outlive
@@ -493,7 +501,8 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
   the per-database settings file (`databaseSettingsFile`, `loadDatabaseSettings`,
   `saveDatabaseSettings`, `renderDatabaseOverrides`, `databaseSettingTokens`, `databaseSettingMap`).
 - **Config keys** (`config.ini`): `[server] listen_addr, data_dir, default_database,
-  keepalive_seconds|tcp_keepalive_seconds`; `[database] pair_bytes|pair_index_bytes,
+  keepalive_seconds|tcp_keepalive_seconds,
+  graph_cache_global_capacity|graph_cache_total_capacity`; `[database] pair_bytes|pair_index_bytes,
   sharded_key_slots, key_slot_bits, payload_cache_entries, payload_cache_mb, payload_cache_bytes, adaptive_pair_index,
   graph_cache_enabled, graph_cache_sample, graph_cache_capacity, graph_cache_half_life,
   graph_cache_min_utility, graph_cache_budget, graph_cache_interval, graph_cache_page`;
@@ -504,7 +513,9 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
   overrides recorded on the name are rewritten on the reopen that follows.
 - **Common mistakes:** `normalize` clamps `pair_index_bytes` into `[1,2]` but maps `≤0`→**2** (not the
   `defaultConfig` value of 1); `key_slot_bits` is clamped to 1..16 and otherwise returns to 12. All
-  env keys are enumerated in [Configuration reference](#configuration-reference).
+  env keys are enumerated in [Configuration reference](#configuration-reference). The global graph
+  cache ceiling is an Engine/startup setting, not a per-database override and therefore never belongs
+  in `<db>/settings.ini`.
 
 #### [`src/database_config.go`](src/database_config.go)
 
@@ -988,6 +999,19 @@ next query.
   are read only for the items that survive the limit. When equal activations compete for the one
   displayed `via`, choose the lexical seed; map iteration must not make identical recalls differ.
 
+#### [`src/graph_cache_budget.go`](src/graph_cache_budget.go)
+
+The Engine-owned atomic capacity coordinator shared by every loaded database's association cache.
+It counts committed rows plus in-flight reservations, so simultaneous admissions in different
+databases cannot cross the process ceiling. `capacity=0` is unlimited but still counted for stats;
+the configured capacity is immutable for the Engine lifetime.
+
+- **Key symbols:** `graphCacheBudget`, `graphCacheBudgetSnapshot`, `newGraphCacheBudget`, `reserve`,
+  `adjust`, `register`, `unregister`, `snapshot`.
+- **Common mistakes:** this file owns no cache rows and performs no scans. Reopen accounting stays
+  lazy in each [`graphCacheStore`](src/graph_cache.go); its completed sweep or explicit recount sends
+  only the local delta here. Do not turn Engine construction into a scan of every database.
+
 #### [`src/graph_cache.go`](src/graph_cache.go)
 
 The association cache: *parallel, implicit tables* that remember the hidden links already paid for
@@ -1003,7 +1027,7 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
 - **Key symbols:** `graphCacheEntry` (+`encode`/`decodeGraphCacheEntry`, `utility`,
   `usageProbability`), `graphCacheStore` (`observeLink`, `observeCommon`, `observeRun`,
   `lookupCommon`, `linksOf`, `sweep`, `maintain`, `countEntries`, `adjustEntries`,
-  `invalidateEntrySweep`, `CloseAndWait`),
+  `reserveEntrySlot`, `cancelEntrySlot`, `commitEntrySlot`, `invalidateEntrySweep`, `CloseAndWait`),
   `admissionProbability`, `graphCacheClass`/`retune`, `graphCacheSignature`, `graphCacheClassOf`,
   `graphCacheLinkKey`/`graphCacheQueryKey`, the epoch (`currentEpoch`, `bumpEpoch`,
   `graphCacheBumpEpoch`), `graphCacheConfig`.
@@ -1028,9 +1052,15 @@ trie as everything else, in fixed-byte records under `\x07gc:`, and survives a r
   deletion did not invalidate the pass. This makes `capacity` effective again after reopen without
   adding a blocking startup scan or a metadata write to every admission. A concurrent mutation makes
   the next lap retry instead of letting the census overwrite its increment/decrement.
+- **Capacity has two scopes.** A new row reserves against the database's `graph_cache_capacity` and
+  the Engine's `graph_cache_global_capacity` before it is written. Reinforcement needs no slot;
+  failed writes cancel the reservation, while deletion, pruning, recount and shutdown reconcile the
+  shared counter. Per-key striped locks keep two concurrent first writes from charging the same row
+  twice. A direct `NewDatabase` has only its local ceiling because it has no Engine coordinator.
 - **Depends on:** [`commands.go`](src/commands.go) (`getPairPayload`/`upsertPairPayload`/
   `deletePairAndPayload`), [`database.go`](src/database.go) (`PairScanWithOptions`),
-  [`graph_recall.go`](src/graph_recall.go) (options, run, associations).
+  [`graph_recall.go`](src/graph_recall.go) (options, run, associations),
+  [`graph_cache_budget.go`](src/graph_cache_budget.go) (process coordinator).
   **Tests:** [`graph_cache_test.go`](src/graph_cache_test.go).
 - **Common mistakes:** do not make the link key symmetric — the two directions are two different
   facts with two different recurrences. Do not skip the `read` before admitting: reinforcement of an
@@ -1051,7 +1081,8 @@ because `DEL` is the protocol's only erasure verb).
 - **`put` is the client-side half of the feature.** It writes a shortcut *bypassing the sampling*,
   which is how a client that already paid an expensive comparison outside the graph — two
   descriptors, two colour fields, two image signatures — makes the next search start from the answer
-  instead of recomputing it.
+  instead of recomputing it. It still reserves both capacity slots and answers
+  `ERROR,graph_cache_capacity_reached` when either ceiling is full.
 - **`common` reuses `graphParseRecallOptions`**, and must: the signature has to come from the same
   parameters, since a convergence computed at three hops is not the answer to the same question at
   one.
@@ -1747,20 +1778,24 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   type filter, seed-count bucket → one of 64 slots) the cache tracks its own hit rate and raises or
   lowers that shape's admission bias, so the sampling budget follows the queries that actually read
   it back. Nothing about this needs a command: `GRAPH_CACHE prune` exists for operators and tests.
-- **Owners:** [`graph_cache.go`](src/graph_cache.go), [`micro_graph_cache.go`](src/micro_graph_cache.go),
+- **Owners:** [`graph_cache.go`](src/graph_cache.go),
+  [`graph_cache_budget.go`](src/graph_cache_budget.go),
+  [`micro_graph_cache.go`](src/micro_graph_cache.go),
   the hooks in [`graph_recall.go`](src/graph_recall.go), the epoch bump in [`graph.go`](src/graph.go),
-  the store field/shutdown in [`database.go`](src/database.go). **Tests:**
+  the store field/shutdown in [`database.go`](src/database.go), and the coordinator attachment in
+  [`engine.go`](src/engine.go). **Tests:**
   [`graph_cache_test.go`](src/graph_cache_test.go).
 - **Constraints:** injection is bounded by `cache_limit` (default 64, max 256) and by the same
   activation `floor` as real spreading, so a fat cache cannot widen a recall past what was asked; a
   **truncated** run never memoises its convergence, because its "nothing in common" is a budget
   artifact and not a fact; `cache=serve` answers carry `cached: true` and no `via` path, which is
-  why serving is opt-in while recording and injection are not.
+  why serving is opt-in while recording and injection are not. Admission is also bounded twice:
+  `graph_cache_capacity` per database and `graph_cache_global_capacity` across the loaded Engine.
 - **Persistence:** `GRAPH_CACHE config` writes the complete profile to `<db>/settings.ini`; the next
   open restores it, and `DB_CONFIG <name> graph_cache_*=…` reaches the same runtime configuration.
-- **Gaps:** There is no cross-database budget: each database trains and prunes its own cache in
-  isolation. The entry counter no longer needs operator intervention after reopen: a completed
-  maintenance lap adopts its live-row census and the following page applies `capacity`.
+  The process ceiling is intentionally a startup-only `[server]`/environment setting, not a database
+  setting. Reopened entry counts remain lazy: a completed maintenance lap adopts its live-row census,
+  charges the shared coordinator, and the following page applies both capacities.
 
 ### Edge uncertainty + ambiguity — Shipped
 
@@ -1979,7 +2014,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
 | `GRAPH_RECALL` (including bounded complete references and the shared sync/job execution path), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go), [`micro_job.go`](src/micro_job.go) |
-| `GRAPH_CACHE stats/config/get/links/common/put/prune`, `DEL graph_cache` | [`micro_graph_cache.go`](src/micro_graph_cache.go), [`graph_cache.go`](src/graph_cache.go) |
+| `GRAPH_CACHE stats/config/get/links/common/put/prune`, `DEL graph_cache` | [`micro_graph_cache.go`](src/micro_graph_cache.go), [`graph_cache.go`](src/graph_cache.go), [`graph_cache_budget.go`](src/graph_cache_budget.go), [`engine.go`](src/engine.go) |
 | `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`jobs.go`](src/jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
 | `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](src/database.go), [`resource_monitor.go`](src/resource_monitor.go), [`logger.go`](src/logger.go), [`file_manager.go`](src/file_manager.go) |
@@ -2123,9 +2158,11 @@ Environment variables read by the server (all verified in-tree):
 - **Graph term index** ([`graph_recall.go`](src/graph_recall.go)): `CHEETAH_GRAPH_TERM_INDEX`
   (default on; `0/false/no/off/disable(d)` turns off the automatic maintenance on node write —
   `GRAPH_TERM_INDEX action=rebuild` indexes regardless, since it is an explicit request).
-- **Graph association cache** ([`graph_cache.go`](src/graph_cache.go)): `CHEETAH_GRAPH_CACHE`
-  (default on; `0/false/off/no` sets the server-wide enabled default to off). Everything else is
-  tuned live per database with `GRAPH_CACHE config` or `DB_CONFIG`;
+- **Graph association cache** ([`graph_cache.go`](src/graph_cache.go),
+  [`graph_cache_budget.go`](src/graph_cache_budget.go)): `CHEETAH_GRAPH_CACHE`
+  (default on; `0/false/off/no` sets the server-wide enabled default to off) and
+  `CHEETAH_GRAPH_CACHE_GLOBAL_CAPACITY` (default 65,536; `0` removes the process ceiling). Everything
+  else is tuned live per database with `GRAPH_CACHE config` or `DB_CONFIG`;
   the profile is persisted in that database's `settings.ini`.
 - **Prediction:** `CHEETAH_PREDICT_DEEPEN`, `CHEETAH_PREDICT_FLUSH_MILLIS`,
   `CHEETAH_PREDICT_PURGE_THRESHOLD`, `CHEETAH_PREDICT_MERGER`.
@@ -2199,6 +2236,8 @@ seen in old docs are **client-side**; the server does not read them.
 | Cache rows stay hidden from ordinary scans; the epoch survives a reopen | [`TestGraphCacheEntriesStayHidden`, `TestGraphCacheEpochSurvivesReopen`](src/graph_cache_test.go) |
 | A post-reopen cache lap restores the count; a concurrent admission invalidates the lap and a quiet retry converges | [`TestGraphCacheSweepRecountsAfterReopenAndEnforcesCapacity`, `TestGraphCacheSweepCensusRetriesAfterConcurrentMutation`](src/graph_cache_test.go) |
 | Scoped graph-cache deletion preserves the other family's entry count | [`TestGraphCacheScopedDeletePreservesRemainingEntryCount`](src/graph_cache_test.go) |
+| The Engine-wide cache budget caps concurrent cross-database admissions, returns deleted slots, and lazily charges reopened rows | [`TestGraphCacheGlobalBudgetCapsAdmissionsAcrossDatabases`, `TestGraphCacheGlobalBudgetReservationsAreConcurrent`, `TestGraphCacheGlobalBudgetReconcilesLazyReopenCounts`](src/graph_cache_test.go) (`-race`) |
+| Process graph-cache capacity reads from its dedicated environment override | [`TestGraphCacheGlobalCapacityEnvironment`](src/graph_cache_test.go) |
 | `GRAPH_CACHE` surface + `DEL graph_cache` + `CHEETAH_GRAPH_CACHE=0` | [`TestGraphCacheCommandSurface`, `TestGraphCacheRejectsUnknownTargets`, `TestGraphCacheCanBeDisabledByEnv`](src/graph_cache_test.go) |
 | `GRAPH_CACHE config` survives a reopen through `settings.ini` | [`TestGraphCacheConfigPersistsThroughDatabaseSettings`](src/engine_control_test.go) |
 | Exhausted recall budget answers `truncated=1` on one line instead of stalling | [`TestGraphRecallBudgetDegradesInsteadOfStalling`](src/graph_recall_test.go) |

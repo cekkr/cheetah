@@ -259,7 +259,7 @@ var argumentKeyNames = []string{
 	"changed", "command", "compact", "confidence", "continue_on_error", "cost_limit",
 	"count", "cursor", "database", "depth", "direction", "drop", "edge",
 	"encoding", "entries", "expand", "fields", "field", "filter", "from", "generation",
-	"group", "hidden", "hops", "hidden_only", "id", "if_not_exists", "items",
+	"global_capacity", "global_databases", "global_entries", "group", "hidden", "hops", "hidden_only", "id", "if_not_exists", "items",
 	"indexed", "key", "keys", "kind", "label", "labels", "limit", "matrix", "mode",
 	"modality", "name", "node", "nodes", "offset", "op", "options", "payload",
 	"payloads", "pair_bytes", "precision", "prefix", "props", "reducer",
