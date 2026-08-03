@@ -56,7 +56,7 @@ func (db *Database) persistPayload(value []byte, specifiedSize int) (uint64, str
 	writeValueSize(entry, sizeField)
 	copy(entry[ValueSizeBytes:], location.Encode())
 
-	if err := db.mainKeys.WriteEntry(newKey, entry); err != nil {
+	if err := db.writeMainKeyEntry(newKey, entry); err != nil {
 		// Restituire la chiave alla free list invece di decrementare il
 		// contatore: il decremento consegnava la stessa chiave a chi nel
 		// frattempo ne aveva già presa una più alta, sovrascrivendone la riga.
@@ -68,7 +68,7 @@ func (db *Database) persistPayload(value []byte, specifiedSize int) (uint64, str
 }
 
 func (db *Database) Read(key uint64) (string, error) {
-	entry, err := db.mainKeys.ReadEntry(key)
+	entry, err := db.readMainKeyEntry(key)
 	if err != nil {
 		if os.IsNotExist(err) || err == io.EOF {
 			return "ERROR,key_not_found", nil
@@ -106,11 +106,15 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
 		return "ERROR,invalid_value_size", nil
 	}
 
-	lock := db.mainKeys.getLock(key)
+	table, row, err := db.mainKeyTableFor(key)
+	if err != nil {
+		return "ERROR,key_not_found", err
+	}
+	lock := table.getLock(row)
 	lock.Lock()
 	defer lock.Unlock()
 
-	entry, err := db.mainKeys.readEntryFromFile(key)
+	entry, err := table.readEntryFromFile(row)
 	if err != nil {
 		return "ERROR,key_not_found", err
 	}
@@ -154,7 +158,7 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
 	newLocationBytes := newLocation.Encode()
 	writeValueSize(entry, newSizeField)
 	copy(entry[ValueSizeBytes:], newLocationBytes)
-	if err := db.mainKeys.writeEntryToFile(key, entry); err != nil {
+	if err := table.writeEntryToFile(row, entry); err != nil {
 		if recycleTable, recycleErr := db.getRecycleTable(newSizeField); recycleErr == nil {
 			_ = recycleTable.Push(newLocationBytes)
 		}
@@ -179,11 +183,15 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
 }
 
 func (db *Database) Delete(key uint64) (string, error) {
-	lock := db.mainKeys.getLock(key)
+	table, row, err := db.mainKeyTableFor(key)
+	if err != nil {
+		return "ERROR,key_not_found", err
+	}
+	lock := table.getLock(row)
 	lock.Lock()
 	defer lock.Unlock()
 
-	entry, err := db.mainKeys.readEntryFromFile(key) // Usa il metodo interno non bloccante
+	entry, err := table.readEntryFromFile(row) // Usa il metodo interno non bloccante
 	if err != nil {
 		return "ERROR,key_not_found", err
 	}
@@ -208,7 +216,7 @@ func (db *Database) Delete(key uint64) (string, error) {
 	// significherebbe, in caso di errore sull'azzeramento, avere uno slot in
 	// free list ancora puntato da una riga viva — cioè un INSERT successivo che
 	// sovrascrive un payload buono.
-	if err := db.mainKeys.writeEntryToFile(key, make([]byte, MainKeysEntrySize)); err != nil {
+	if err := table.writeEntryToFile(row, make([]byte, MainKeysEntrySize)); err != nil {
 		return "ERROR,key_delete_failed", err
 	}
 	if err := rTable.Push(locationBytes); err != nil {
@@ -223,6 +231,9 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 	if len(value) == 0 {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
+	if _, _, err := db.keyFormat.decode(absKey); err != nil {
+		return "ERROR,absolute_key_out_of_range", nil
+	}
 	if err := db.setPairValue(value, absKey, false); err != nil {
 		return "", err
 	}
@@ -232,6 +243,9 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 func (db *Database) PairSetHidden(value []byte, absKey uint64) (string, error) {
 	if len(value) == 0 {
 		return "ERROR,pair_value_cannot_be_empty", nil
+	}
+	if _, _, err := db.keyFormat.decode(absKey); err != nil {
+		return "ERROR,absolute_key_out_of_range", nil
 	}
 	if err := db.setPairValue(value, absKey, true); err != nil {
 		return "", err

@@ -118,6 +118,7 @@ Environment variables:
 
 - `CHEETAH_DATA_DIR` — root directory for database folders (defaults to `cheetah_data`).
 - `CHEETAH_PAYLOAD_CACHE_ENTRIES` / `_MB` / `_BYTES` — cache tuning knobs.
+- `CHEETAH_SHARDED_KEY_SLOTS` / `CHEETAH_KEY_SLOT_BITS` — opt-in adaptive main-key sharding and its slot width.
 - `CHEETAH_LOG_LEVEL` — set to `3`/`debug` for level 3 traces (command ingress, reducer/trie steps).
 
 - `CHEETAH_PREDICT_DEEPEN` - set to `0` to disable context-matrix deepening in prediction tables (derived layers now scale with context diversity).
@@ -126,7 +127,8 @@ Prefer declarative settings? Copy `config.example.ini` to `config.ini` (or point
 `CHEETAH_CONFIG_PATH` at a custom file) and edit:
 
 - `[server]` covers `listen_addr`, `data_dir`, and `default_database`.
-- `[database]` sets `pair_index_bytes` (1 or 2) and `adaptive_pair_index` (default `true`), plus
+- `[database]` sets `pair_index_bytes` (1 or 2), `adaptive_pair_index` (default `true`),
+  `sharded_key_slots` (default `false`) and `key_slot_bits` (default 12), plus
   payload-cache sizing and the persisted `graph_cache_*` profile.
 - `[tuning]` exposes `max_pair_tables` so you can pin the open-file budget,
   `pair_list_max_bytes` (default 4096) — the sorted-list size at which an adaptive node expands into
@@ -139,10 +141,11 @@ database, and `RESET_DB` rebuilds a trie with recorded geometry. For example,
 `DB_CONFIG default payload_cache_entries=0 graph_cache_sample=0.1` disables the payload cache and
 retunes association admission without reopening the handle.
 
-`pair_index_bytes` and `adaptive_pair_index` are recorded in `pairs/format.dat` when a database is
-created and that marker wins on every later open, so editing `config.ini` never reinterprets existing
-on-disk data. Use `RESET_DB <name> [pair_bytes=…] [adaptive_pair_index=…]` to rebuild with new
-settings. A `pairs/` directory written before this format existed is refused at open with
+Pair geometry is recorded in `pairs/format.dat`; key-slot geometry is recorded in
+`main_keys.format.dat`. The markers pin these creation-time choices so editing `config.ini` never
+reinterprets existing on-disk data. A key-slot mismatch is refused on open; use
+`RESET_DB <name> [pair_bytes=…] [adaptive_pair_index=…] [sharded_key_slots=…] [key_slot_bits=…]`
+to rebuild with new settings. A `pairs/` directory written before its format marker existed is refused at open with
 `incompatible_pair_format_rebuild_required`; rebuild it and re-ingest.
 
 The binary prints `[cheetah_data/default]>` when ready. Use `DATABASE <name>` (CLI) to switch between
@@ -477,11 +480,11 @@ TCP cannot drift.
 
 | Command | What it means |
 | --- | --- |
-| `DB_CONFIG <name> [key=value …]` | Persist settings for an existing database. Payload-cache and graph-cache fields apply immediately when it is loaded; an unloaded database reports them in `on_open=`. `applied=`, `on_open=`, `reopen=` and `reset=` are semicolon-separated action lists (`-` when empty). Trie settings are recorded under `reset=` because `pairs/format.dat` remains authoritative until `RESET_DB`. With no settings, this is a non-mutating settings read. |
+| `DB_CONFIG <name> [key=value …]` | Persist settings for an existing database. Payload-cache and graph-cache fields apply immediately when it is loaded; an unloaded database reports them in `on_open=`. `applied=`, `on_open=`, `reopen=` and `reset=` are semicolon-separated action lists (`-` when empty). Trie and key-slot geometry are recorded under `reset=` because their format markers remain authoritative until `RESET_DB`. With no settings, this is a non-mutating settings read. |
 | `DB_CREATE <name> [key=value …]` | **Create a new database with settings of its own**, without pointing the connection at it. The `key=value` tokens override, *for this database only*, the `[database]` section the server was started with; they are written to `cheetah_data/<name>/settings.ini` and re-read at every open, so they outlive the process. Refuses an existing name (`ERROR,database_exists:<name>`) — that refusal is the difference from `DATABASE`, which opens-or-creates and would silently adopt a populated directory. Answers with the settings the database was actually created with. |
 | `DB_LIST` | Every database directory under `data_dir`, with the settings each one would open with and whether it carries its own `settings.ini` (`ad_hoc_settings`). Reads the disk, not the registry: a database never opened in this process is still listed. Records travel in `payload=<base64 json>`. |
 | `DATABASE <name> [key=value …]` | Point **this connection** at another logical database (`cheetah_data/<name>`), creating it on first use. Overrides are remembered for that name and persisted next to its data exactly as with `DB_CREATE`. Accepted fields cover trie geometry, payload-cache budgets and the `graph_cache_*` profile. Trie geometry only bites when the directory is created; use `DB_CONFIG` for later live cache tuning. |
-| `RESET_DB [name] [key=value …]` | Close the database, delete `cheetah_data/<name>` on disk, reopen it empty. The only way to adopt a new trie geometry, since `pairs/format.dat` wins on every ordinary open. Omitting the name resets whichever database the connection currently holds. |
+| `RESET_DB [name] [key=value …]` | Close the database, delete `cheetah_data/<name>` on disk, reopen it empty. The only way to adopt new trie or key-slot geometry. Omitting the name resets whichever database the connection currently holds. |
 | `EXIT` | CLI only: leave the interactive loop. A TCP client just closes the socket. |
 
 A database name is a single path component: letters, digits, `_`, `-` and `.`, at most 64 characters.
@@ -2210,6 +2213,12 @@ defined in [`src/types.go`](src/types.go) and the traversal logic lives in [`src
   noise. Since a 1-byte-stride database gets no benefit, the savings require `pair_index_bytes = 2`.
   The stride and the flag are pinned per database in `pairs/format.dat`; changing them requires
   `RESET_DB`.
+- **Optional main-key slot files** (`sharded_key_slots`, off by default) split the immutable 48-bit
+  absolute key into slot and sequence fields. The allocator keeps one randomly selected lane for
+  serial work and activates another only when every active lane is concurrently leased. Each lane
+  therefore stays dense in `main_keys_<slot>.table` and owns its own recycle file; high key numbers
+  do not create sparse holes. `key_slot_bits` accepts 1..16 (default 12), and both choices are pinned
+  in `main_keys.format.dat` until `RESET_DB`.
 - Jump nodes collapse unique suffixes into a compact segment so single-key branches no longer
   allocate entire tables. `PAIR_SET` writes the remainder of a key into a jump node whenever a branch
   has no siblings, and the node is split automatically if a later key shares part of that suffix. On

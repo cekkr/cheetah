@@ -263,6 +263,12 @@ func databaseOverrideActions(overrides DatabaseOverrides) (hot []string, reset [
 	if overrides.PairIndexBytes != nil {
 		reset = append(reset, "pair_index_bytes")
 	}
+	if overrides.ShardedKeySlots != nil {
+		reset = append(reset, "sharded_key_slots")
+	}
+	if overrides.KeySlotBits != nil {
+		reset = append(reset, "key_slot_bits")
+	}
 	if overrides.AdaptivePairIndex != nil {
 		reset = append(reset, "adaptive_pair_index")
 	}

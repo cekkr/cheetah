@@ -44,8 +44,8 @@ test('a setting the server does not know is caught before the wire', () => {
 
 test('boolean settings travel as 1/0, never as "false"', () => {
     assert.equal(
-        admin.buildCreateDatabase('bench', { adaptive_pair_index: false }),
-        'DB_CREATE bench adaptive_pair_index=0'
+        admin.buildCreateDatabase('bench', { sharded_key_slots: true, key_slot_bits: 10 }),
+        'DB_CREATE bench sharded_key_slots=1 key_slot_bits=10'
     );
 });
 

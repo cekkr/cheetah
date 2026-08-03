@@ -32,14 +32,14 @@ func TestDatabaseConfigAppliesHotSettingsAndReportsTrieReset(t *testing.T) {
 		t.Fatalf("GetDatabase: %v", err)
 	}
 
-	resp := controlCommand(t, engine, "DB_CONFIG", "default payload_cache_entries=7 payload_cache_bytes=4096 graph_cache_sample=0.5 pair_bytes=2")
+	resp := controlCommand(t, engine, "DB_CONFIG", "default payload_cache_entries=7 payload_cache_bytes=4096 graph_cache_sample=0.5 pair_bytes=2 sharded_key_slots=0 key_slot_bits=12")
 	if !strings.HasPrefix(resp, "SUCCESS,database_configured=default,loaded=1") {
 		t.Fatalf("DB_CONFIG = %q", resp)
 	}
 	for _, want := range []string{
 		"applied=payload_cache_entries;payload_cache_bytes;graph_cache_sample",
 		"reopen=-",
-		"reset=pair_index_bytes",
+		"reset=pair_index_bytes;sharded_key_slots;key_slot_bits",
 	} {
 		if !strings.Contains(resp, want) {
 			t.Fatalf("DB_CONFIG response missing %q: %s", want, resp)
@@ -168,11 +168,11 @@ func TestDatabaseCreateWithAdHocSettings(t *testing.T) {
 		t.Fatalf("NewEngine: %v", err)
 	}
 
-	resp := controlCommand(t, engine, "DB_CREATE", "bench pair_bytes=2 payload_cache_entries=0 pair_list_max_bytes=8192")
+	resp := controlCommand(t, engine, "DB_CREATE", "bench pair_bytes=2 sharded_key_slots=1 key_slot_bits=10 payload_cache_entries=0 pair_list_max_bytes=8192")
 	if !strings.HasPrefix(resp, "SUCCESS,database_created=bench") {
 		t.Fatalf("DB_CREATE = %q", resp)
 	}
-	for _, want := range []string{"pair_index_bytes=2", "payload_cache_entries=0", "pair_list_max_bytes=8192"} {
+	for _, want := range []string{"pair_index_bytes=2", "sharded_key_slots=1", "key_slot_bits=10", "payload_cache_entries=0", "pair_list_max_bytes=8192"} {
 		if !strings.Contains(resp, want) {
 			t.Fatalf("DB_CREATE response missing %s: %q", want, resp)
 		}
@@ -201,7 +201,7 @@ func TestDatabaseCreateWithAdHocSettings(t *testing.T) {
 	}
 	t.Cleanup(func() { reopened.Close() })
 	settings := reopened.EffectiveSettings("bench")
-	if settings.PairIndexBytes != 2 || settings.PayloadCacheEntries != 0 || settings.PairListMaxBytes != 8192 {
+	if settings.PairIndexBytes != 2 || !settings.ShardedKeySlots || settings.KeySlotBits != 10 || settings.PayloadCacheEntries != 0 || settings.PairListMaxBytes != 8192 {
 		t.Fatalf("settings after restart = %+v", settings)
 	}
 	db, err := reopened.GetDatabase("bench")
@@ -210,6 +210,9 @@ func TestDatabaseCreateWithAdHocSettings(t *testing.T) {
 	}
 	if db.settings.PairIndexBytes != 2 {
 		t.Fatalf("reopened database stride = %d, want 2", db.settings.PairIndexBytes)
+	}
+	if db.shardedKeys == nil || db.keyFormat.slotBits != 10 {
+		t.Fatalf("reopened key format = %+v, want sharded/10", db.keyFormat)
 	}
 }
 

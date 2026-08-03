@@ -261,7 +261,14 @@ from cheetah_db import admin
 
 # Settings that override the server's [database] section for this database
 # alone, persisted next to its data so they survive a restart.
-admin.create_database(conn, "bench", pair_bytes=2, payload_cache_mb=256)
+admin.create_database(
+    conn,
+    "bench",
+    pair_bytes=2,
+    sharded_key_slots=True,
+    key_slot_bits=12,
+    payload_cache_mb=256,
+)
 admin.configure_database(conn, "bench", payload_cache_mb=128, graph_cache_sample=0.5)
 admin.list_databases(conn)      # name, path, loaded, ad_hoc, settings
 ```
@@ -269,7 +276,8 @@ admin.list_databases(conn)      # name, path, loaded, ad_hoc, settings
 `create_database` refuses a name that already exists — that refusal is the whole
 difference from `use_database`, which opens-or-creates and would silently adopt a
 populated directory *and* ignore the settings passed, since trie geometry is
-decided when the directory is made.
+decided when the directory is made. Main-key sharding is creation-time geometry
+too; changing `sharded_key_slots` or `key_slot_bits` requires `reset_database`.
 
 ## Concurrency
 

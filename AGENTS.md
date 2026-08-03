@@ -163,6 +163,15 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   Rebuild (`RESET_DB … pair_bytes=2`) to change it. Note [`Config.normalize`](src/config.go) coerces a
   `≤0` value to **2**, while [`defaultConfig`](src/config.go) ships **1**; an explicitly zeroed
   `pair_index_bytes` becomes 2, not 1.
+- **Optional main-key sharding stays inside the existing 48-bit absolute-key wire format.** With
+  `sharded_key_slots=1`, [`key_format.go`](src/key_format.go) decodes a key as
+  `[slot:key_slot_bits][sequence:48-key_slot_bits]`; it cannot use 64 bits without changing the
+  immutable 6-byte `PairEntry.Key`. Each lane owns `main_keys_<slot>.table`, its recycle file and its
+  high-water mark ([`key_slots.go`](src/key_slots.go)). The allocator starts with one random lane and
+  activates another only when all active lanes are leased, so it shards actual insert contention
+  rather than serial work. `main_keys.format.dat` pins enabled/width at creation and an incompatible
+  reopen is refused; rebuild with `RESET_DB`. Slot bits are 1..16 (default 12), and key zero remains
+  the global sentinel.
 - **Pair-node files are self-describing and adaptive.** Each `pairs/<hexid>.table` begins with a
   `PairHeaderSize` (12-byte) header (`"CHPT"`, version, mode, keyWidth, entry count —
   [`types.go`](src/types.go)) followed by either a sorted, binary-searched **LIST** body of
@@ -335,13 +344,13 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   tables in full* — that last part is required, not an optimisation, because a response names its
   fields by index and a client without the argument-key dictionary could not decode even the answer
   to `ALIAS keys`.
-- **Per-database settings are persisted, hot where safe, and the pair format still wins.**
+- **Per-database settings are persisted, hot where safe, and creation-time formats still win.**
   `DB_CONFIG`/`DB_CREATE`/`DATABASE`
   overrides are written to `<db>/settings.ini` and re-read at every open, layered
   defaults → file → session ([`config.go`](src/config.go), [`engine.go`](src/engine.go)). Payload-cache
   and graph-cache fields apply hot to a loaded handle; `GRAPH_CACHE config` writes the same file. This does
-  **not** make trie geometry mutable: `pairs/format.dat` remains authoritative on reopen, so a changed
-  `pair_index_bytes` still needs a `RESET_DB`.
+  **not** make geometry mutable: `pairs/format.dat` pins the trie while `main_keys.format.dat` pins
+  main-key sharding, so changed pair/key-slot settings still need a `RESET_DB`.
 
 ---
 
@@ -474,7 +483,7 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
   `saveDatabaseSettings`, `renderDatabaseOverrides`, `databaseSettingTokens`, `databaseSettingMap`).
 - **Config keys** (`config.ini`): `[server] listen_addr, data_dir, default_database,
   keepalive_seconds|tcp_keepalive_seconds`; `[database] pair_bytes|pair_index_bytes,
-  payload_cache_entries, payload_cache_mb, payload_cache_bytes, adaptive_pair_index,
+  sharded_key_slots, key_slot_bits, payload_cache_entries, payload_cache_mb, payload_cache_bytes, adaptive_pair_index,
   graph_cache_enabled, graph_cache_sample, graph_cache_capacity, graph_cache_half_life,
   graph_cache_min_utility, graph_cache_budget, graph_cache_interval, graph_cache_page`;
   `[tuning] max_pair_tables, pair_list_max_bytes, pair_list_max_fill_percent`.
@@ -483,7 +492,8 @@ overrides, normalizes/clamps, and parses inline `key=value` database overrides f
   when a database ends up with no overrides, and it disappears with the directory on `RESET_DB` — the
   overrides recorded on the name are rewritten on the reopen that follows.
 - **Common mistakes:** `normalize` clamps `pair_index_bytes` into `[1,2]` but maps `≤0`→**2** (not the
-  `defaultConfig` value of 1). All env keys are enumerated in [Configuration reference](#configuration-reference).
+  `defaultConfig` value of 1); `key_slot_bits` is clamped to 1..16 and otherwise returns to 12. All
+  env keys are enumerated in [Configuration reference](#configuration-reference).
 
 #### [`src/database_config.go`](src/database_config.go)
 
@@ -526,7 +536,7 @@ and the glue handlers for prediction, cluster, and graph commands. Most feature 
   `DATABASE`/`RESET_DB`/`EXIT` are outside all of them. `normalizeCommandResponse` runs on the way
   out and prefixes any response that opens with neither `SUCCESS`, `ERROR` nor `PENDING`.
 - **Lifecycle / tables:** `NewDatabase` (creates `pairs/` + `pair_jumps/`, wires cache, file manager,
-  scheduler, reducers, prediction store, and closes `main_keys.table` on every failed initialization
+  scheduler, reducers, prediction store, and closes the main-key handle(s) on every failed initialization
   path), `Close`, `getValuesTable`, `getRecycleTable`, `getPairTable`, `pairTableCache` (fd-bounded LRU
   of open `PairTable`s via `resolvePairTableLimit`).
 - **The fd margin is proportional, and that was the bug.** `resolvePairTableLimit` returns
@@ -668,6 +678,28 @@ opening a legacy (headerless) directory.
   `adaptive_pair_index` in `config.ini` does **not** affect an existing database (by design — the old
   behavior silently reinterpreted on-disk data). `RESET_DB <name> [pair_bytes=…] [adaptive_pair_index=…]`
   is the way to adopt new settings.
+
+#### [`src/key_format.go`](src/key_format.go)
+
+Pins the main-key layout in `main_keys.format.dat` (`CHKS`, version, sharded flag, slot width, absolute
+key width). `resolveKeyFormat` writes the marker for fresh and legacy-unsharded databases, refuses a
+legacy `main_keys.table` when sharding is requested, and refuses any later flag/width mismatch.
+
+- **Key symbols:** `keyFormat`, `resolveKeyFormat`, `loadKeyFormat`, `writeKeyFormat`,
+  `absoluteKeyBits` (48), `defaultKeySlotBits` (12).
+- **Common mistakes:** the roadmap's conceptual 64-bit split is not the on-disk contract. Pair
+  terminals hold only six key bytes; widening that field requires a versioned pair migration.
+
+#### [`src/key_slots.go`](src/key_slots.go)
+
+The optional sharded main-key allocator and router. `shardedKeyStore.claimSlot` leases a random free
+active lane and grows the active pool only under contention; a `mainKeySlot` owns its dense sequence
+counter and recycle table. `mainKeyTableFor`/`readMainKeyEntry`/`writeMainKeyEntry` hide the physical
+file choice from KV and graph callers. Main-key files use `ManagedFile`, so thousands of possible
+lanes do not bypass the process fd budget.
+
+- **Common mistakes:** a lease is single-holder and the counter belongs to the lane, never to a
+  goroutine. Releasing a row must return its decoded sequence to that same lane's recycle file.
 
 #### [`src/jump_store.go`](src/jump_store.go)
 
@@ -1268,6 +1300,13 @@ two historical async trios, with the async fetch asserted equal to the synchrono
 `TestPredictFailuresCarryTheErrorPrefix` and `TestNormalizeCommandResponse` (the `ERROR,` prefix fix).
 Provides `runCommand`, `mustCommand`, `assertResponse`, `waitForJobState`.
 
+#### [`src/key_slots_test.go`](src/key_slots_test.go)
+
+Pins the optional allocator end to end: concurrent inserts are unique/readable and survive both the
+pair trie's 6-byte absolute-key field and a reopen; serial inserts activate exactly one lane; leases
+are single-holder; deletion recycles into the original lane; and `main_keys.format.dat` refuses both
+legacy reinterpretation and a changed slot width.
+
 #### [`src/micro_command_test.go`](src/micro_command_test.go)
 
 The micro surface itself: `TestMicroDelSelectors` and `TestMicroDelGraphSelectors` (one verb, the
@@ -1332,7 +1371,8 @@ The engine-scoped commands and per-database settings: `TestDatabaseCreateWithAdH
 
 `TestEditResizesValues` (correctness of size-changing edits) plus `TestCheetahDBBenchmark`, a
 throughput harness gated by `CHEETAHDB_BENCH=1` and tuned by `CHEETAHDB_BENCH_DURATION/_WORKERS/
-_VALUE_SIZE`. Writes logs a client would rotate under `var/eval_logs/` (untracked).
+_VALUE_SIZE`; `CHEETAHDB_BENCH_SHARDED_KEYS=1` selects the optional slot allocator. Writes logs a
+client would rotate under `var/eval_logs/` (untracked).
 
 ### Separate build targets (not part of the server binary)
 
@@ -1497,8 +1537,10 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 ### Runtime / generated (never edited or committed)
 
 - `cheetah-server` / `cheetah-server.exe` — the platform-specific built binary (`.gitignore`d).
-- `cheetah_data/<db>/` — per-database directory: `main_keys.table`, `main_keys.recycle.table`
-  (free list of deleted key rows), `values_<size>_<id>.table`,
+- `cheetah_data/<db>/` — per-database directory: `main_keys.format.dat` plus either
+  `main_keys.table`/`main_keys.recycle.table` or sharded
+  `main_keys_<slot>.table`/`main_keys_<slot>.recycle.table` pairs (free lists of deleted key rows),
+  `values_<size>_<id>.table`,
   `values_<size>.recycle.table` (free list of value slots; both carry the `"CHRL"` header),
   `pairs/<hexid>.table` + `pairs/next_id.dat` + `pairs/format.dat`,
   `pair_jumps/{jumps.bin,index.bin,next_id.dat}`, `prediction_<name>.table`,
@@ -1515,10 +1557,14 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 ### Key/value store — Shipped
 
 - **Behavior:** `INSERT`/`READ`/`EDIT`/`DELETE` over size-partitioned value tables with slot recycling
-  and a payload LRU. Keys are numeric main-key offsets.
+  and a payload LRU. By default keys are numeric `main_keys.table` offsets. Opt-in
+  `sharded_key_slots` routes the key's high bits to a lane file, activates lanes only under live
+  insert contention, and retains a dense sequence/free list within each lane.
 - **Flow & owners:** `ExecuteCommand` → [`commands.go`](src/commands.go) → [`tables.go`](src/tables.go) →
-  [`file_manager.go`](src/file_manager.go); cache via [`cache.go`](src/cache.go).
-- **Tests:** [`TestEditResizesValues`](src/benchmark_test.go). **Gaps:** none known.
+  [`file_manager.go`](src/file_manager.go); key geometry/routing via [`key_format.go`](src/key_format.go)
+  and [`key_slots.go`](src/key_slots.go); cache via [`cache.go`](src/cache.go).
+- **Tests:** [`TestEditResizesValues`](src/benchmark_test.go), [`key_recycle_test.go`](src/key_recycle_test.go),
+  [`key_slots_test.go`](src/key_slots_test.go). **Gaps:** none known.
 
 ### Pair-trie namespaces + scan/summary — Shipped
 
@@ -2024,6 +2070,9 @@ Environment variables read by the server (all verified in-tree):
   `yes/no`, `on/off`), `CHEETAH_PAIR_LIST_MAX_BYTES` (default 4096),
   `CHEETAH_PAIR_LIST_MAX_FILL_PERCENT` (default 0 = off). All only apply when a database is
   **created** — thereafter `pairs/format.dat` wins ([`pair_format.go`](src/pair_format.go)).
+- **Main-key slots:** `CHEETAH_SHARDED_KEY_SLOTS` (default off, same boolean dialect) and
+  `CHEETAH_KEY_SLOT_BITS` (1..16, default 12). Both are creation-time settings pinned by
+  `main_keys.format.dat` ([`key_format.go`](src/key_format.go)).
 - **Payload cache:** `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`,
   `CHEETAH_PAYLOAD_CACHE_BYTES` (any `=0` disables caching).
 - **Managed-file cache** ([`file_manager.go`](src/file_manager.go)): `CHEETAH_FLUSH_WORKERS`,
@@ -2041,7 +2090,8 @@ Environment variables read by the server (all verified in-tree):
   `CHEETAH_PREDICT_PURGE_THRESHOLD`, `CHEETAH_PREDICT_MERGER`.
 - **Cluster:** `CHEETAH_NODE_ID`, `CHEETAH_TRACK_STANDALONE_FORKS`.
 - **Benchmark (test only):** `CHEETAHDB_BENCH`, `CHEETAHDB_BENCH_DURATION`,
-  `CHEETAHDB_BENCH_WORKERS`, `CHEETAHDB_BENCH_VALUE_SIZE`.
+  `CHEETAHDB_BENCH_WORKERS`, `CHEETAHDB_BENCH_VALUE_SIZE`,
+  `CHEETAHDB_BENCH_SHARDED_KEYS`.
 - **Demo end-to-end (test only):** `CHEETAH_NELL_E2E=1` gates
   [`TestGraphNELLEndToEnd`](demo/graph-nell/main_test.go), which builds + boots the server and drives
   the demo over TCP. Read by the test harness, **not** by the server.
@@ -2063,6 +2113,7 @@ seen in old docs are **client-side**; the server does not read them.
 | `ALIAS` answers describe the index and the profiles | [`TestAliasCommandDescribesTheIndex`, `TestAliasProfileReadsAndWrites`](src/binary_protocol_test.go) |
 | Size-changing `EDIT` relocates + recycles | [`TestEditResizesValues`](src/benchmark_test.go) |
 | Equal-size payload inserts reserve distinct slots across reopen | [`TestEqualSizeInsertsReserveDistinctValueSlots`](src/key_recycle_test.go) |
+| Sharded keys: concurrent uniqueness/read/pair/reopen, exclusive adaptive leases, lane-local recycling, pinned-format guards | [`key_slots_test.go`](src/key_slots_test.go) |
 | Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](src/pair_adaptive_test.go) |
 | LIST→DENSE densify + ordered `PopulatedBranchIndices` over a sparse body | [`TestPairTableListToDense`](src/pair_adaptive_test.go) |
 | LIST insert/replace/delete ordering + count | [`TestPairTableListDelete`](src/pair_adaptive_test.go), [`TestAdaptivePairListLifecycle`](src/pair_adaptive_test.go) |
@@ -2160,7 +2211,9 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   `cheetah_data/*` and the binary are `.gitignore`d.
 - **On-disk compatibility:** the byte formats in [`types.go`](src/types.go) and the `CHPREDTB` prediction
   format are unversioned wire contracts. The pair-node container **is** versioned (`"CHPT"` header +
-  `PairFormatVersion`) and pinned per database by `pairs/format.dat` (`"CHPF"`). Record-table schemas
+  `PairFormatVersion`) and pinned per database by `pairs/format.dat` (`"CHPF"`). The main-key mode is
+  pinned separately by `main_keys.format.dat` (`"CHKS"`); an old unsharded database gains that marker
+  on open, while requesting sharding over its single file is refused. Record-table schemas
   are versioned too (`"CHRS"` + `RecordFormatVersion`, [`record_schema.go`](src/record_schema.go)) and
   refuse an unknown version rather than guessing a layout. Legacy migrations
   that *do* exist: per-file `.jump` → `pair_jumps/*.bin` ([`jump_store.go`](src/jump_store.go)), and
@@ -2190,6 +2243,7 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 
 - KV store, pair-trie namespaces with jump-node compression, cursored `PAIR_SCAN`/`PAIR_SUMMARY`/
   `PAIR_PURGE`.
+- Optional contention-adaptive main-key slot files with per-lane recycling and pinned geometry.
 - Atomic per-value-table slot reservation and serialized pair-trie mutations for concurrent ingest.
 - Reducers: `counts`/`probabilities`/`continuations` + graph `degree`/`triangle`/`pagerank_seed`,
   sync and async.

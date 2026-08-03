@@ -67,8 +67,8 @@ class DatabaseOperationTests(unittest.TestCase):
             admin.create_database(self.conn, "bench", cache_size_mb=16)
 
     def test_booleans_travel_as_one_and_zero(self) -> None:
-        admin.create_database(self.conn, "bench", adaptive_pair_index=False)
-        self.assertIn("adaptive_pair_index=0", self.conn.commands[-1])
+        admin.create_database(self.conn, "bench", sharded_key_slots=True, key_slot_bits=10)
+        self.assertIn("sharded_key_slots=1 key_slot_bits=10", self.conn.commands[-1])
 
     def test_list_databases_reports_which_ones_carry_their_own_settings(self) -> None:
         admin.create_database(self.conn, "bench", pair_bytes=2)

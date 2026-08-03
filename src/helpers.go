@@ -122,17 +122,37 @@ func (db *Database) seedKeyRecycle() error {
 // limite superiore. Nessuna delle due strade può restituire una riga viva —
 // una chiave entra nella free list solo dopo che la sua riga è stata azzerata.
 func (db *Database) nextKey() (uint64, error) {
+	if db.shardedKeys != nil {
+		return db.shardedKeys.nextKey()
+	}
 	if db.keyRecycle != nil {
 		if key, ok := db.keyRecycle.PopKey(); ok {
+			if key == 0 || key > db.keyFormat.sequenceMask() {
+				return 0, fmt.Errorf("invalid_recycled_absolute_key:%d", key)
+			}
 			return key, nil
 		}
 	}
-	return db.highestKey.Add(1), nil
+	for {
+		highest := db.highestKey.Load()
+		if highest >= db.keyFormat.sequenceMask() {
+			return 0, fmt.Errorf("absolute_key_space_exhausted")
+		}
+		if db.highestKey.CompareAndSwap(highest, highest+1) {
+			return highest + 1, nil
+		}
+	}
 }
 
 // releaseKey rimette una chiave a disposizione. Va chiamata solo quando la riga
 // corrispondente è azzerata su disco.
 func (db *Database) releaseKey(key uint64) {
+	if db.shardedKeys != nil {
+		if err := db.shardedKeys.releaseKey(key); err != nil {
+			logErrorf("main_keys: recycling sharded key %d failed: %v", key, err)
+		}
+		return
+	}
 	if db.keyRecycle == nil || key == 0 {
 		return
 	}

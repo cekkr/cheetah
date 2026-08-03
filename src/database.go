@@ -32,6 +32,8 @@ type Database struct {
 	pairTableReserveMu  sync.Mutex
 	mainKeys            *MainKeysTable
 	keyRecycle          *RecycleTable // Righe di main_keys liberate da DELETE, riusate dal prossimo INSERT
+	keyFormat           keyFormat
+	shardedKeys         *shardedKeyStore
 	valuesTables        sync.Map
 	recycleTables       sync.Map
 	pairTables          sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
@@ -400,24 +402,16 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, err
 	}
-	mainKeysPath := filepath.Join(path, "main_keys.table")
-	mkt, err := NewMainKeysTable(mainKeysPath)
-	if err != nil {
-		return nil, err
-	}
-	keepMainKeysOpen := false
-	defer func() {
-		if !keepMainKeysOpen {
-			mkt.Close()
-		}
-	}()
-
 	pairDir := filepath.Join(path, "pairs")
 	if err := os.MkdirAll(pairDir, 0755); err != nil {
 		return nil, err
 	}
 	jumpDir := filepath.Join(path, "pair_jumps")
 	if err := os.MkdirAll(jumpDir, 0755); err != nil {
+		return nil, err
+	}
+	keyFmt, err := resolveKeyFormat(path, cfg)
+	if err != nil {
 		return nil, err
 	}
 
@@ -444,15 +438,35 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	effective.AdaptivePairIndex = pairFmt.adaptive
 	effective.PairListMaxBytes = pairFmt.listMaxBytes
 	effective.PairListMaxFillPercent = pairFmt.listMaxFillPct
+	effective.ShardedKeySlots = keyFmt.sharded
+	effective.KeySlotBits = keyFmt.slotBits
 
 	pairLimit := resolvePairTableLimit(maxPairTables)
 	fileManager := NewFileManager(pairLimit, monitor)
+	var mkt *MainKeysTable
+	if !keyFmt.sharded {
+		mkt, err = NewMainKeysTable(fileManager, filepath.Join(path, "main_keys.table"))
+		if err != nil {
+			fileManager.Close()
+			return nil, err
+		}
+	}
+	keepMainKeysOpen := false
+	defer func() {
+		if !keepMainKeysOpen {
+			if mkt != nil {
+				mkt.Close()
+			}
+			fileManager.Close()
+		}
+	}()
 	db := &Database{
 		name:               name,
 		path:               path,
 		pairDir:            pairDir,
 		nextPairIDPath:     filepath.Join(pairDir, "next_id.dat"),
 		mainKeys:           mkt,
+		keyFormat:          keyFmt,
 		payloadCache:       newPayloadCacheFromConfig(cfg),
 		resources:          monitor,
 		fileManager:        fileManager,
@@ -476,6 +490,12 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	db.protocolProfiles = newNumericProfileStore(filepath.Join(path, numericProfileFile))
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
 	db.registerDefaultReducers()
+	if keyFmt.sharded {
+		db.shardedKeys, err = newShardedKeyStore(path, fileManager, keyFmt)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Carica il contatore degli ID delle tabelle pair
 	if err := db.loadNextPairTableID(); err != nil {
@@ -485,24 +505,25 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		return nil, err
 	}
 
-	if err := db.loadHighestKey(); err != nil {
-		return nil, err
-	}
-
-	// La free list delle chiavi va aperta dopo loadHighestKey: se manca, viene
-	// seminata con le righe già cancellate, e per farlo serve sapere fin dove
-	// arriva main_keys.
-	keyRecyclePath := filepath.Join(path, "main_keys.recycle.table")
-	_, missing := os.Stat(keyRecyclePath)
-	keyRecycle, err := NewRecycleTable(fileManager, keyRecyclePath, RecycleKeyEntrySize)
-	if err != nil {
-		return nil, err
-	}
-	db.keyRecycle = keyRecycle
-	if os.IsNotExist(missing) {
-		if err := db.seedKeyRecycle(); err != nil {
-			keyRecycle.Close()
+	if !keyFmt.sharded {
+		if err := db.loadHighestKey(); err != nil {
 			return nil, err
+		}
+
+		// La free list delle chiavi va aperta dopo loadHighestKey: se manca,
+		// viene seminata con le righe già cancellate.
+		keyRecyclePath := filepath.Join(path, "main_keys.recycle.table")
+		_, missing := os.Stat(keyRecyclePath)
+		keyRecycle, err := NewRecycleTable(fileManager, keyRecyclePath, RecycleKeyEntrySize)
+		if err != nil {
+			return nil, err
+		}
+		db.keyRecycle = keyRecycle
+		if os.IsNotExist(missing) {
+			if err := db.seedKeyRecycle(); err != nil {
+				keyRecycle.Close()
+				return nil, err
+			}
 		}
 	}
 	keepMainKeysOpen = true
@@ -530,9 +551,15 @@ func (db *Database) shutdown() error {
 	// Il maintainer della cache scrive nella trie come qualsiasi altro
 	// scrittore: va fermato e atteso *prima* che i file sotto di lui spariscano.
 	db.graphCache.CloseAndWait()
-	db.mainKeys.Close()
-	if db.keyRecycle != nil {
-		db.keyRecycle.Close()
+	if db.shardedKeys != nil {
+		db.shardedKeys.Close()
+	} else {
+		if db.mainKeys != nil {
+			db.mainKeys.Close()
+		}
+		if db.keyRecycle != nil {
+			db.keyRecycle.Close()
+		}
 	}
 	db.valuesTables.Range(func(key, value interface{}) bool {
 		if table, ok := value.(interface{ Close() }); ok {
@@ -709,6 +736,9 @@ func (db *Database) closePairTable(tableID uint32, table *PairTable, deleteFile 
 func (db *Database) setPairValue(value []byte, absKey uint64, hidden bool) error {
 	if len(value) == 0 {
 		return fmt.Errorf("pair value cannot be empty")
+	}
+	if _, _, err := db.keyFormat.decode(absKey); err != nil {
+		return err
 	}
 	db.pairMutationMu.Lock()
 	defer db.pairMutationMu.Unlock()
@@ -2831,7 +2861,7 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, i
 }
 
 func (db *Database) readValuePayload(key uint64) ([]byte, error) {
-	entry, err := db.mainKeys.ReadEntry(key)
+	entry, err := db.readMainKeyEntry(key)
 	if err != nil {
 		return nil, err
 	}
@@ -2868,7 +2898,7 @@ func (db *Database) insertPayloadBytes(value []byte) (uint64, error) {
 }
 
 func (db *Database) readValueSizeForKey(key uint64) (uint32, error) {
-	entry, err := db.mainKeys.ReadEntry(key)
+	entry, err := db.readMainKeyEntry(key)
 	if err != nil {
 		return 0, err
 	}

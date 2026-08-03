@@ -19,13 +19,18 @@ import (
 
 // MainKeysTable gestisce l'accesso al file main_keys.table
 type MainKeysTable struct {
-	file  *os.File
+	file  *ManagedFile
 	path  string
 	locks []sync.RWMutex // Lock striping
 }
 
-func NewMainKeysTable(path string) (*MainKeysTable, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+func NewMainKeysTable(manager *FileManager, path string) (*MainKeysTable, error) {
+	opts := ManagedFileOptions{
+		CacheEnabled:     false,
+		SectorSize:       defaultSectorSize,
+		MaxCachedSectors: 0,
+	}
+	file, err := NewManagedFile(manager, path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +67,9 @@ func (t *MainKeysTable) WriteEntry(key uint64, entry []byte) error {
 }
 
 func (t *MainKeysTable) Close() {
-	t.file.Close()
+	if t != nil && t.file != nil {
+		t.file.Close()
+	}
 }
 
 // Metodi senza lock (per uso interno quando il lock Γö£┬┐ giΓö£├í acquisito)

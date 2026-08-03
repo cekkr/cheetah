@@ -145,15 +145,16 @@ func TestCheetahDBBenchmark(t *testing.T) {
 			concurrency = parsed
 		}
 	}
+	shardedKeys := os.Getenv("CHEETAHDB_BENCH_SHARDED_KEYS") != ""
 
-	logPath, err := runBenchmark(duration, concurrency, valueSize)
+	logPath, err := runBenchmark(duration, concurrency, valueSize, shardedKeys)
 	if err != nil {
 		t.Fatalf("benchmark failed: %v", err)
 	}
 	t.Logf("cheetah-db benchmark finished, log at %s", logPath)
 }
 
-func runBenchmark(duration time.Duration, concurrency, valueSize int) (string, error) {
+func runBenchmark(duration time.Duration, concurrency, valueSize int, shardedKeys bool) (string, error) {
 	baseDir := filepath.Join("cheetah_data", "bench_perf")
 	if err := os.RemoveAll(baseDir); err != nil {
 		return "", fmt.Errorf("cleanup bench dir: %w", err)
@@ -161,6 +162,7 @@ func runBenchmark(duration time.Duration, concurrency, valueSize int) (string, e
 
 	cfg := defaultConfig()
 	cfg.DataDir = baseDir
+	cfg.DatabaseDefaults.ShardedKeySlots = shardedKeys
 	engine, err := NewEngine(&cfg, nil)
 	if err != nil {
 		return "", err

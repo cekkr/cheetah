@@ -37,12 +37,14 @@ __all__ = [
 #: The per-database settings ``DB_CONFIG``/``DB_CREATE``/``DATABASE``/``RESET_DB`` accept.
 #: They override the server's own ``[database]`` section for that database
 #: alone and are persisted next to its data (``<db>/settings.ini``), so they
-#: survive a restart. The trie-geometry ones only bite when the directory is
-#: *created*: ``pairs/format.dat`` wins on every ordinary open, which is why
-#: adopting a new stride means :func:`reset_database`.
+#: survive a restart. Trie and main-key geometry only bite when the directory
+#: is *created*: their format markers win on every ordinary open, which is why
+#: adopting a new stride or key-slot split means :func:`reset_database`.
 DATABASE_SETTINGS = (
     "pair_bytes",
     "pair_index_bytes",
+    "sharded_key_slots",
+    "key_slot_bits",
     "adaptive_pair_index",
     "pair_list_max_bytes",
     "pair_list_max_fill_percent",
@@ -244,8 +246,8 @@ def reset_database(
 ) -> Response:
     """``RESET_DB`` — delete the directory and reopen it empty.
 
-    The only way to adopt a new trie geometry, since ``pairs/format.dat`` is
-    authoritative on every ordinary open. Destructive and not confirmable:
+    The only way to adopt new trie or main-key geometry, since their format
+    markers are authoritative on every ordinary open. Destructive and not confirmable:
     everything in that database is gone.
     """
     parts = ["RESET_DB"]

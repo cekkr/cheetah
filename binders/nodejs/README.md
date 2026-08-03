@@ -258,7 +258,12 @@ const { admin, graph, jobs } = require('cheetah-db');
 
 // A database of its own, with settings that override the server's [database]
 // section for this database alone and persist next to its data.
-await admin.createDatabase(pool, 'bench', { pair_bytes: 2, payload_cache_mb: 256 });
+await admin.createDatabase(pool, 'bench', {
+    pair_bytes: 2,
+    sharded_key_slots: true,
+    key_slot_bits: 12,
+    payload_cache_mb: 256,
+});
 await admin.configureDatabase(pool, 'bench', { payload_cache_mb: 128, graph_cache_sample: 0.5 });
 await admin.listDatabases(pool);        // name, path, loaded, adHoc, settings
 
@@ -277,7 +282,8 @@ await admin.systemStats(pool);          // gauges; `NA` reads as null, never 0
 `createDatabase` refuses a name that already exists — that refusal is the whole
 difference from `useDatabase`, which opens-or-creates and would silently adopt a
 populated directory *and* ignore the settings you passed, since trie geometry is
-decided when the directory is made.
+decided when the directory is made. Main-key sharding is creation-time geometry
+too; changing `sharded_key_slots` or `key_slot_bits` requires `resetDatabase`.
 
 ## `CheetahDatabase`
 

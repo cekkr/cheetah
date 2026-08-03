@@ -24,6 +24,8 @@ type Config struct {
 // DatabaseConfig holds concrete per-database tunables.
 type DatabaseConfig struct {
 	PairIndexBytes       int
+	ShardedKeySlots      bool
+	KeySlotBits          int
 	PayloadCacheEntries  int
 	PayloadCacheBytes    int64
 	GraphCacheEnabled    bool
@@ -52,6 +54,8 @@ type DatabaseConfig struct {
 // DatabaseOverrides carries optional overrides collected via CLI/API commands.
 type DatabaseOverrides struct {
 	PairIndexBytes       *int
+	ShardedKeySlots      *bool
+	KeySlotBits          *int
 	PayloadCacheEntries  *int
 	PayloadCacheBytes    *int64
 	AdaptivePairIndex    *bool
@@ -79,6 +83,8 @@ func defaultConfig() Config {
 		TCPKeepAliveSeconds: 60,
 		DatabaseDefaults: DatabaseConfig{
 			PairIndexBytes:       1,
+			ShardedKeySlots:      false,
+			KeySlotBits:          defaultKeySlotBits,
 			PayloadCacheEntries:  defaultPayloadCacheEntries,
 			PayloadCacheBytes:    defaultPayloadCacheBytes,
 			AdaptivePairIndex:    true,
@@ -158,6 +164,12 @@ func assignConfigValue(section, key, val string, cfg *Config) {
 		case "pair_bytes", "pair_index_bytes":
 			if v := parsePositiveInt(val); v > 0 {
 				cfg.DatabaseDefaults.PairIndexBytes = v
+			}
+		case "sharded_key_slots":
+			cfg.DatabaseDefaults.ShardedKeySlots = parseBool(val, cfg.DatabaseDefaults.ShardedKeySlots)
+		case "key_slot_bits":
+			if v := parsePositiveInt(val); v > 0 {
+				cfg.DatabaseDefaults.KeySlotBits = v
 			}
 		case "payload_cache_entries":
 			cfg.DatabaseDefaults.PayloadCacheEntries = parseIntAllowZero(val, cfg.DatabaseDefaults.PayloadCacheEntries)
@@ -295,6 +307,12 @@ func applyEnvOverrides(cfg *Config) {
 	if v := parsePositiveInt(os.Getenv("CHEETAH_PAIR_INDEX_BYTES")); v > 0 {
 		cfg.DatabaseDefaults.PairIndexBytes = v
 	}
+	if raw := strings.TrimSpace(os.Getenv("CHEETAH_SHARDED_KEY_SLOTS")); raw != "" {
+		cfg.DatabaseDefaults.ShardedKeySlots = parseBool(raw, cfg.DatabaseDefaults.ShardedKeySlots)
+	}
+	if v := parsePositiveInt(os.Getenv("CHEETAH_KEY_SLOT_BITS")); v > 0 {
+		cfg.DatabaseDefaults.KeySlotBits = v
+	}
 	if v := parseIntAllowZero(os.Getenv("CHEETAH_PAYLOAD_CACHE_ENTRIES"), cfg.DatabaseDefaults.PayloadCacheEntries); v >= 0 {
 		cfg.DatabaseDefaults.PayloadCacheEntries = v
 	}
@@ -338,6 +356,9 @@ func (cfg *Config) normalize() {
 	}
 	if cfg.DatabaseDefaults.PairIndexBytes > 2 {
 		cfg.DatabaseDefaults.PairIndexBytes = 2
+	}
+	if cfg.DatabaseDefaults.KeySlotBits < minKeySlotBits || cfg.DatabaseDefaults.KeySlotBits > maxKeySlotBits {
+		cfg.DatabaseDefaults.KeySlotBits = defaultKeySlotBits
 	}
 	if cfg.DatabaseDefaults.PayloadCacheBytes <= 0 {
 		cfg.DatabaseDefaults.PayloadCacheBytes = defaultPayloadCacheBytes
@@ -385,6 +406,12 @@ func mergeDatabaseConfig(base DatabaseConfig, override DatabaseOverrides) Databa
 	result := base
 	if override.PairIndexBytes != nil {
 		result.PairIndexBytes = *override.PairIndexBytes
+	}
+	if override.ShardedKeySlots != nil {
+		result.ShardedKeySlots = *override.ShardedKeySlots
+	}
+	if override.KeySlotBits != nil {
+		result.KeySlotBits = *override.KeySlotBits
 	}
 	if override.PayloadCacheEntries != nil {
 		result.PayloadCacheEntries = *override.PayloadCacheEntries
@@ -451,6 +478,18 @@ func parseDatabaseOverrideTokens(tokens []string) (DatabaseOverrides, error) {
 			} else {
 				return overrides, fmt.Errorf("pair_bytes must be >0")
 			}
+		case "sharded_key_slots":
+			parsed, ok := parseStrictBool(val)
+			if !ok {
+				return overrides, fmt.Errorf("sharded_key_slots must be 0 or 1")
+			}
+			overrides.ShardedKeySlots = ptrBool(parsed)
+		case "key_slot_bits":
+			parsed, err := strconv.Atoi(val)
+			if err != nil || parsed < minKeySlotBits || parsed > maxKeySlotBits {
+				return overrides, fmt.Errorf("key_slot_bits must be %d..%d", minKeySlotBits, maxKeySlotBits)
+			}
+			overrides.KeySlotBits = ptrInt(parsed)
 		case "payload_cache_entries":
 			valParsed := parseIntAllowZero(val, 0)
 			overrides.PayloadCacheEntries = ptrInt(valParsed)
@@ -563,6 +602,8 @@ const databaseSettingsFile = "settings.ini"
 
 func (ov DatabaseOverrides) isEmpty() bool {
 	return ov.PairIndexBytes == nil &&
+		ov.ShardedKeySlots == nil &&
+		ov.KeySlotBits == nil &&
 		ov.PayloadCacheEntries == nil &&
 		ov.PayloadCacheBytes == nil &&
 		ov.AdaptivePairIndex == nil &&
@@ -583,6 +624,12 @@ func mergeDatabaseOverrides(base DatabaseOverrides, extra DatabaseOverrides) Dat
 	result := base
 	if extra.PairIndexBytes != nil {
 		result.PairIndexBytes = extra.PairIndexBytes
+	}
+	if extra.ShardedKeySlots != nil {
+		result.ShardedKeySlots = extra.ShardedKeySlots
+	}
+	if extra.KeySlotBits != nil {
+		result.KeySlotBits = extra.KeySlotBits
 	}
 	if extra.PayloadCacheEntries != nil {
 		result.PayloadCacheEntries = extra.PayloadCacheEntries
@@ -632,6 +679,12 @@ func renderDatabaseOverrides(ov DatabaseOverrides) []string {
 	var lines []string
 	if ov.PairIndexBytes != nil {
 		lines = append(lines, fmt.Sprintf("pair_index_bytes=%d", *ov.PairIndexBytes))
+	}
+	if ov.ShardedKeySlots != nil {
+		lines = append(lines, fmt.Sprintf("sharded_key_slots=%d", boolToInt(*ov.ShardedKeySlots)))
+	}
+	if ov.KeySlotBits != nil {
+		lines = append(lines, fmt.Sprintf("key_slot_bits=%d", *ov.KeySlotBits))
 	}
 	if ov.AdaptivePairIndex != nil {
 		lines = append(lines, fmt.Sprintf("adaptive_pair_index=%d", boolToInt(*ov.AdaptivePairIndex)))
@@ -723,6 +776,8 @@ func saveDatabaseSettings(path string, ov DatabaseOverrides) error {
 func databaseSettingTokens(cfg DatabaseConfig) []string {
 	return []string{
 		fmt.Sprintf("pair_index_bytes=%d", cfg.PairIndexBytes),
+		fmt.Sprintf("sharded_key_slots=%d", boolToInt(cfg.ShardedKeySlots)),
+		fmt.Sprintf("key_slot_bits=%d", cfg.KeySlotBits),
 		fmt.Sprintf("adaptive_pair_index=%d", boolToInt(cfg.AdaptivePairIndex)),
 		fmt.Sprintf("pair_list_max_bytes=%d", cfg.PairListMaxBytes),
 		fmt.Sprintf("pair_list_max_fill_percent=%d", cfg.PairListMaxFillPercent),
@@ -742,6 +797,8 @@ func databaseSettingTokens(cfg DatabaseConfig) []string {
 func databaseSettingMap(cfg DatabaseConfig) map[string]any {
 	return map[string]any{
 		"pair_index_bytes":           cfg.PairIndexBytes,
+		"sharded_key_slots":          cfg.ShardedKeySlots,
+		"key_slot_bits":              cfg.KeySlotBits,
 		"adaptive_pair_index":        cfg.AdaptivePairIndex,
 		"pair_list_max_bytes":        cfg.PairListMaxBytes,
 		"pair_list_max_fill_percent": cfg.PairListMaxFillPercent,

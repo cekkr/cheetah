@@ -22,13 +22,15 @@ const { buildKeyValueCommand, decodePayload, numericField } = require('./protoco
  * The per-database settings `DB_CONFIG`/`DB_CREATE`/`DATABASE`/`RESET_DB` accept. They
  * override the server's own `[database]` section for that database alone and
  * are persisted next to its data (`<db>/settings.ini`), so they survive a
- * restart. The trie-geometry ones only bite when the directory is *created*:
- * `pairs/format.dat` wins on every ordinary open, which is why adopting a new
- * stride means `resetDatabase`.
+ * restart. Trie and main-key geometry only bite when the directory is
+ * *created*: their format markers win on every ordinary open, which is why
+ * adopting a new stride or key-slot split means `resetDatabase`.
  */
 const DATABASE_SETTINGS = Object.freeze([
     'pair_bytes',
     'pair_index_bytes',
+    'sharded_key_slots',
+    'key_slot_bits',
     'adaptive_pair_index',
     'pair_list_max_bytes',
     'pair_list_max_fill_percent',
@@ -103,8 +105,8 @@ async function createDatabase(conn, name, settings) {
 
 /**
  * Persist settings for an existing database. Cache settings apply immediately
- * when loaded; trie geometry is reported in `reset` and remains pinned until
- * `RESET_DB` rebuilds the database.
+ * when loaded; trie/key-slot geometry is reported in `reset` and remains
+ * pinned until `RESET_DB` rebuilds the database.
  */
 async function configureDatabase(conn, name, settings) {
     const response = await sendOrThrow(conn, buildConfigureDatabase(name, settings), `DB_CONFIG ${name}`);
@@ -154,8 +156,8 @@ async function useDatabase(conn, name, settings) {
 
 /**
  * `RESET_DB` — delete the directory and reopen it empty. The only way to adopt
- * a new trie geometry, since `pairs/format.dat` is authoritative on every
- * ordinary open. Destructive and not confirmable.
+ * new trie or main-key geometry, since their markers are authoritative on
+ * every ordinary open. Destructive and not confirmable.
  */
 async function resetDatabase(conn, name = null, settings = null) {
     const tokens = settingTokens(settings);
