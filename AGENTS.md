@@ -271,8 +271,24 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   is `recordRowLocks` ([`record_table.go`](src/record_table.go)). Row ops take the table's `RLock` and
   then a row lock; schema mutations take the `Lock` and **never** a row lock — reversing that nests
   the two in both orders.
-- **Reserved trie prefixes now run `\x01`…`\x06`.** `\x06rr:` belongs to record-table rows, alongside
-  the five graph prefixes. Never emit user keys under any of them.
+- **Reserved trie prefixes now run `\x01`…`\x07`.** `\x06rr:` belongs to record-table rows and
+  `\x07gc:` to the graph association cache ([`graph_cache.go`](src/graph_cache.go)), alongside the
+  five graph prefixes. Never emit user keys under any of them.
+- **The graph cache is derived, hidden, and never authoritative.** Its rows (`\x07gc:l/` shortcuts,
+  `\x07gc:q/` convergences) are written *hidden*, so they stay out of ordinary scans and summaries,
+  and they may be dropped at any moment by the maintainer or by `DEL graph_cache` without changing a
+  single answer — only how fast it arrives. A cached shortcut therefore enters a recall as evidence
+  marked `cached` (a dedicated `graphRecallEdgeView.Cached` bool, **not** a reserved edge type, which
+  a user-declared type could always collide with), never as an edge.
+- **Every graph write advances the cache epoch, and there is exactly one place that does it.**
+  `graphUpsertPairPayload`/`graphDeletePairAndPayload` ([`graph.go`](src/graph.go)) are the choke
+  point for records, adjacency, property indexes and the term index alike, so a *new* graph write
+  path invalidates stale convergences without having to remember to — unlike the derived term index,
+  which does need every write path to call it. The epoch persists at `\x07gc:e` with the same
+  reserve-a-block-and-write-the-end scheme as jump ids: a restart resumes past every epoch ever
+  issued, because resuming from zero would make a pre-restart convergence read as fresh. The cache's
+  own writes go through plain `upsertPairPayload` and must keep doing so — routing them through the
+  graph wrappers would invalidate the cache on every row it writes.
 - **A database name is a single path component.** `validateDatabaseName` ([`config.go`](src/config.go))
   gates `GetDatabase`/`CreateDatabase`/`ResetDatabase` and `parseDatabaseTarget`; without it
   `RESET_DB ../..` resolved (and deleted) outside `data_dir`. Any new engine entry point taking a name
@@ -333,7 +349,8 @@ client ── TCP ──►  server.go (per-conn loop; text or binary frames)   
                  │                        └─ cache.go (payload LRU),  jump_store.go (suffix collapse)
                  ├─ reducers.go        PAIR_REDUCE counts/probs/continuations + graph degree/triangle/pagerank
                  ├─ graph.go           GRAPH_* nodes/edges/adjacency/query
-                 │    └─ graph_recall.go  GRAPH_RECALL/SIMILAR/TERM_INDEX (associative recall)
+                 │    ├─ graph_recall.go  GRAPH_RECALL/SIMILAR/TERM_INDEX (associative recall)
+                 │    └─ graph_cache.go   \x07gc: shortcut + convergence cache, self-training
                  ├─ record_*.go        RECORD multi-field tables (schema file + rows in the trie)
                  ├─ prediction_*.go    PREDICT_* tables + context matrices
                  └─ cluster_*.go       CLUSTER_*/FORK_ASSIGN topology, gossip
@@ -729,7 +746,8 @@ until the dispatcher boundary so an alias formatter can read it by name), `micro
 - **Key symbols:** `microField`/`mf`/`mfi`/`mfu`, `microResponse` (`Render`/`Get`/`Has`/`IsError`),
   `microOK`/`microFail`/`microFailf`/`microPending`/`microSilent`, `microHandler`, `microCall`,
   `microCommandRegistry`, `ensureCommandRegistries` (the one-time `sync.Once` that builds all three
-  package-level tables), `registerDefaultMicroCommands` (`ALIAS`, `BATCH`, `DEL`, `JOB`, `RECORD`), `splitMicroArgs`,
+  package-level tables), `registerDefaultMicroCommands` (`ALIAS`, `BATCH`, `DEL`, `GRAPH_CACHE`,
+  `JOB`, `RECORD`), `splitMicroArgs`,
   `microParseBytes`/`microEncodeBytes`, `Database.executeMicroCommand`.
 - **Common mistakes:** `microSilent()` (empty `Status`) is the "only an error to propagate" case and
   renders as the empty string — do not confuse it with `microFail`. `microEncodeBytes` always emits
@@ -765,10 +783,13 @@ knowledge of the commands it runs and never needs editing when one is added.
 #### [`src/micro_del.go`](src/micro_del.go)
 
 The `DEL` micro-command — one erasure verb with the scope in the arguments (`DEL values key=`,
-`DEL pairs key=`/`prefix=`, `DEL graph node=`/`from=`+`to=`, `DEL records table=`+`key=`/`drop=1`).
+`DEL pairs key=`/`prefix=`, `DEL graph node=`/`from=`+`to=`, `DEL graph_cache scope=`,
+`DEL records table=`+`key=`/`drop=1`).
 
 - **Key symbols:** `microDel`, `microDelValues`, `microDelPairs`, `microDelGraph`,
-  `microDelGraphNode`, `microDelGraphEdge`, `microDelRecords`, `microRawResponse`.
+  `microDelGraphNode`, `microDelGraphEdge`, `microDelRecords`, `microRawResponse`; the
+  `graph_cache` target is implemented in [`micro_graph_cache.go`](src/micro_graph_cache.go)
+  (`microDelGraphCache`) and only dispatched here.
 - **Common mistakes:** its error tokens are deliberately the *same words* the legacy commands used
   (`not_found`, `already_deleted`, `node_not_found`), which is what lets the aliases pass errors
   through unformatted. `RESET_DB` is not a `DEL` target — it is front-end scoped.
@@ -864,16 +885,86 @@ next query.
   `(*graphRecallRun).touch`/`path`/`associations`; bounded sentence hydration
   `graphHydrateAssociationEvidence` (node references + episodic `edge.props.src`); handlers `handleGraphRecall`, `handleGraphSimilar`
   (with `graphSimilarMatches`), `handleGraphTermIndex`.
+- **Cache hooks:** `graphRecallInjectCache` puts remembered shortcuts into the frontier *alongside the
+  seeds* (a link that had cost three hops now costs zero and the spread restarts from there with the
+  budget intact), `graphCacheStore.observeRun` writes back what the run discovered, and
+  `graphRecallResponse` is the single formatter both the real recall and a `cache=serve` answer go
+  through — see [`graph_cache.go`](src/graph_cache.go).
 - **Depends on:** [`graph.go`](src/graph.go) (adjacency scan, node/edge records, pair-payload helpers)
   and [`graph_uncertainty.go`](src/graph_uncertainty.go) (`graphEffectiveConfidence`/`Modality`, and the
   modality scale, which `precision=` reuses so `precision=probable` means 0.75).
-  **Tests:** [`graph_recall_test.go`](src/graph_recall_test.go).
+  **Tests:** [`graph_recall_test.go`](src/graph_recall_test.go),
+  [`graph_cache_test.go`](src/graph_cache_test.go).
 - **Common mistakes:** activation is combined across seeds with **noisy-OR**, so a node can pass
   `precision` even when no single seed reaches it — the frontier is therefore pruned at
   `precision / seeds` (floored at `graphRecallMinActivation`), never at `precision`; tightening that
   cut silently drops convergences. `distance` is **conceptual depth** (synonym hops cost a hop but no
   depth), which is not the `hops` reported per source. Traversal never hydrates node records — labels
   are read only for the items that survive the limit.
+
+#### [`src/graph_cache.go`](src/graph_cache.go)
+
+The association cache: *parallel, implicit tables* that remember the hidden links already paid for
+once, so the next traversal does not pay them again. It is not a RAM cache — it lives in the same
+trie as everything else, in fixed-byte records under `\x07gc:`, and survives a restart.
+
+- **Two namespaces, two questions.** `\x07gc:l/<from>/<to>` is a **shortcut**: "starting from this
+  node you reach that one, this strongly". The key is **directed on purpose** — spreading activation
+  is not symmetric, injection always starts at a seed, and `l/<from>/` being a prefix is what keeps
+  a node's shortcuts an O(its own rows) read instead of a scan. `\x07gc:q/<signature>` is a
+  **convergence**: what a whole seed set has in common, i.e. the memo of a comparison, which is the
+  case where the cost is in comparing many things rather than in any one of them.
+- **Key symbols:** `graphCacheEntry` (+`encode`/`decodeGraphCacheEntry`, `utility`,
+  `usageProbability`), `graphCacheStore` (`observeLink`, `observeCommon`, `observeRun`,
+  `lookupCommon`, `linksOf`, `sweep`, `maintain`, `countEntries`, `CloseAndWait`),
+  `admissionProbability`, `graphCacheClass`/`retune`, `graphCacheSignature`, `graphCacheClassOf`,
+  `graphCacheLinkKey`/`graphCacheQueryKey`, the epoch (`currentEpoch`, `bumpEpoch`,
+  `graphCacheBumpEpoch`), `graphCacheConfig`.
+- **The three training mechanisms, and why all three are needed.** *Sampled admission*: a pair never
+  seen before is written only with a probability raised by the association's strength, by its
+  distance (an adjacent neighbour is no shortcut — the graph already finds it — so it is damped to
+  30%) and by the learned bias of that **query shape**. A one-off is almost never stored; something
+  recurrent gets a fresh roll every recall and is admitted almost surely. *Recurrence*: `hits`
+  (times the row actually answered) and `observations` (times the fact was rediscovered) are counted
+  **apart**, and their ratio is the usage probability — the direct measure of whether a row is
+  earning its place. *Continuous pruning + compression*: the maintainer decays utility, drops what
+  falls under threshold, and halves survivors' counters on every completed lap, so the numbers stay
+  small and comparable and an old-and-famous row cannot outrank a new-and-useful one forever.
+- **The maintainer needs no command.** It backs off the moment `ResourceMonitor` reports CPU ≥ 80/85%
+  or memory pressure ≥ 0.90, sizes its page from `RecommendedWorkers`, and stretches its interval up
+  to 32× while it finds nothing — the same degrade-don't-stall posture as reducers and scans. It
+  starts lazily on the first cache operation (a database that never touches the graph pays no
+  goroutine) and `CloseAndWait` joins it **first** in `shutdown`, before the files it writes through
+  are closed. `GRAPH_CACHE prune` is an operator/test override, not part of normal operation.
+- **Depends on:** [`commands.go`](src/commands.go) (`getPairPayload`/`upsertPairPayload`/
+  `deletePairAndPayload`), [`database.go`](src/database.go) (`PairScanWithOptions`),
+  [`graph_recall.go`](src/graph_recall.go) (options, run, associations).
+  **Tests:** [`graph_cache_test.go`](src/graph_cache_test.go).
+- **Common mistakes:** do not make the link key symmetric — the two directions are two different
+  facts with two different recurrences. Do not skip the `read` before admitting: reinforcement of an
+  existing row must never be sampled, or recurrence stops meaning recurrence. Do not let the sweep
+  prune `\x07gc:e`: it is the graph write counter, not a cache row, and removing it would make every
+  stale convergence read as fresh.
+
+#### [`src/micro_graph_cache.go`](src/micro_graph_cache.go)
+
+The `GRAPH_CACHE` micro-command: `stats`, `config`, `get`, `links`, `common`, `put`, `prune`, plus
+`DEL graph_cache` (which lives here but is dispatched from [`micro_del.go`](src/micro_del.go),
+because `DEL` is the protocol's only erasure verb).
+
+- **Key symbols:** `microGraphCache` (the target switch), `microGraphCacheStats/Config/Get/Links/
+  Common/Put/Prune`, `microDelGraphCache`, `graphCacheStoreOrNil` (deliberately returns the store
+  even when disabled, so `config enabled=1` can turn it back on), `graphCacheParseDuration`.
+- **`put` is the client-side half of the feature.** It writes a shortcut *bypassing the sampling*,
+  which is how a client that already paid an expensive comparison outside the graph — two
+  descriptors, two colour fields, two image signatures — makes the next search start from the answer
+  instead of recomputing it.
+- **`common` reuses `graphParseRecallOptions`**, and must: the signature has to come from the same
+  parameters, since a convergence computed at three hops is not the answer to the same question at
+  one.
+- **Common mistakes:** `prune min_utility=` is a per-sweep threshold that is restored afterwards —
+  do not make it write through to the config, or an operator's one-off deep prune silently leaves
+  the database more aggressive than they found it.
 
 #### [`src/graph_uncertainty.go`](src/graph_uncertainty.go)
 
@@ -1094,6 +1185,22 @@ vs shared words, the term-index lifecycle (auto-maintained, label removal, node 
 bounded recall hydration of node references plus episodic `edge.props.src` payloads, and budget
 exhaustion answering `truncated=1` on one line. Provides `newRecallTestDB`, `seedRecallGraph`,
 `recallPayload`, `findAssociation`.
+
+#### [`src/graph_cache_test.go`](src/graph_cache_test.go)
+
+The association cache. Fixed-byte codec round trip and the refusal of a truncated record; sampled
+admission vs unconditional reinforcement; the admission bias toward distant and strong associations;
+the key staying **directed** (a shortcut `a→b` must not answer for `b`); `hits` and `observations`
+counted apart into a usage probability; decay-driven pruning and counter-halving compression;
+convergences going stale on a graph write and the staleness counted apart from a miss; signature
+canonicality (seed order irrelevant, parameters not); a cached shortcut putting a node in reach that
+one hop could not have reached, with `cache=off` restoring the old behavior exactly; write-back of
+both shortcuts and convergences and `cache=serve` answering from them; a truncated run refusing to
+memoise; the whole `GRAPH_CACHE` surface plus `DEL graph_cache`; the maintainer pruning **without
+being asked**; per-query-shape bias following hit rate; cache rows staying out of ordinary scans;
+the epoch surviving a reopen; and `CHEETAH_GRAPH_CACHE=0`. Provides `forceGraphCache`, which makes
+the sampling and the clock deterministic. Builds on `newRecallTestDB`/`seedRecallGraph` from
+[`graph_recall_test.go`](src/graph_recall_test.go).
 
 #### [`src/command_alias_test.go`](src/command_alias_test.go)
 
@@ -1471,8 +1578,46 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   Term-index maintenance on write is switchable with `CHEETAH_GRAPH_TERM_INDEX=0`; a database written
   with it off (or created before this feature) needs `GRAPH_TERM_INDEX action=rebuild` before free-text
   seeds resolve — exact ids and synonym edges work regardless.
-- **Gaps:** no consolidation (recall never writes back what it discovered), no async variant, and the
-  index weighs every token equally — all three are open items in [`NEXT_STEPS.md`](NEXT_STEPS.md).
+- **Gaps:** no async variant, and the index weighs every token equally — both open items in
+  [`NEXT_STEPS.md`](NEXT_STEPS.md). Consolidation is no longer one: a recall now writes back what it
+  discovered through the association cache below.
+
+<a id="feature-graph-cache"></a>
+### Graph association cache (real-time, self-training) — Shipped
+
+- **Behavior:** `GRAPH_RECALL` learns. Every run proposes what it discovered to a cache of *parallel,
+  implicit tables* under `\x07gc:` — `l/<from>/<to>` shortcuts and `q/<signature>` convergences — and
+  every later run reads them back for free. `cache=on` (the default) feeds the cache and injects its
+  shortcuts into the frontier; `cache=off` restores the previous behavior exactly; `cache=serve`
+  additionally answers a repeated comparison from the stored convergence when the graph has not been
+  written since. `GRAPH_CACHE stats/config/get/links/common/put/prune` inspects and steers it,
+  `DEL graph_cache [scope=links|queries|all]` erases it. New response fields on `GRAPH_RECALL`:
+  `cache=`, `cache_injected=`, `cache_links=`, `cache_common=`.
+- **Why it is a cache and not an index:** what is expensive here is not reading a node, it is
+  *comparing many things to find what they share*. A convergence memoises that comparison whole; a
+  shortcut memoises one hidden link that cost several hops to find. Both are throwaway — dropping
+  them changes no answer, only its latency.
+- **Why it trains instead of filling.** Admission is **sampled** (see
+  [`graph_cache.go`](src/graph_cache.go)), recurrence is counted as `hits` *and* `observations` kept
+  apart so usage probability is measurable, and a background maintainer prunes and halves counters
+  continuously at a cadence set by free resources. Per **query shape** (hops, min_sources, direction,
+  type filter, seed-count bucket → one of 64 slots) the cache tracks its own hit rate and raises or
+  lowers that shape's admission bias, so the sampling budget follows the queries that actually read
+  it back. Nothing about this needs a command: `GRAPH_CACHE prune` exists for operators and tests.
+- **Owners:** [`graph_cache.go`](src/graph_cache.go), [`micro_graph_cache.go`](src/micro_graph_cache.go),
+  the hooks in [`graph_recall.go`](src/graph_recall.go), the epoch bump in [`graph.go`](src/graph.go),
+  the store field/shutdown in [`database.go`](src/database.go). **Tests:**
+  [`graph_cache_test.go`](src/graph_cache_test.go).
+- **Constraints:** injection is bounded by `cache_limit` (default 64, max 256) and by the same
+  activation `floor` as real spreading, so a fat cache cannot widen a recall past what was asked; a
+  **truncated** run never memoises its convergence, because its "nothing in common" is a budget
+  artifact and not a fact; `cache=serve` answers carry `cached: true` and no `via` path, which is
+  why serving is opt-in while recording and injection are not.
+- **Gaps:** `GRAPH_CACHE config` is per-process and **not persisted** — a restart returns to the
+  defaults (only `CHEETAH_GRAPH_CACHE=0` survives, and only as off). The entry counter is seeded at
+  0 on open and is an estimate until `GRAPH_CACHE stats recount=1`; `capacity` therefore only starts
+  biting once the counter has caught up. There is no cross-database budget: each database trains and
+  prunes its own cache in isolation.
 
 ### Edge uncertainty + ambiguity — Shipped
 
@@ -1675,7 +1820,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | --- | --- |
 | `DATABASE`, `RESET_DB`, `EXIT` (connection-scoped) | [`main.go`](src/main.go) `runCLI`, [`server.go`](src/server.go) `handleConnection`, [`engine.go`](src/engine.go) |
 | `DB_CREATE`, `DB_LIST` (engine-scoped) | [`engine.go`](src/engine.go) `engineControlCommand`, called by both front-ends |
-| `ALIAS`, `BATCH`, `DEL`, `JOB`, `RECORD` (micro-commands) | [`micro_alias.go`](src/micro_alias.go), [`batch.go`](src/batch.go), [`micro_del.go`](src/micro_del.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
+| `ALIAS`, `BATCH`, `DEL`, `GRAPH_CACHE`, `JOB`, `RECORD` (micro-commands) | [`micro_alias.go`](src/micro_alias.go), [`batch.go`](src/batch.go), [`micro_del.go`](src/micro_del.go), [`micro_graph_cache.go`](src/micro_graph_cache.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
 | `ALIAS list/get/keys/types/profile/digest` | [`micro_alias.go`](src/micro_alias.go), [`command_index.go`](src/command_index.go), [`binary_profile.go`](src/binary_profile.go) |
 | The binary framing itself (no command of its own — a codec over every line) | [`binary_protocol.go`](src/binary_protocol.go), [`server.go`](src/server.go) `handleBinaryConnection` |
 | `RECORD define/alter/compact/schema/tables/set/get/scan`, `DEL records` | [`micro_record.go`](src/micro_record.go), [`record_table.go`](src/record_table.go), [`record_schema.go`](src/record_schema.go) |
@@ -1687,6 +1832,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `GRAPH_NODE_*`, `GRAPH_EDGE_*`, `GRAPH_NEIGHBORS`, `GRAPH_DEGREE`, `GRAPH_NEIGHBOR_TYPES`, `GRAPH_QUERY` | [`graph.go`](src/graph.go) |
 | `GRAPH_AMBIGUITY_SET/GET/RESOLVE` | [`graph_uncertainty.go`](src/graph_uncertainty.go) |
 | `GRAPH_RECALL` (including bounded complete references), `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX` | [`graph_recall.go`](src/graph_recall.go) |
+| `GRAPH_CACHE stats/config/get/links/common/put/prune`, `DEL graph_cache` | [`micro_graph_cache.go`](src/micro_graph_cache.go), [`graph_cache.go`](src/graph_cache.go) |
 | `PREDICT_*` | [`prediction_table.go`](src/prediction_table.go), [`prediction_manager.go`](src/prediction_manager.go), [`jobs.go`](src/jobs.go) |
 | `CLUSTER_UPDATE/STATUS/MOVE/GOSSIP`, `FORK_ASSIGN` | [`cluster_scheduler.go`](src/cluster_scheduler.go), [`cluster_gossip.go`](src/cluster_gossip.go) |
 | `SYSTEM_STATS`, `LOG_FLUSH`, `FILE_CHECKPOINT` | [`database.go`](src/database.go), [`resource_monitor.go`](src/resource_monitor.go), [`logger.go`](src/logger.go), [`file_manager.go`](src/file_manager.go) |
@@ -1827,6 +1973,10 @@ Environment variables read by the server (all verified in-tree):
 - **Graph term index** ([`graph_recall.go`](src/graph_recall.go)): `CHEETAH_GRAPH_TERM_INDEX`
   (default on; `0/false/no/off/disable(d)` turns off the automatic maintenance on node write —
   `GRAPH_TERM_INDEX action=rebuild` indexes regardless, since it is an explicit request).
+- **Graph association cache** ([`graph_cache.go`](src/graph_cache.go)): `CHEETAH_GRAPH_CACHE`
+  (default on; `0/false/off/no` disables admission, injection and the maintainer for every database
+  in the process). Everything else is tuned live per database with `GRAPH_CACHE config` and is
+  **not** persisted — see the gaps in [Graph association cache](#feature-graph-cache).
 - **Prediction:** `CHEETAH_PREDICT_DEEPEN`, `CHEETAH_PREDICT_FLUSH_MILLIS`,
   `CHEETAH_PREDICT_PURGE_THRESHOLD`, `CHEETAH_PREDICT_MERGER`.
 - **Cluster:** `CHEETAH_NODE_ID`, `CHEETAH_TRACK_STANDALONE_FORKS`.
@@ -1881,6 +2031,20 @@ seen in old docs are **client-side**; the server does not read them.
 | Novelty prefers a distant multi-seed node over a near single-seed one | [`TestGraphRecallNoveltyPrefersDistantConvergence`](src/graph_recall_test.go) |
 | Free-text seeds resolve lexically + through alias edges; `expand=exact` disables both | [`TestGraphRecallResolvesLexicalTermsAndSynonyms`](src/graph_recall_test.go) |
 | Recall precision gates on declared edge confidence; `via` carries the modality | [`TestGraphRecallHonoursPrecisionAndConfidence`](src/graph_recall_test.go) |
+| Cache record is fixed-width and refuses a truncated read | [`TestGraphCacheEntryCodecRoundTrip`, `TestGraphCacheHeaderIsFixedWidth`](src/graph_cache_test.go) |
+| Admission is sampled but reinforcement never is; distance and strength bias it | [`TestGraphCacheAdmissionIsSampledButReinforcementIsNot`, `TestGraphCacheAdmissionPrefersDistantAssociations`](src/graph_cache_test.go) |
+| A shortcut is directed: `a→b` does not answer for `b` | [`TestGraphCacheLinksAreDirected`](src/graph_cache_test.go) |
+| `hits` and `observations` stay apart, giving a usage probability | [`TestGraphCacheHitsAndObservationsAreCountedApart`](src/graph_cache_test.go) |
+| Decay prunes; a completed lap halves survivors' counters | [`TestGraphCachePruneDropsDecayedEntries`, `TestGraphCacheAgingHalvesCounters`](src/graph_cache_test.go) |
+| A graph write makes a stored convergence stale, counted apart from a miss | [`TestGraphCacheCommonGoesStaleOnGraphWrite`](src/graph_cache_test.go) |
+| The comparison signature ignores seed order but not the parameters | [`TestGraphCacheSignatureIsCanonical`](src/graph_cache_test.go) |
+| A cached shortcut reaches what one hop could not; `cache=off` restores the old behavior | [`TestGraphRecallInjectsCachedShortcut`](src/graph_cache_test.go) |
+| A recall writes back shortcuts + convergences; `cache=serve` answers from them | [`TestGraphRecallWritesBackWhatItDiscovered`](src/graph_cache_test.go) |
+| A truncated run never memoises its comparison | [`TestGraphRecallDoesNotMemoriseTruncatedComparisons`](src/graph_cache_test.go) |
+| The maintainer prunes with no command issued | [`TestGraphCacheMaintainerRunsWithoutBeingAsked`](src/graph_cache_test.go) |
+| Per-query-shape admission bias follows the observed hit rate | [`TestGraphCacheClassBiasFollowsHitRate`](src/graph_cache_test.go) |
+| Cache rows stay hidden from ordinary scans; the epoch survives a reopen | [`TestGraphCacheEntriesStayHidden`, `TestGraphCacheEpochSurvivesReopen`](src/graph_cache_test.go) |
+| `GRAPH_CACHE` surface + `DEL graph_cache` + `CHEETAH_GRAPH_CACHE=0` | [`TestGraphCacheCommandSurface`, `TestGraphCacheRejectsUnknownTargets`, `TestGraphCacheCanBeDisabledByEnv`](src/graph_cache_test.go) |
 | Exhausted recall budget answers `truncated=1` on one line instead of stalling | [`TestGraphRecallBudgetDegradesInsteadOfStalling`](src/graph_recall_test.go) |
 | Distributional similarity: shared neighbours and shared id words | [`TestGraphSimilarSharesContextAndWords`](src/graph_recall_test.go) |
 | Term index maintained on write, dropped with the node, rebuildable, switchable | [`TestGraphTermIndexLifecycle`](src/graph_recall_test.go) |
@@ -1969,6 +2133,10 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
 - Associative recall: multi-seed `GRAPH_RECALL` with noisy-OR convergence, bounded complete node/
   episodic reference hydration, `GRAPH_SIMILAR`, and the `\x05gt:` lexical term index behind
   `GRAPH_TERM_INDEX`.
+- Real-time association cache under `\x07gc:`: `GRAPH_RECALL` writes back the shortcuts and the
+  convergences it discovers and reads them again for free, with sampled admission, `hits`/
+  `observations` recurrence, and a resource-aware maintainer that prunes and compresses continuously
+  without being asked. `GRAPH_CACHE` + `DEL graph_cache`.
 - Multi-field record tables: declared per-field byte widths, rows packed into one payload, add/drop a
   field on a live table without rewriting rows, explicit `RECORD compact` to reclaim dead space.
 - Per-database ad-hoc settings (`DB_CREATE`/`DB_LIST`, persisted in `<db>/settings.ini`) and a

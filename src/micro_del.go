@@ -11,6 +11,7 @@
 //	DEL pairs  prefix=<p> [limit=<n>] [payloads=0|1]
 //	DEL graph  node=<id> [cascade=1]
 //	DEL graph  from=<a> to=<b> [type=<t>] [directed=0|1]
+//	DEL graph_cache [scope=links|queries|all] [limit=<n>]
 //	DEL records table=<t> key=<k>
 //	DEL records table=<t> drop=1
 //
@@ -32,6 +33,8 @@ func microDel(db *Database, args microArgs) (microResponse, error) {
 		return db.microDelPairs(args)
 	case "graph":
 		return db.microDelGraph(args)
+	case "graph_cache", "cache":
+		return db.microDelGraphCache(args)
 	case "records", "record":
 		return db.microDelRecords(args)
 	case "":

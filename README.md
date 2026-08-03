@@ -439,7 +439,8 @@ name  layer   PAIR_SET / PAIR_GET / PAIR_DEL …   byte prefixes in a trie → n
   ├─ views over one walk  PAIR_SCAN (names) · PAIR_SUMMARY (statistics) · PAIR_REDUCE (payloads)
   ├─ graph records        GRAPH_* — nodes/edges/adjacency under reserved \x01..\x05 prefixes
   ├─ record tables        RECORD — declared multi-field rows under the reserved \x06 prefix
-  └─ recall               GRAPH_RECALL / GRAPH_SIMILAR / GRAPH_TERM_INDEX
+  ├─ recall               GRAPH_RECALL / GRAPH_SIMILAR / GRAPH_TERM_INDEX
+  └─ association cache    GRAPH_CACHE — what recall learned, under the reserved \x07 prefix
 side tables   PREDICT_*                          prediction_<name>.table files, not the trie
 control       DATABASE / RESET_DB / DB_CREATE / DB_LIST · CLUSTER_* / FORK_ASSIGN
               SYSTEM_STATS / LOG_FLUSH / FILE_CHECKPOINT
@@ -777,16 +778,17 @@ ERROR,graph_query_parse_failed:left_node_must_be_anchored_by_id
 
 | Command | What it means |
 | --- | --- |
-| `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [references=0\|1] [reference_limit=] [limit=] [branch_limit=] [budget=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. `references=1` also hydrates complete node sentences and episodic payloads cited by `edge.props.src`, under a separate bound. |
+| `GRAPH_RECALL seeds=<t>[,…] [precision=] [hops=] [min_sources=] [direction=] [type=] [decay=] [expand=] [references=0\|1] [reference_limit=] [limit=] [branch_limit=] [budget=] [cache=on\|off\|serve] [cache_limit=]` | **The question you don't know how to ask.** Spreads activation from every seed at once and returns everything they co-activate, ranked, each hit carrying the seeds that reached it, its conceptual distance, the evidence path and a novelty score. Seeds may be free text. `min_sources=2` narrows it to convergences — what several seeds *share*. `references=1` also hydrates complete node sentences and episodic payloads cited by `edge.props.src`, under a separate bound. |
 | `GRAPH_SIMILAR id=<id> [by=context\|lexical\|all] [limit=] [precision=]` | **"What else behaves like this?"** — nodes with the same neighbours (distributional) or the same words in their id (lexical). No edge between them is required. |
 | `GRAPH_TERM_INDEX [action=stats\|rebuild\|drop] [limit=] [cursor=]` | Maintenance of the derived `\x05gt:` lexical index that free-text seeds resolve through. It is never authoritative: exact ids and synonym edges keep working without it, and `rebuild` is resumable through `next_cursor`. |
+| `GRAPH_CACHE stats\|config\|get\|links\|common\|put\|prune …` | **What recall learned.** A cache of *parallel, implicit tables* under `\x07gc:` holding the shortcuts and the convergences that earlier recalls paid for. It is never authoritative — erasing it changes no answer, only how long one takes. See [Association cache](#association-cache--what-recall-learned). |
 
 **In context** — the conversation has been touching Luna and Marco, and nobody has asked a question
 yet. Recall answers what a query cannot be written for:
 
 ```text
 [cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=28,references=0,count=4,bridges=4,truncated=0,precision=0.100,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=28,references=0,count=4,bridges=4,truncated=0,precision=0.100,cache=miss,cache_injected=0,cache_links=<n>,cache_common=4,payload=<base64>
 # payload decodes to {"seeds":[{"term":"cat:luna","matches":[{"id":"cat:luna","score":1,"match":"exact"},
 #                                                            {"id":"cat:mia","score":0.33,"match":"lexical"}]}, …],
 #  "associations":[
@@ -800,11 +802,11 @@ SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=10,hydrated=2
 # cat:mia lexically.
 
 [cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=3 precision=0.05 min_sources=2 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=34,references=0,count=4,bridges=4,truncated=0,precision=0.050,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=2,resolved=3,visited=7,expanded=14,hydrated=34,references=0,count=4,bridges=4,truncated=0,precision=0.050,cache=miss,cache_injected=0,cache_links=<n>,cache_common=4,payload=<base64>
 # the "what do these two have to do with each other?" view: only nodes both seeds reach
 
 [cheetah_data/notes]> GRAPH_RECALL seeds=berlin hops=1 precision=0.1 limit=4
-SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,references=0,count=3,bridges=0,truncated=0,precision=0.100,payload=<base64>
+SUCCESS,command=GRAPH_RECALL,seeds=1,resolved=1,visited=4,expanded=1,hydrated=3,references=0,count=3,bridges=0,truncated=0,precision=0.100,cache=miss,cache_injected=0,cache_links=<n>,cache_common=0,payload=<base64>
 # "seeds":[{"term":"berlin","matches":[{"id":"city:berlin","score":0.495,"match":"lexical"}]}]
 # a bare word, not an id — resolved through the term index, and it says so
 
@@ -819,6 +821,95 @@ SUCCESS,command=GRAPH_TERM_INDEX,action=stats,enabled=1,entries=21
 [cheetah_data/notes]> GRAPH_TERM_INDEX action=rebuild limit=4096
 SUCCESS,command=GRAPH_TERM_INDEX,action=rebuild,nodes=9,terms=21,next_cursor=*
 # next_cursor=* means the whole graph fitted in one slice; otherwise pass the token back
+```
+
+`cache_links=<n>` is written `<n>` on purpose: admission is **sampled**, so the number of shortcuts
+a given run writes back is genuinely not fixed — that is the mechanism, not an omission. See below.
+
+<a id="association-cache--what-recall-learned"></a>
+### Association cache — what recall learned
+
+The expensive part of recall is not reading a node. It is **comparing many things to find what they
+share** — and doing it again from scratch the next time. `GRAPH_RECALL` therefore learns: every run
+offers what it discovered to a set of *parallel, implicit tables* under the reserved `\x07gc:`
+prefix, and every later run reads them back for nothing.
+
+Two things get remembered, because there are two different questions:
+
+- a **shortcut** `l/<from>/<to>` — "starting here you reach there, this strongly". A link that had
+  cost three hops to find costs zero the next time, and the spread restarts from it with its budget
+  intact. The key is directed: spreading activation is not symmetric, and `l/<from>/` being a prefix
+  is what makes a node's shortcuts a single scan rather than a search.
+- a **convergence** `q/<signature>` — what a whole seed set has in common. This is the memo of the
+  comparison itself, for the case where no single input is expensive but comparing all of them is.
+
+**It trains itself; it does not just fill up.** Three mechanisms, and the third does not work without
+the first two:
+
+1. **Sampled admission.** A pair never seen before is written only *with a probability*, raised by how
+   strong the association is, by how far apart the two nodes were (an adjacent neighbour is no
+   shortcut — the graph already finds it) and by how well that *kind* of query has been paying off.
+   A one-off association almost never gets stored; a recurring one gets a fresh roll every recall and
+   is admitted nearly for certain. You test at random what might matter instead of keeping everything.
+2. **Recurrence.** Each row counts `observations` (times the fact was rediscovered) and `hits` (times
+   the row actually answered) **separately**. Their ratio is the usage probability — the direct
+   measure of whether that row is earning its place, and the thing that distinguishes a row written
+   often and read never from one that pays for itself.
+3. **Continuous pruning and compression.** A background maintainer decays utility over time, drops
+   what falls below threshold, and halves the survivors' counters on every completed lap, so the
+   numbers stay small and comparable and an old, famous row cannot outrank a new, useful one forever.
+   It paces itself on free CPU and memory and skips its turn when the machine is busy.
+
+**None of this needs a command.** The maintainer runs on its own; `GRAPH_CACHE prune` exists for an
+operator or a test that wants the result *now*.
+
+| Command | What it means |
+| --- | --- |
+| `GRAPH_CACHE stats [recount=1]` | Counters, hit rate, current epoch and live configuration. `recount=1` re-walks the namespace to resynchronise the entry count, which is otherwise an estimate. |
+| `GRAPH_CACHE config [enabled=] [sample=] [capacity=] [half_life=] [min_utility=] [budget=] [interval=] [page=]` | Steers the training live. **Not persisted** — a restart returns to the defaults. |
+| `GRAPH_CACHE get from=<id> to=<id>` / `signature=<sig>` | One row, with both recurrence counters, its usage probability and its current utility. |
+| `GRAPH_CACHE links id=<id> [limit=]` | Every shortcut known from a node. |
+| `GRAPH_CACHE common seeds=<a,b,…> [<recall options>]` | The memorised answer to "what do these have in common?", without redoing the comparison. Takes the same options as `GRAPH_RECALL` because a convergence found at three hops is not the answer to the same question at one. |
+| `GRAPH_CACHE put from=<id> to=<id> [score=] [distance=] [sources=]` | Teach a shortcut directly, **bypassing the sampling**. This is the hook for a client that already paid an expensive comparison *outside* the graph — two descriptors, two colour fields, two image signatures — and wants the next search to start from the answer. |
+| `GRAPH_CACHE prune [limit=] [min_utility=] [age=1]` | Force a sweep. `min_utility=` applies to this pass only and is restored afterwards. |
+| `DEL graph_cache [scope=links\|queries\|all] [limit=]` | Erase it. Erasure goes through `DEL` because `DEL` is the protocol's only erasure verb. |
+
+On `GRAPH_RECALL`, `cache=on` (the default) feeds the cache and injects its shortcuts; `cache=off`
+restores the previous behavior exactly; `cache=serve` will additionally answer a repeated comparison
+from the stored convergence, when the graph has not been written since.
+
+```text
+[cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1
+SUCCESS,command=GRAPH_RECALL,…,cache=miss,cache_injected=0,cache_links=7,cache_common=2,payload=<base64>
+# first run: nothing to reuse. It wrote back 7 shortcuts and the 2 convergences it found.
+
+[cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1
+SUCCESS,command=GRAPH_RECALL,…,cache=miss,cache_injected=7,cache_links=9,cache_common=4,payload=<base64>
+# same query again: those 7 shortcuts came back for free — `via` marks those hops "cached":true —
+# and reaching further found 2 more convergences that the first run's budget had not.
+# The write-back counts climb like this only because admission was forced on for a reproducible
+# example; under the default sampling they start lower and rise as associations recur.
+
+[cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 cache=serve
+SUCCESS,command=GRAPH_RECALL,…,cache=hit,cache_injected=0,cache_links=0,cache_common=0,payload=<base64>
+# the comparison itself was reused. Associations carry "cached":true and no `via` path, which is
+# why serving is opt-in while recording and injecting are not — those never change the shape of
+# an answer, only what it manages to reach.
+
+[cheetah_data/notes]> GRAPH_CACHE stats recount=1
+SUCCESS,entries=11,lookups=7,hits=5,misses=2,stale=0,admitted=11,rejected=0,reinforced=18,pruned=0,
+        aged=0,sweeps=0,skipped=0,hit_rate=0.714286,epoch=39,links=10,queries=1,enabled=1,…
+[cheetah_data/notes]> GRAPH_CACHE get from=cat:luna to=country:germany
+SUCCESS,score=0.302495,distance=2,sources=2,observations=3,hits=2,usage=0.4,utility=1.7088…,…
+# usage=0.4 — two reads for three rediscoveries. A row near 0 is one the maintainer will drop.
+
+[cheetah_data/notes]> GRAPH_EDGE_SET from=person:marco to=city:hamburg type=visited
+SUCCESS,command=GRAPH_EDGE_SET,edge=…
+[cheetah_data/notes]> GRAPH_RECALL seeds=cat:luna,person:marco hops=2 precision=0.1 cache=serve
+SUCCESS,command=GRAPH_RECALL,…,cache=miss,…
+# the graph moved, so the stored comparison no longer answers. Shortcuts survive — they are only
+# hints, and a wrong hint costs a wasted branch, never a wrong answer — but a memoised comparison
+# is a claim about a state of the graph, so it expires with it.
 ```
 
 ### Prediction tables

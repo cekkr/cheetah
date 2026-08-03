@@ -67,6 +67,7 @@ type Database struct {
 	forkScheduler    *ForkScheduler
 	predictStore     *PredictionManager
 	recordStore      *RecordManager
+	graphCache       *graphCacheStore
 	protocolProfiles *numericProfileStore
 	clusterMessenger *ClusterMessenger
 	jobs             *microJobManager
@@ -469,6 +470,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 	}
 	db.predictStore = newPredictionManager(path)
 	db.recordStore = newRecordManager(filepath.Join(path, "records"))
+	db.graphCache = newGraphCacheStore(db)
 	db.protocolProfiles = newNumericProfileStore(filepath.Join(path, numericProfileFile))
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
 	db.registerDefaultReducers()
@@ -523,6 +525,9 @@ func (db *Database) Close() error {
 
 func (db *Database) shutdown() error {
 	var firstErr error
+	// Il maintainer della cache scrive nella trie come qualsiasi altro
+	// scrittore: va fermato e atteso *prima* che i file sotto di lui spariscano.
+	db.graphCache.CloseAndWait()
 	db.mainKeys.Close()
 	if db.keyRecycle != nil {
 		db.keyRecycle.Close()

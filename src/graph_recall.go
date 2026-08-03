@@ -64,6 +64,7 @@ const (
 	graphTermRebuildDefaultLimit = 4096
 	graphRecallDefaultReferences = 32
 	graphRecallMaxReferences     = 256
+	graphRecallMaxCacheLimit     = 256
 
 	graphSimilarDefaultLimit     = 32
 	graphSimilarDefaultPrecision = 0.05
@@ -397,7 +398,21 @@ type graphRecallOptions struct {
 	References     bool
 	ReferenceLimit int
 	Expand         graphRecallExpansion
+	// Cache dice quanto ci si fida della cache delle associazioni
+	// (graph_cache.go): `off` la ignora, `on` la alimenta e ne inietta le
+	// scorciatoie, `serve` accetta anche di rispondere direttamente con una
+	// convergenza già calcolata.
+	Cache      string
+	CacheLimit int
+	// class è la forma della query, su cui la cache allena la sua ammissione.
+	class int
 }
+
+const (
+	graphRecallCacheOff   = "off"
+	graphRecallCacheOn    = "on"
+	graphRecallCacheServe = "serve"
+)
 
 // graphParseRecallSeeds legge `seeds=a,b,c`. Gli argomenti del protocollo si
 // spezzano sugli spazi, quindi un termine con spazi va passato come
@@ -490,6 +505,8 @@ func graphParseRecallOptions(params map[string]string) (graphRecallOptions, stri
 		Budget:         graphRecallDefaultBudget,
 		SeedLimit:      graphRecallDefaultSeedLimit,
 		ReferenceLimit: graphRecallDefaultReferences,
+		Cache:          graphRecallCacheOn,
+		CacheLimit:     graphCacheDefaultBudget,
 	}
 
 	rawSeeds := params["seeds"]
@@ -610,6 +627,37 @@ func graphParseRecallOptions(params map[string]string) (graphRecallOptions, stri
 		rawTypes = params["types"]
 	}
 	opts.applyTypeFilter(graphParseTypeList(rawTypes))
+
+	// `on` è il default perché alimentare la cache e iniettarne le scorciatoie
+	// non cambia la *forma* della risposta, solo cosa si riesce a raggiungere.
+	// `serve` sì — una convergenza già calcolata non porta con sé il cammino —
+	// quindi va chiesto per nome.
+	if raw := strings.ToLower(strings.TrimSpace(params["cache"])); raw != "" {
+		switch raw {
+		case "0", "off", "false", "no", "none":
+			opts.Cache = graphRecallCacheOff
+		case "1", "on", "true", "yes":
+			opts.Cache = graphRecallCacheOn
+		case "serve", "answer":
+			opts.Cache = graphRecallCacheServe
+		default:
+			return opts, "ERROR,invalid_cache", nil
+		}
+	}
+	if raw := strings.TrimSpace(params["cache_limit"]); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			return opts, "ERROR,invalid_cache_limit", nil
+		}
+		if parsed > graphRecallMaxCacheLimit {
+			parsed = graphRecallMaxCacheLimit
+		}
+		opts.CacheLimit = parsed
+	}
+
+	// La classe si calcola per ultima: dipende da campi che le righe sopra
+	// possono ancora aver cambiato.
+	opts.class = graphCacheClassOf(&opts)
 	return opts, "", nil
 }
 
@@ -910,6 +958,11 @@ type graphRecallEdgeView struct {
 	Confidence float64 `json:"confidence"`
 	Modality   string  `json:"modality,omitempty"`
 	Source     string  `json:"source,omitempty"`
+	// Cached distingue una scorciatoia ricordata dalla cache da un arco vero.
+	// È `omitempty` perché ogni risposta che non la usa resta identica a prima,
+	// ed è un campo a sé invece di un tipo d'arco convenuto perché un tipo
+	// riservato può sempre collidere con uno dichiarato da chi scrive il grafo.
+	Cached bool `json:"cached,omitempty"`
 }
 
 func graphRecallSourceOf(props map[string]interface{}) string {
@@ -971,6 +1024,7 @@ type graphRecallRun struct {
 	Seeds     int
 	Expanded  int
 	Hydrated  int
+	Injected  int
 	Truncated bool
 }
 
@@ -1037,6 +1091,77 @@ func (run *graphRecallRun) path(nodeID string, seed string) []graphRecallEdgeVie
 	return reversed
 }
 
+// graphRecallInjectCache legge le scorciatoie note di ogni origine e le mette
+// in frontiera come se fossero già state percorse.
+//
+// Tre vincoli, tutti necessari perché la cache resti un acceleratore e non
+// diventi una seconda sorgente di verità:
+//
+//   - il totale è limitato da `cache_limit`, quindi una cache grassa non può
+//     allargare la recall oltre quello che il chiamante ha chiesto;
+//   - l'attivazione iniettata è comunque il prodotto seme × forza ricordata e
+//     passa dallo stesso `floor` della diffusione vera, quindi una scorciatoia
+//     debole non entra;
+//   - il nodo viene toccato con `touch`, quindi se la diffusione vera lo
+//     raggiunge meglio la traccia migliore vince come sempre.
+func (db *Database) graphRecallInjectCache(
+	run *graphRecallRun,
+	resolutions []graphRecallSeedResolution,
+	opts *graphRecallOptions,
+	floor float64,
+) []graphRecallFrontierItem {
+	if opts == nil || opts.Cache == graphRecallCacheOff || opts.CacheLimit <= 0 {
+		return nil
+	}
+	store := db.graphCacheOrNil()
+	if store == nil {
+		return nil
+	}
+	remaining := opts.CacheLimit
+	var injected []graphRecallFrontierItem
+	for _, resolution := range resolutions {
+		for _, match := range resolution.Matches {
+			if remaining <= 0 {
+				return injected
+			}
+			for _, member := range store.linksOf(match.ID, remaining, opts.class) {
+				if remaining <= 0 {
+					return injected
+				}
+				activation := match.Score * graphRecallClamp01(member.Score)
+				if activation < floor {
+					continue
+				}
+				depth := member.Distance
+				if depth < 1 {
+					depth = 1
+				}
+				edge := graphRecallEdgeView{
+					From:       match.ID,
+					Type:       "cached",
+					To:         member.ID,
+					Weight:     graphRecallClamp01(member.Score),
+					Confidence: graphRoundConfidence(member.Score),
+					Modality:   graphModalityForConfidence(member.Score),
+					Cached:     true,
+				}
+				if !run.touch(member.ID, resolution.Term, activation, 1, depth, match.ID, edge, true) {
+					continue
+				}
+				remaining--
+				run.Injected++
+				injected = append(injected, graphRecallFrontierItem{
+					NodeID:     member.ID,
+					Seed:       resolution.Term,
+					Activation: activation,
+					Depth:      depth,
+				})
+			}
+		}
+	}
+	return injected
+}
+
 func (db *Database) graphRecallSpread(
 	resolutions []graphRecallSeedResolution,
 	opts *graphRecallOptions,
@@ -1071,6 +1196,11 @@ func (db *Database) graphRecallSpread(
 			}
 		}
 	}
+
+	// Le scorciatoie ricordate entrano in frontiera insieme ai semi, non dopo:
+	// un legame che era costato tre hop ne costa zero, e la diffusione riparte
+	// da lì con il budget ancora intero. È tutta la ragione della cache.
+	frontier = append(frontier, db.graphRecallInjectCache(run, resolutions, opts, floor)...)
 
 	budget := opts.Budget
 	for hop := 1; hop <= opts.Hops && len(frontier) > 0; hop++ {
@@ -1136,13 +1266,16 @@ type graphRecallAssociation struct {
 	Novelty float64 `json:"novelty"`
 	// Distance è la distanza concettuale minima da un seme: i passi fra sinonimi
 	// non contano, perché non cambiano argomento.
-	Distance    int                      `json:"distance"`
-	SourceCount int                      `json:"source_count"`
-	Bridge      bool                     `json:"bridge,omitempty"`
-	Labels      []string                 `json:"labels,omitempty"`
-	References  []GraphReferenceSentence `json:"references,omitempty"`
-	Sources     []graphRecallSourceView  `json:"sources"`
-	Via         []graphRecallEdgeView    `json:"via,omitempty"`
+	Distance    int  `json:"distance"`
+	SourceCount int  `json:"source_count"`
+	Bridge      bool `json:"bridge,omitempty"`
+	// Cached: l'associazione arriva da una convergenza già calcolata
+	// (`cache=serve`), quindi non porta con sé il cammino che l'ha prodotta.
+	Cached     bool                     `json:"cached,omitempty"`
+	Labels     []string                 `json:"labels,omitempty"`
+	References []GraphReferenceSentence `json:"references,omitempty"`
+	Sources    []graphRecallSourceView  `json:"sources"`
+	Via        []graphRecallEdgeView    `json:"via,omitempty"`
 }
 
 type graphRecallPayload struct {
@@ -1350,8 +1483,48 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 		return "", err
 	}
 	resolved := 0
+	origins := make([]string, 0, resolved)
 	for _, resolution := range resolutions {
 		resolved += len(resolution.Matches)
+		for _, match := range resolution.Matches {
+			origins = append(origins, match.ID)
+		}
+	}
+
+	store := db.graphCacheOrNil()
+	signature := ""
+	if store != nil && opts.Cache != graphRecallCacheOff && len(origins) > 0 {
+		signature = graphCacheSignature(origins, &opts)
+	}
+
+	// `cache=serve`: se lo stesso confronto è già stato fatto e da allora il
+	// grafo non è stato toccato, la risposta è quella. Le etichette e le
+	// reference si idratano comunque dal vivo, quindi ciò che si riusa è il
+	// confronto — la parte cara — non i dati dei nodi.
+	if opts.Cache == graphRecallCacheServe && signature != "" {
+		if members, hit := store.lookupCommon(signature, opts.class); hit {
+			associations := make([]graphRecallAssociation, 0, len(members))
+			for _, member := range members {
+				associations = append(associations, graphRecallAssociation{
+					ID:          member.ID,
+					Score:       graphRoundConfidence(member.Score),
+					Distance:    member.Distance,
+					SourceCount: member.Sources,
+					Bridge:      member.Sources > 1,
+					Cached:      true,
+					Sources:     []graphRecallSourceView{},
+				})
+			}
+			if len(associations) > opts.Limit {
+				associations = associations[:opts.Limit]
+			}
+			references := db.graphHydrateAssociationEvidence(associations, &opts)
+			return graphRecallResponse(
+				&opts, resolutions, unresolved, associations,
+				resolved, len(associations), 0, 0, references, false,
+				"hit", 0, 0, 0,
+			)
+		}
 	}
 
 	run, err := db.graphRecallSpread(resolutions, &opts)
@@ -1361,6 +1534,39 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 	associations := run.associations(&opts)
 	references := db.graphHydrateAssociationEvidence(associations, &opts)
 
+	cacheState := "off"
+	cacheLinks, cacheCommon := 0, 0
+	if store != nil && opts.Cache != graphRecallCacheOff {
+		cacheState = "miss"
+		cacheLinks, cacheCommon = store.observeRun(run, associations, &opts, signature)
+	}
+
+	return graphRecallResponse(
+		&opts, resolutions, unresolved, associations,
+		resolved, len(run.Nodes), run.Expanded, run.Hydrated, references, run.Truncated,
+		cacheState, run.Injected, cacheLinks, cacheCommon,
+	)
+}
+
+// graphRecallResponse tiene in un posto solo la riga di risposta, che ora ha due
+// chiamanti (la recall vera e quella servita dalla cache) e deve restare
+// identica campo per campo fra i due.
+func graphRecallResponse(
+	opts *graphRecallOptions,
+	resolutions []graphRecallSeedResolution,
+	unresolved []string,
+	associations []graphRecallAssociation,
+	resolved int,
+	visited int,
+	expanded int,
+	hydrated int,
+	references int,
+	truncated bool,
+	cacheState string,
+	cacheInjected int,
+	cacheLinks int,
+	cacheCommon int,
+) (string, error) {
 	bridges := 0
 	for _, association := range associations {
 		if association.SourceCount > 1 {
@@ -1376,17 +1582,21 @@ func (db *Database) handleGraphRecall(args string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf(
-		"SUCCESS,command=GRAPH_RECALL,seeds=%d,resolved=%d,visited=%d,expanded=%d,hydrated=%d,references=%d,count=%d,bridges=%d,truncated=%d,precision=%.3f,payload=%s",
+		"SUCCESS,command=GRAPH_RECALL,seeds=%d,resolved=%d,visited=%d,expanded=%d,hydrated=%d,references=%d,count=%d,bridges=%d,truncated=%d,precision=%.3f,cache=%s,cache_injected=%d,cache_links=%d,cache_common=%d,payload=%s",
 		len(opts.Seeds),
 		resolved,
-		len(run.Nodes),
-		run.Expanded,
-		run.Hydrated,
+		visited,
+		expanded,
+		hydrated,
 		references,
 		len(associations),
 		bridges,
-		boolToInt(run.Truncated),
+		boolToInt(truncated),
 		opts.Precision,
+		cacheState,
+		cacheInjected,
+		cacheLinks,
+		cacheCommon,
 		payload,
 	), nil
 }

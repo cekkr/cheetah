@@ -2485,12 +2485,28 @@ func (db *Database) graphGetPayloadByPairKey(pairKey []byte) ([]byte, bool, erro
 	return db.getPairPayload(pairKey)
 }
 
+// Ogni scrittura del grafo passa da questi due wrapper — record, indici di
+// adiacenza, indici di proprietà, indice lessicale — quindi è qui che si fa
+// avanzare l'epoca che invecchia le convergenze in cache (graph_cache.go). Un
+// percorso di scrittura nuovo la fa avanzare senza doversene ricordare, che è
+// esattamente ciò che il resto degli indici derivati *non* garantisce.
+//
+// La cache scrive invece con `upsertPairPayload` diretto: le sue righe non sono
+// grafo, e farle contare come tali la invaliderebbe a ogni riga che scrive.
 func (db *Database) graphUpsertPairPayload(pairKey []byte, payload []byte, hidden bool) (uint64, error) {
-	return db.upsertPairPayload(pairKey, payload, hidden)
+	key, err := db.upsertPairPayload(pairKey, payload, hidden)
+	if err == nil {
+		db.graphCacheBumpEpoch()
+	}
+	return key, err
 }
 
 func (db *Database) graphDeletePairAndPayload(pairKey []byte) (bool, error) {
-	return db.deletePairAndPayload(pairKey)
+	deleted, err := db.deletePairAndPayload(pairKey)
+	if err == nil && deleted {
+		db.graphCacheBumpEpoch()
+	}
+	return deleted, err
 }
 
 func (db *Database) graphScanAdjacency(
@@ -2849,6 +2865,16 @@ func graphNormalizeEdgeType(raw string) string {
 
 func graphEncodeSegment(raw string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// graphDecodeSegment è l'inverso: serve a chi legge una chiave del namespace e
+// deve tornare all'id che ci era stato codificato dentro (graph_cache.go).
+func graphDecodeSegment(encoded string) (string, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
 }
 
 func graphNodePairKey(nodeID string) []byte {

@@ -219,6 +219,7 @@ func registerDefaultMicroCommands(registry *microCommandRegistry) {
 	registry.Register("ALIAS", microAlias)
 	registry.Register("BATCH", microBatch)
 	registry.Register("DEL", microDel)
+	registry.Register("GRAPH_CACHE", microGraphCache)
 	registry.Register("JOB", microJobCommand)
 	registry.Register("RECORD", microRecord)
 }
