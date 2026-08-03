@@ -255,15 +255,15 @@ func (t *commandIndexTable) lookupID(id uint16) (commandIndexEntry, bool) {
 // nulla. Ha comunque il suo digest, così un client sa quando riscaricarlo.
 
 var argumentKeyNames = []string{
-	"action", "add", "algorithm", "ambiguity", "backend", "branch_limit",
-	"command", "compact", "confidence", "continue_on_error", "cost_limit",
+	"action", "add", "algorithm", "ambiguity", "backend", "branch_limit", "budget",
+	"changed", "command", "compact", "confidence", "continue_on_error", "cost_limit",
 	"count", "cursor", "database", "depth", "direction", "drop", "edge",
-	"encoding", "expand", "fields", "field", "filter", "from", "generation",
+	"encoding", "entries", "expand", "fields", "field", "filter", "from", "generation",
 	"group", "hidden", "hops", "hidden_only", "id", "if_not_exists", "items",
-	"key", "keys", "kind", "label", "labels", "limit", "matrix", "mode",
-	"modality", "name", "node", "nodes", "offset", "options", "payload",
+	"indexed", "key", "keys", "kind", "label", "labels", "limit", "matrix", "mode",
+	"modality", "name", "node", "nodes", "offset", "op", "options", "payload",
 	"payloads", "pair_bytes", "precision", "prefix", "props", "reducer",
-	"reference_limit", "references", "reset", "results", "rows", "seed",
+	"reference_limit", "references", "reset", "results", "rows", "scanned", "seed",
 	"seeds", "share", "size", "source", "state", "stop_on_error", "table",
 	"tables", "target", "terms", "to", "type", "types", "uint", "int",
 	"float", "value", "values", "weight", "width", "window",

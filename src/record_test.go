@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -28,6 +29,13 @@ func newRecordTestEngine(t *testing.T) (*Engine, *Database) {
 func recordFields(t *testing.T, resp string) map[string]any {
 	t.Helper()
 	var out map[string]any
+	decodePayloadField(t, resp, &out)
+	return out
+}
+
+func recordRows(t *testing.T, resp string) []recordRowView {
+	t.Helper()
+	var out []recordRowView
 	decodePayloadField(t, resp, &out)
 	return out
 }
@@ -275,6 +283,191 @@ func TestRecordTableScanAndDelete(t *testing.T) {
 	}
 	if resp, _ := db.ExecuteCommand("RECORD schema table=ctx"); resp != "ERROR,record_table_not_found:ctx" {
 		t.Fatalf("schema after drop = %q", resp)
+	}
+}
+
+func TestRecordSelectUsesFieldReducerAndOptionalIndexes(t *testing.T) {
+	_, db := newRecordTestEngine(t)
+	assertCommandPrefix(t, db, "RECORD define table=metrics fields=cnt:uint:2,signed:int:2,score:float:8,label:string:8", "SUCCESS")
+	for _, command := range []string{
+		"RECORD set table=metrics key=de/a cnt=50 signed=-5 score=-1.5 label=alpha",
+		"RECORD set table=metrics key=de/b cnt=101 signed=0 score=-0 label=beta",
+		"RECORD set table=metrics key=it/c cnt=200 signed=7 score=2.5 label=gamma",
+		"RECORD set table=metrics key=it/d cnt=10 signed=-1 score=0 label=delta",
+	} {
+		assertCommandPrefix(t, db, command, "SUCCESS")
+	}
+
+	resp := assertCommandPrefix(t, db, "RECORD reduce table=metrics field=cnt op=gt value=100 fields=cnt,label", "SUCCESS")
+	if responseField(resp, "indexed") != "0" || responseField(resp, "scanned") != "4" {
+		t.Fatalf("unindexed reduce did not scan rows: %s", resp)
+	}
+	rows := recordRows(t, resp)
+	if len(rows) != 2 || rows[0].Fields["cnt"] != float64(101) || rows[1].Fields["cnt"] != float64(200) {
+		t.Fatalf("unindexed selection = %+v", rows)
+	}
+
+	resp = assertCommandPrefix(t, db, "RECORD index table=metrics field=cnt action=create", "SUCCESS")
+	if responseField(resp, "entries") != "4" || responseField(resp, "indexed") != "1" {
+		t.Fatalf("index create = %s", resp)
+	}
+	resp = assertCommandPrefix(t, db, "RECORD schema table=metrics", "SUCCESS")
+	var schema RecordSchema
+	decodePayloadField(t, resp, &schema)
+	if field := schema.fieldByName("cnt"); field == nil || !field.Indexed {
+		t.Fatalf("schema did not persist indexed flag: %+v", schema.Fields)
+	}
+
+	resp = assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt op=eq value=101", "SUCCESS")
+	rows = recordRows(t, resp)
+	if responseField(resp, "indexed") != "1" || responseField(resp, "scanned") != "1" || len(rows) != 1 || rows[0].Key != microEncodeBytes([]byte("de/b")) {
+		t.Fatalf("indexed equality = %s / %+v", resp, rows)
+	}
+	assertCommandPrefix(t, db, "RECORD set table=metrics key=de/b cnt=20", "SUCCESS")
+	if rows := recordRows(t, assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt value=101", "SUCCESS")); len(rows) != 0 {
+		t.Fatalf("old indexed value survived update: %+v", rows)
+	}
+	rows = recordRows(t, assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt value=20", "SUCCESS"))
+	if len(rows) != 1 || rows[0].Key != microEncodeBytes([]byte("de/b")) {
+		t.Fatalf("new indexed value missing: %+v", rows)
+	}
+	resp = assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt op=gte value=100", "SUCCESS")
+	if responseField(resp, "scanned") != "1" || len(recordRows(t, resp)) != 1 {
+		t.Fatalf("indexed range did not seek to its lower bound: %s", resp)
+	}
+
+	assertCommandPrefix(t, db, "RECORD index table=metrics field=signed action=create", "SUCCESS")
+	rows = recordRows(t, assertCommandPrefix(t, db, "RECORD select table=metrics field=signed op=lt value=0", "SUCCESS"))
+	if len(rows) != 2 || rows[0].Key != microEncodeBytes([]byte("de/a")) || rows[1].Key != microEncodeBytes([]byte("it/d")) {
+		t.Fatalf("signed ordering = %+v", rows)
+	}
+	assertCommandPrefix(t, db, "RECORD index table=metrics field=score action=create", "SUCCESS")
+	rows = recordRows(t, assertCommandPrefix(t, db, "RECORD select table=metrics field=score op=eq value=0", "SUCCESS"))
+	if len(rows) != 2 { // -0 e +0 sono lo stesso valore numerico.
+		t.Fatalf("float zero equality = %+v", rows)
+	}
+
+	resp = assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt op=gte value=0 prefix=de/ limit=10 budget=1", "SUCCESS")
+	if responseField(resp, "scanned") != "1" || responseField(resp, "next_cursor") == "" {
+		t.Fatalf("bounded indexed selection = %s", resp)
+	}
+	cursor := responseField(resp, "next_cursor")
+	resp = assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt op=gte value=0 prefix=de/ limit=10 budget=10 cursor="+cursor, "SUCCESS")
+	if len(recordRows(t, resp)) != 2 {
+		t.Fatalf("selection cursor did not resume: %s", resp)
+	}
+
+	assertCommandPrefix(t, db, "RECORD index table=metrics field=cnt action=rebuild", "SUCCESS")
+	table, ok := db.recordStore.Get("metrics")
+	if !ok {
+		t.Fatal("metrics table disappeared")
+	}
+	liveSchema := table.Schema()
+	field := liveSchema.fieldByName("cnt")
+	staleRow := make([]byte, liveSchema.RowWidth)
+	if err := field.encodeInto(staleRow, "777"); err != nil {
+		t.Fatal(err)
+	}
+	staleKey, ok := recordIndexPairKey(liveSchema.Name, liveSchema.Generation, *field, staleRow, []byte("ghost"))
+	if !ok {
+		t.Fatal("failed to encode stale index candidate")
+	}
+	if _, err := db.upsertPairPayload(staleKey, []byte("ghost"), true); err != nil {
+		t.Fatal(err)
+	}
+	resp = assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt value=777", "SUCCESS")
+	if responseField(resp, "scanned") != "1" || len(recordRows(t, resp)) != 0 {
+		t.Fatalf("stale derived candidate was treated as authoritative: %s", resp)
+	}
+	resp = assertCommandPrefix(t, db, "RECORD index table=metrics action=list", "SUCCESS")
+	var indexes []string
+	decodePayloadField(t, resp, &indexes)
+	if strings.Join(indexes, ",") != "cnt,signed,score" {
+		t.Fatalf("index list = %v", indexes)
+	}
+	assertCommandPrefix(t, db, "RECORD index table=metrics field=cnt action=drop", "SUCCESS")
+	if responseField(assertCommandPrefix(t, db, "RECORD select table=metrics field=cnt value=20", "SUCCESS"), "indexed") != "0" {
+		t.Fatal("dropped index was still selected")
+	}
+
+	visible, _, err := db.PairScanWithOptions([]byte(recordIndexPrefix), 32, nil, false)
+	if err != nil || len(visible) != 0 {
+		t.Fatalf("record indexes leaked into ordinary scans: %d, %v", len(visible), err)
+	}
+}
+
+func TestRecordIndexesSurviveCompactionReopenAndDrop(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.DataDir = filepath.Join(t.TempDir(), "data")
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := engine.GetDatabase("persist_index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCommandPrefix(t, db, "RECORD define table=t fields=cnt:uint:4,tmp:string:8", "SUCCESS")
+	assertCommandPrefix(t, db, "RECORD set table=t key=a cnt=1 tmp=x", "SUCCESS")
+	assertCommandPrefix(t, db, "RECORD set table=t key=b cnt=2 tmp=y", "SUCCESS")
+	assertCommandPrefix(t, db, "RECORD index table=t field=cnt action=create", "SUCCESS")
+	assertCommandPrefix(t, db, "RECORD alter table=t drop=tmp", "SUCCESS")
+	assertCommandPrefix(t, db, "RECORD compact table=t", "SUCCESS")
+	if rows := recordRows(t, assertCommandPrefix(t, db, "RECORD select table=t field=cnt op=gte value=1", "SUCCESS")); len(rows) != 2 {
+		t.Fatalf("index after compaction = %+v", rows)
+	}
+	engine.Close()
+
+	engine, err = NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { engine.Close() })
+	db, err = engine.GetDatabase("persist_index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := assertCommandPrefix(t, db, "RECORD select table=t field=cnt value=2", "SUCCESS")
+	if responseField(resp, "indexed") != "1" || len(recordRows(t, resp)) != 1 {
+		t.Fatalf("index after reopen = %s", resp)
+	}
+	assertCommandPrefix(t, db, "DEL records table=t drop=1", "SUCCESS")
+	left, _, err := db.PairScanWithOptions(recordIndexTablePrefix("t"), 32, nil, true)
+	if err != nil || len(left) != 0 {
+		t.Fatalf("drop left %d index rows: %v", len(left), err)
+	}
+}
+
+func TestRecordSchemaV1LoadsWithoutIndexFlagsAndWritesV2(t *testing.T) {
+	fields, err := parseRecordFieldSpecs("cnt:uint:4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := newRecordSchema("legacy", fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := schema.encode()
+	legacy[4] = RecordLegacyFormatVersion
+	legacy[RecordHeaderSize+8] = 0xff // reserved bytes in v1 must not become flags.
+	decoded, err := decodeRecordSchema("legacy", legacy)
+	if err != nil {
+		t.Fatalf("decode v1: %v", err)
+	}
+	if decoded.Fields[0].Indexed {
+		t.Fatal("v1 reserved bytes were interpreted as an index flag")
+	}
+	path := filepath.Join(t.TempDir(), "legacy.schema")
+	table := &RecordTable{name: "legacy", path: path, schema: decoded}
+	if err := table.persistLocked(decoded); err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written[4] != RecordFormatVersion {
+		t.Fatalf("persisted schema version=%d, want %d", written[4], RecordFormatVersion)
 	}
 }
 

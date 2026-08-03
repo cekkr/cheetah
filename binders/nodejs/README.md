@@ -165,6 +165,14 @@ await records.getRow(pool, 'ngram', 'berlin');   // { cnt: 43, prob: 0.25, label
 for await (const row of records.scanRows(pool, 'ngram', { prefix: 'be', limit: 500 })) {
     console.log(row.key, row.fields);
 }
+
+// Occasional predicates reduce rows inside the server; repeated ones can opt
+// into a derived index without changing the result/paging contract.
+await records.selectAll(pool, 'ngram', { field: 'cnt', op: 'gt', value: 100, budget: 4096 });
+await records.configureIndex(pool, 'ngram', 'cnt', { action: 'create' });
+for await (const row of records.selectRows(pool, 'ngram', { field: 'cnt', op: 'gte', value: 100 })) {
+    console.log(row.key, row.fields.cnt);
+}
 ```
 
 Three properties of the family are worth internalising, because they decide how
@@ -177,6 +185,9 @@ you use it:
 - **`compact` is the only call that touches rows.** It reclaims what a drop left
   behind, and it is explicit for that reason. It bumps the table's generation and
   briefly doubles its footprint while copying.
+- **Field indexes are optional derived state.** `selectPage` reports `scanned`,
+  `indexed`, and a cursor either way; create an index only when repeated predicates
+  justify maintaining an extra entry on every changed row.
 - **A field name is an argument.** `RECORD set table=t key=k <field>=<value>` puts
   field names in the same namespace as the command's own modifiers, so `table`,
   `key`, `fields`, `limit`, `cursor` and friends are refused — by this binder at

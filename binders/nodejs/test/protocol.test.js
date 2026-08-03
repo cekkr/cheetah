@@ -186,6 +186,9 @@ test('assertUnreservedKey rejects the server reserved prefixes', () => {
     assert.equal(assertUnreservedKey('f:0000000a/'), 'f:0000000a/');
     assert.throws(() => assertUnreservedKey('\x01gn:node'), /reserved control-byte/);
     assert.throws(() => assertUnreservedKey('\x05gt:term'), /reserved control-byte/);
+    assert.throws(() => assertUnreservedKey('\x06rr:row'), /reserved control-byte/);
+    assert.throws(() => assertUnreservedKey('\x07gc:cache'), /reserved control-byte/);
+    assert.throws(() => assertUnreservedKey('\x08ri:index'), /reserved control-byte/);
     assert.throws(() => assertUnreservedKey('graph/edges'), /reserved namespace/);
     assert.throws(() => assertUnreservedKey('idx/whatever'), /reserved namespace/);
     assert.throws(() => assertUnreservedKey(''), /must not be empty/);

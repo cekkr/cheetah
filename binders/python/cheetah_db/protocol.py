@@ -57,8 +57,8 @@ __all__ = [
     "to_bytes",
 ]
 
-#: ``\x01gn:`` … ``\x05gt:`` — the graph store's reserved first bytes.
-RESERVED_CONTROL_PREFIXES = (0x01, 0x02, 0x03, 0x04, 0x05)
+#: ``\x01`` … ``\x08`` — graph, record, cache, and record-index namespaces.
+RESERVED_CONTROL_PREFIXES = (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08)
 
 #: Reserved textual namespaces (``graph.go`` → ``graph/``, ``idx/``).
 RESERVED_TEXT_PREFIXES = ("graph/", "idx/")

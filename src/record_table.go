@@ -119,8 +119,15 @@ func (db *Database) recordSetRow(table *RecordTable, key []byte, values map[stri
 		}
 	}
 
+	indexCleanup, err := db.recordPrepareRowIndexes(schema, key, existing, row)
+	if err != nil {
+		return false, 0, err
+	}
 	absKey, err := db.upsertPairPayload(pairKey, row, false)
 	if err != nil {
+		return false, 0, err
+	}
+	if err := db.recordCommitRowIndexes(indexCleanup); err != nil {
 		return false, 0, err
 	}
 	return !found, absKey, nil
@@ -194,7 +201,18 @@ func (db *Database) recordDeleteRow(table *RecordTable, key []byte) (bool, error
 	lock := recordRowLockFor(pairKey)
 	lock.Lock()
 	defer lock.Unlock()
-	return db.deletePairAndPayload(pairKey)
+	row, found, err := db.getPairPayload(pairKey)
+	if err != nil || !found {
+		return false, err
+	}
+	deleted, err := db.deletePairAndPayload(pairKey)
+	if err != nil || !deleted {
+		return deleted, err
+	}
+	if err := db.recordDeleteRowIndexes(table.schema, key, row); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // recordAlterTable applica aggiunte e rimozioni di campo a una tabella viva.
@@ -207,14 +225,20 @@ func (db *Database) recordAlterTable(table *RecordTable, add []RecordField, drop
 
 	next := table.schema.clone()
 	dropped := 0
+	var droppedIndexes []string
 	for _, name := range drop {
 		clean, err := validateRecordFieldName(name)
 		if err != nil {
 			return 0, 0, err
 		}
-		if !next.dropField(clean) {
+		field := next.fieldByName(clean)
+		if field == nil {
 			return 0, 0, fmt.Errorf("unknown_field:%s", clean)
 		}
+		if field.Indexed {
+			droppedIndexes = append(droppedIndexes, clean)
+		}
+		next.dropField(clean)
 		dropped++
 	}
 	added := 0
@@ -232,6 +256,13 @@ func (db *Database) recordAlterTable(table *RecordTable, add []RecordField, drop
 	}
 	if err := table.persistLocked(next); err != nil {
 		return 0, 0, err
+	}
+	for _, name := range droppedIndexes {
+		if _, err := db.PairPurgeWithOptions(recordIndexFieldPrefix(table.name, name), 0, true); err != nil {
+			// Lo schema è già il commit point e non consulta più queste righe
+			// derivate. Restano spazzatura innocua fino al drop della tabella.
+			logErrorf("record alter %s: stale index %s left behind: %v", table.name, name, err)
+		}
 	}
 	return added, dropped, nil
 }
@@ -254,6 +285,14 @@ func (db *Database) recordCompact(table *RecordTable) (int, error) {
 	// prefisso, o si mischierebbero alle righe nuove.
 	if _, err := db.PairPurgeWithOptions(newPrefix, 0, true); err != nil {
 		return 0, err
+	}
+	for _, field := range next.Fields {
+		if !field.Indexed {
+			continue
+		}
+		if _, err := db.PairPurgeWithOptions(recordIndexGenerationPrefix(table.name, field.Name, next.Generation), 0, true); err != nil {
+			return 0, err
+		}
 	}
 
 	rewritten := 0
@@ -299,6 +338,9 @@ func (db *Database) recordCompact(table *RecordTable) (int, error) {
 			if _, err := db.upsertPairPayload(target, remapped, false); err != nil {
 				return rewritten, err
 			}
+			if err := db.recordPutRowIndexes(next, userKey, remapped); err != nil {
+				return rewritten, err
+			}
 			rewritten++
 		}
 		cursor = nextCursor
@@ -314,6 +356,14 @@ func (db *Database) recordCompact(table *RecordTable) (int, error) {
 	// raggiungibili e possono sparire con calma.
 	if _, err := db.PairPurgeWithOptions(oldPrefix, 0, true); err != nil {
 		logErrorf("record compact %s: stale rows left behind: %v", table.name, err)
+	}
+	for _, field := range current.Fields {
+		if !field.Indexed {
+			continue
+		}
+		if _, err := db.PairPurgeWithOptions(recordIndexGenerationPrefix(table.name, field.Name, current.Generation), 0, true); err != nil {
+			logErrorf("record compact %s: stale index %s left behind: %v", table.name, field.Name, err)
+		}
 	}
 	return rewritten, nil
 }
@@ -331,6 +381,11 @@ func (db *Database) recordDropTable(name string) (int, bool, error) {
 	}
 	table.mu.Lock()
 	removed, err := db.PairPurgeWithOptions(recordTablePrefix(name), 0, true)
+	if err == nil {
+		if _, indexErr := db.PairPurgeWithOptions(recordIndexTablePrefix(name), 0, true); indexErr != nil {
+			err = indexErr
+		}
+	}
 	table.mu.Unlock()
 	if err != nil {
 		return removed, false, err

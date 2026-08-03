@@ -11,6 +11,8 @@
 //	RECORD set     table=<t> key=<k> <campo>=<valore> …
 //	RECORD get     table=<t> key=<k> [fields=<nome,…>]
 //	RECORD scan    table=<t> [prefix=<p>] [limit=<n>] [cursor=<c>] [fields=<nome,…>]
+//	RECORD select  table=<t> field=<f> op=<eq|ne|lt|lte|gt|gte> value=<v> [prefix/limit/budget/cursor/fields]
+//	RECORD index   table=<t> field=<f> action=<create|rebuild|drop|list>
 //
 // La cancellazione non è qui: DEL è l'unica cancellazione del protocollo, e le
 // righe (e le tabelle) sono un suo bersaglio — DEL records (micro_del.go).
@@ -45,6 +47,10 @@ func microRecord(db *Database, args microArgs) (microResponse, error) {
 		return db.microRecordGet(args)
 	case "scan":
 		return db.microRecordScan(args)
+	case "select", "reduce", "where":
+		return db.microRecordSelect(args)
+	case "index":
+		return db.microRecordIndex(args)
 	case "":
 		return microFail("record_requires_target"), nil
 	default:
@@ -331,6 +337,133 @@ func (db *Database) microRecordScan(args microArgs) (microResponse, error) {
 	return microOK(append(fields, payload)...), nil
 }
 
+func (db *Database) microRecordSelect(args microArgs) (microResponse, error) {
+	table, failure, ok := db.recordResolveTable(args)
+	if !ok {
+		return failure, nil
+	}
+	fieldName := args.get("field")
+	if strings.TrimSpace(fieldName) == "" {
+		return microFail("record_select_requires_field"), nil
+	}
+	rawValue, hasValue := args.Params["value"]
+	if !hasValue {
+		return microFail("record_select_requires_value"), nil
+	}
+	table.mu.RLock()
+	predicate, err := newRecordPredicate(table.schema, fieldName, args.get("op"), rawValue)
+	table.mu.RUnlock()
+	if err != nil {
+		return microFail(err.Error()), nil
+	}
+
+	var keyPrefix []byte
+	if raw := args.get("prefix"); raw != "" && raw != "*" {
+		keyPrefix, err = microParseBytes(raw)
+		if err != nil {
+			return microRawResponse(err.Error()), nil
+		}
+	}
+	parseInt := func(name string) (int, *microResponse) {
+		raw := args.get(name)
+		if raw == "" {
+			return 0, nil
+		}
+		value, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || value < 0 {
+			failure := microFail("invalid_" + name)
+			return 0, &failure
+		}
+		return value, nil
+	}
+	limit, invalid := parseInt("limit")
+	if invalid != nil {
+		return *invalid, nil
+	}
+	budget, invalid := parseInt("budget")
+	if invalid != nil {
+		return *invalid, nil
+	}
+	var cursor []byte
+	if raw := args.get("cursor"); raw != "" && raw != "*" {
+		cursor, err = microParseBytes(raw)
+		if err != nil {
+			return microRawResponse(err.Error()), nil
+		}
+	}
+	only, err := recordFieldNameSet(args.get("fields"))
+	if err != nil {
+		return microFail(err.Error()), nil
+	}
+	selected, err := db.recordSelectRows(table, predicate, keyPrefix, limit, budget, cursor, only)
+	if err != nil {
+		return microSilent(), err
+	}
+	payload, err := recordPayloadField(selected.Rows)
+	if err != nil {
+		return microSilent(), err
+	}
+	fields := []microField{
+		mf("table", table.name),
+		mf("field", predicate.field.Name),
+		mf("op", predicate.op),
+		mfi("indexed", boolToInt(selected.Indexed)),
+		mfi("scanned", selected.Scanned),
+		mfi("count", len(selected.Rows)),
+	}
+	if len(selected.NextCursor) > 0 {
+		fields = append(fields, mf("next_cursor", microEncodeBytes(selected.NextCursor)))
+	}
+	return microOK(append(fields, payload)...), nil
+}
+
+func (db *Database) microRecordIndex(args microArgs) (microResponse, error) {
+	table, failure, ok := db.recordResolveTable(args)
+	if !ok {
+		return failure, nil
+	}
+	action := strings.ToLower(strings.TrimSpace(args.get("action")))
+	if action == "" {
+		action = "create"
+	}
+	if action == "list" {
+		schema := table.Schema()
+		indexed := make([]string, 0)
+		for _, field := range schema.Fields {
+			if field.Indexed {
+				indexed = append(indexed, field.Name)
+			}
+		}
+		payload, err := recordPayloadField(indexed)
+		if err != nil {
+			return microSilent(), err
+		}
+		return microOK(mf("table", table.name), mfi("count", len(indexed)), payload), nil
+	}
+	fieldName := args.get("field")
+	if strings.TrimSpace(fieldName) == "" {
+		return microFail("record_index_requires_field"), nil
+	}
+	entries, changed, err := db.recordConfigureIndex(table, fieldName, action)
+	if err != nil {
+		if isRecordUserError(err) {
+			return microFail(err.Error()), nil
+		}
+		return microSilent(), err
+	}
+	schema := table.Schema()
+	field := schema.fieldByName(strings.ToLower(strings.TrimSpace(fieldName)))
+	indexed := field != nil && field.Indexed
+	return microOK(
+		mf("table", table.name),
+		mf("field", strings.ToLower(strings.TrimSpace(fieldName))),
+		mf("action", action),
+		mfi("changed", boolToInt(changed)),
+		mfi("indexed", boolToInt(indexed)),
+		mfi("entries", entries),
+	), nil
+}
+
 // isRecordUserError distingue un errore di dialetto (campo sconosciuto, valore
 // fuori scala) da un guasto di IO: il primo è una risposta ERROR, il secondo
 // risale al dispatcher come errore vero.
@@ -342,6 +475,7 @@ func isRecordUserError(err error) bool {
 	for _, token := range []string{
 		"unknown_field", "invalid_", "value_out_of_range", "value_too_long",
 		"record_key_cannot_be_empty", "row_too_short_for_field",
+		"record_field_not_indexed", "record_index_requires_field",
 	} {
 		if strings.HasPrefix(msg, token) {
 			return true

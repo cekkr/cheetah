@@ -51,19 +51,24 @@ __all__ = [
     "FIELD_TYPES",
     "RESERVED_FIELD_NAMES",
     "RecordField",
+    "RecordIndexChange",
     "RecordPage",
     "RecordRow",
     "RecordSchema",
     "RecordWrite",
     "alter",
     "compact",
+    "configure_index",
     "define",
     "delete_row",
     "drop_table",
     "field_spec",
     "get_row",
     "iter_rows",
+    "iter_selected",
+    "list_indexes",
     "scan",
+    "select",
     "schema",
     "set_row",
     "tables",
@@ -128,6 +133,7 @@ class RecordField:
     type: str
     width: int
     offset: int = 0
+    indexed: bool = False
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "RecordField":
@@ -138,6 +144,7 @@ class RecordField:
             # `offset` and does not shadow the builtin in caller code.
             width=int(data.get("bytes", 0) or 0),
             offset=int(data.get("offset", 0) or 0),
+            indexed=bool(data.get("indexed", False)),
         )
 
     @property
@@ -198,6 +205,8 @@ class RecordPage:
     rows: tuple[RecordRow, ...]
     cursor: str | None
     response: Response
+    scanned: int | None = None
+    indexed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +216,16 @@ class RecordWrite:
     created: bool
     written: int
     abs_key: int | None
+
+
+@dataclass(frozen=True)
+class RecordIndexChange:
+    field: str
+    action: str
+    changed: bool
+    indexed: bool
+    entries: int
+    response: Response
 
 
 # --------------------------------------------------------------------------- #
@@ -461,16 +480,49 @@ def scan(
     response = conn.send(build_key_value_command("RECORD scan", request))
     if not response.ok:
         _raise(f"RECORD scan {table}", response)
-    payload = response.payload() or []
-    rows = tuple(
-        RecordRow(
-            key=_decode_row_key(entry.get("key")),
-            abs_key=entry.get("abs_key"),
-            fields=dict(entry.get("fields") or {}),
-        )
-        for entry in payload
-    )
-    return RecordPage(rows=rows, cursor=response.cursor(), response=response)
+    return _record_page(response)
+
+
+def select(
+    conn: Any,
+    table: str,
+    field: str,
+    value: Any,
+    *,
+    op: str = "eq",
+    prefix: str | bytes | None = None,
+    limit: int = DEFAULT_SCAN_LIMIT,
+    budget: int | None = None,
+    cursor: str | None = None,
+    fields: Sequence[str] | None = None,
+) -> RecordPage:
+    """One bounded page selected by a decoded field predicate.
+
+    ``op`` is one of ``eq/ne/lt/lte/gt/gte``. The server reports whether the
+    field's optional secondary index served the page; the row/result contract
+    is identical when it falls back to decoding row pages in-process.
+    """
+    predicate = str(op or "eq").lower()
+    if predicate not in {"eq", "ne", "lt", "lte", "gt", "gte"}:
+        raise CheetahError(f"cheetah RECORD select predicate is invalid: {op!r}")
+    request: dict[str, Any] = {
+        "table": _table(table),
+        "field": _field_name(field),
+        "op": predicate,
+        "value": _encode_field_value(field, value),
+        "limit": int(limit) if limit else None,
+        "budget": int(budget) if budget else None,
+    }
+    if prefix not in (None, b"", ""):
+        request["prefix"] = encode_argument(prefix)
+    if cursor:
+        request["cursor"] = RawArgument(cursor)
+    if fields:
+        request["fields"] = join_csv([_field_name(name) for name in fields])
+    response = conn.send(build_key_value_command("RECORD select", request))
+    if not response.ok:
+        _raise(f"RECORD select {table}", response)
+    return _record_page(response)
 
 
 def iter_rows(
@@ -495,6 +547,94 @@ def iter_rows(
         cursor = page.cursor
         if not cursor:
             return
+
+
+def iter_selected(
+    conn: Any,
+    table: str,
+    field: str,
+    value: Any,
+    *,
+    op: str = "eq",
+    prefix: str | bytes | None = None,
+    limit: int = DEFAULT_SCAN_LIMIT,
+    budget: int | None = None,
+    max_rows: int | None = None,
+    fields: Sequence[str] | None = None,
+) -> Iterator[RecordRow]:
+    """Follow ``RECORD select`` cursors until the predicate sweep finishes."""
+    cursor: str | None = None
+    yielded = 0
+    while True:
+        page = select(
+            conn, table, field, value, op=op, prefix=prefix, limit=limit,
+            budget=budget, cursor=cursor, fields=fields,
+        )
+        for row in page.rows:
+            if max_rows is not None and yielded >= max_rows:
+                return
+            yielded += 1
+            yield row
+        cursor = page.cursor
+        if not cursor:
+            return
+
+
+def configure_index(
+    conn: Any, table: str, field: str, *, action: str = "create"
+) -> RecordIndexChange:
+    """Create, rebuild, or drop one field's optional secondary index."""
+    normalized = str(action or "create").lower()
+    if normalized not in {"create", "rebuild", "drop"}:
+        raise CheetahError(f"cheetah RECORD index action is invalid: {action!r}")
+    response = conn.send(
+        build_key_value_command(
+            "RECORD index",
+            {"table": _table(table), "field": _field_name(field), "action": normalized},
+        )
+    )
+    if not response.ok:
+        _raise(f"RECORD index {table}", response)
+    return RecordIndexChange(
+        field=response.field_value("field", _field_name(field)) or _field_name(field),
+        action=response.field_value("action", normalized) or normalized,
+        changed=bool(response.int_field("changed", 0)),
+        indexed=bool(response.int_field("indexed", 0)),
+        entries=response.int_field("entries", 0) or 0,
+        response=response,
+    )
+
+
+def list_indexes(conn: Any, table: str) -> tuple[str, ...]:
+    """Names of fields whose secondary index is enabled."""
+    response = conn.send(
+        build_key_value_command("RECORD index", {"table": _table(table), "action": "list"})
+    )
+    if not response.ok:
+        _raise(f"RECORD index {table}", response)
+    payload = response.payload() or []
+    return tuple(str(name) for name in payload)
+
+
+def _record_page(response: Response) -> RecordPage:
+    payload = response.payload() or []
+    rows = tuple(
+        RecordRow(
+            key=_decode_row_key(entry.get("key")),
+            abs_key=entry.get("abs_key"),
+            fields=dict(entry.get("fields") or {}),
+        )
+        for entry in payload
+    )
+    scanned = response.int_field("scanned")
+    indexed_raw = response.int_field("indexed")
+    return RecordPage(
+        rows=rows,
+        cursor=response.cursor(),
+        response=response,
+        scanned=scanned,
+        indexed=None if indexed_raw is None else bool(indexed_raw),
+    )
 
 
 def _decode_row_key(raw: Any) -> bytes:

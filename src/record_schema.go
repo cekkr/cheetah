@@ -54,11 +54,13 @@ const (
 	//   [1]     lunghezza del nome
 	//   [2:4]   larghezza in byte (uint16)
 	//   [4:8]   offset nella riga (uint32)
-	//   [8:12]  riservato
-	RecordFileMagic       = "CHRS"
-	RecordFormatVersion   = 1
-	RecordHeaderSize      = 24
-	RecordFieldHeaderSize = 12
+	//   [8:12]  flag (v2: bit 0 = indice secondario attivo; riservato in v1)
+	RecordFileMagic           = "CHRS"
+	RecordLegacyFormatVersion = 1
+	RecordFormatVersion       = 2
+	RecordHeaderSize          = 24
+	RecordFieldHeaderSize     = 12
+	recordFieldFlagIndexed    = 1
 
 	recordMaxFields     = 512
 	recordMaxFieldWidth = 4096
@@ -129,10 +131,11 @@ var recordTableNamePattern = regexp.MustCompile(`^[A-Za-z0-9_\-]+$`)
 // RecordField è un campo dello schema. Offset e Width sono in byte e, per Offset,
 // immutabili per tutta la vita del campo (vedi il commento in testa al file).
 type RecordField struct {
-	Name   string `json:"name"`
-	Kind   string `json:"type"`
-	Width  int    `json:"bytes"`
-	Offset int    `json:"offset"`
+	Name    string `json:"name"`
+	Kind    string `json:"type"`
+	Width   int    `json:"bytes"`
+	Offset  int    `json:"offset"`
+	Indexed bool   `json:"indexed,omitempty"`
 
 	kind recordFieldKind
 }
@@ -505,6 +508,9 @@ func (s *RecordSchema) encode() []byte {
 		buf[offset+1] = byte(len(field.Name))
 		binary.BigEndian.PutUint16(buf[offset+2:offset+4], uint16(field.Width))
 		binary.BigEndian.PutUint32(buf[offset+4:offset+8], uint32(field.Offset))
+		if field.Indexed {
+			binary.BigEndian.PutUint32(buf[offset+8:offset+12], recordFieldFlagIndexed)
+		}
 		offset += RecordFieldHeaderSize
 		copy(buf[offset:], field.Name)
 		offset += len(field.Name)
@@ -516,7 +522,8 @@ func decodeRecordSchema(name string, data []byte) (*RecordSchema, error) {
 	if len(data) < RecordHeaderSize || string(data[0:4]) != RecordFileMagic {
 		return nil, fmt.Errorf("invalid_record_schema_file")
 	}
-	if data[4] != RecordFormatVersion {
+	version := data[4]
+	if version != RecordLegacyFormatVersion && version != RecordFormatVersion {
 		return nil, fmt.Errorf("unsupported_record_schema_version:%d", data[4])
 	}
 	count := int(binary.BigEndian.Uint16(data[6:8]))
@@ -534,6 +541,13 @@ func decodeRecordSchema(name string, data []byte) (*RecordSchema, error) {
 		nameLen := int(data[offset+1])
 		width := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
 		fieldOffset := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
+		flags := uint32(0)
+		if version >= RecordFormatVersion {
+			flags = binary.BigEndian.Uint32(data[offset+8 : offset+12])
+			if flags & ^uint32(recordFieldFlagIndexed) != 0 {
+				return nil, fmt.Errorf("unsupported_record_field_flags:%d", flags)
+			}
+		}
 		offset += RecordFieldHeaderSize
 		if offset+nameLen > len(data) {
 			return nil, fmt.Errorf("truncated_record_schema_file")
@@ -544,11 +558,12 @@ func decodeRecordSchema(name string, data []byte) (*RecordSchema, error) {
 			return nil, fmt.Errorf("unknown_field_type_in_schema:%d", kind)
 		}
 		schema.Fields = append(schema.Fields, RecordField{
-			Name:   fieldName,
-			Kind:   kind.name(),
-			Width:  width,
-			Offset: fieldOffset,
-			kind:   kind,
+			Name:    fieldName,
+			Kind:    kind.name(),
+			Width:   width,
+			Offset:  fieldOffset,
+			Indexed: flags&recordFieldFlagIndexed != 0,
+			kind:    kind,
 		})
 	}
 	schema.refreshDerived()

@@ -187,6 +187,27 @@ func TestEqualSizeInsertsReserveDistinctValueSlots(t *testing.T) {
 	}
 }
 
+func TestValuesTablePendingWriteIsImmediatelyReadable(t *testing.T) {
+	manager := NewFileManager(4, nil)
+	t.Cleanup(manager.Close)
+	table, err := NewValuesTable(manager, filepath.Join(t.TempDir(), "values_6_0.table"), 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(table.Close)
+
+	// Inserisce una scrittura ancora non consegnata al loop: ReadAt deve
+	// comporre il risultato con pending e cancellare l'EOF del file vuoto.
+	table.pendingMu.Lock()
+	table.pending[12] = []byte("third!")
+	table.pendingMu.Unlock()
+	got := make([]byte, 6)
+	n, err := table.ReadAt(got, 12)
+	if err != nil || n != len(got) || string(got) != "third!" {
+		t.Fatalf("pending ReadAt = %q, n=%d, err=%v", got, n, err)
+	}
+}
+
 // TestDeletedKeysAreReused pretende che una chiave cancellata in mezzo al file
 // torni disponibile. Prima solo la chiave *più alta* veniva recuperata
 // (findNewHighestKey faceva scendere il contatore): ogni DELETE su una chiave

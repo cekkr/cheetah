@@ -201,7 +201,10 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
 - **Fresh value slots come from `ValuesTable.ReserveEntry`, never a live `os.Stat`.** Value writes are
   queued asynchronously, so the file size can lag acknowledged inserts. Each table seeds one atomic
   high-water mark from disk when opened and reserves from it before queuing bytes; deriving
-  `EntryID` from the file on every insert makes equal-size payloads overwrite one another.
+  `EntryID` from the file on every insert makes equal-size payloads overwrite one another. `ReadAt`
+  holds the pending-write view across its disk read and clears `io.EOF` when that overlay fills the
+  request; otherwise an acknowledged insert can fall exactly between the disk miss and pending-map
+  cleanup and be briefly unreadable.
 - **Pair-trie mutations are serialized end to end.** `setPairValue` and `deletePairValue` share
   `pairMutationMu` because jump splitting, promotion, child creation and deletion all rewrite common
   ancestors. Point reads/scans remain concurrent; do not move the lock down into only one mutation
@@ -287,9 +290,17 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   is `recordRowLocks` ([`record_table.go`](src/record_table.go)). Row ops take the table's `RLock` and
   then a row lock; schema mutations take the `Lock` and **never** a row lock — reversing that nests
   the two in both orders.
-- **Reserved trie prefixes now run `\x01`…`\x07`.** `\x06rr:` belongs to record-table rows and
-  `\x07gc:` to the graph association cache ([`graph_cache.go`](src/graph_cache.go)), alongside the
-  five graph prefixes. Never emit user keys under any of them.
+- **A record secondary index is derived, hidden, and verified.** Enabled field indexes live at
+  `\x08ri:<table>/<field>/<generation>/<sortable-value>/<row-key>` ([`record_index.go`](src/record_index.go)).
+  Their entries are hidden from ordinary scans, and `RECORD select` always reloads the authoritative
+  `\x06rr:` row and rechecks the predicate. Prepare a new candidate before committing a changed row,
+  then delete the old one: an interrupted write may leave a harmless stale candidate but must not
+  leave an indexed row unreachable. Index creation and compaction build the derived generation before
+  the schema rename/flag is the commit point; drop clears the flag before purging.
+- **Reserved trie prefixes now run `\x01`…`\x08`.** `\x06rr:` belongs to record-table rows,
+  `\x07gc:` to the graph association cache ([`graph_cache.go`](src/graph_cache.go)), and `\x08ri:`
+  to record secondary indexes, alongside the five graph prefixes. Never emit user keys under any of
+  them; both binder codecs enforce the same range.
 - **The graph cache is derived, hidden, and never authoritative.** Its rows (`\x07gc:l/` shortcuts,
   `\x07gc:q/` convergences) are written *hidden*, so they stay out of ordinary scans and summaries,
   and they may be dropped at any moment by the maintainer or by `DEL graph_cache` without changing a
@@ -377,7 +388,7 @@ client ── TCP ──►  server.go (per-conn loop; text or binary frames)   
                  ├─ graph.go           GRAPH_* nodes/edges/adjacency/query
                  │    ├─ graph_recall.go  GRAPH_RECALL/SIMILAR/TERM_INDEX (associative recall)
                  │    └─ graph_cache.go   \x07gc: shortcut + convergence cache, self-training
-                 ├─ record_*.go        RECORD multi-field tables (schema file + rows in the trie)
+                 ├─ record_*.go        RECORD multi-field tables (schema + rows + derived indexes)
                  ├─ prediction_*.go    PREDICT_* tables + context matrices
                  └─ cluster_*.go       CLUSTER_*/FORK_ASSIGN topology, gossip
                          ▲
@@ -1083,8 +1094,10 @@ text protocol and the packed row, the `CHRS` schema file, and the per-database r
   `parseRecordFieldSpec`/`parseRecordFieldSpecs`); `RecordTable` (schema + `sync.RWMutex` +
   `persistLocked`) and `RecordManager` (`Get`/`Create`/`Drop`/`List`, lazy directory scan).
 - **On-disk format:** `records/<table>.schema` — `RecordHeaderSize` (24 B) header (`"CHRS"`, version,
-  field count, row width, generation) then `RecordFieldHeaderSize` (12 B) descriptors + names. Written
-  by `persistLocked` through a temp file and a rename, which is the commit point of a compaction.
+  field count, row width, generation) then `RecordFieldHeaderSize` (12 B) descriptors + names. Version
+  2 uses descriptor bytes 8–11 as flags (`recordFieldFlagIndexed`); version 1 is accepted with those
+  formerly-reserved bytes ignored and is written as v2 on the next schema mutation. Written by
+  `persistLocked` through a temp file and a rename, which is the commit point of a compaction.
 - **Common mistakes:** `addField` is append-only by design and `dropField` deliberately leaves a hole
   — see [Critical contracts](#critical-implementation-contracts). Field names must stay distinct from
   the `RECORD` modifiers (`recordReservedNames`), since in `RECORD set` a field *is* an argument; the
@@ -1110,15 +1123,37 @@ paged trie walk.
   `recordSetRow` always writes the *current* row width, which is how a stale row catches up with an
   ADD.
 
+#### [`src/record_index.go`](src/record_index.go)
+
+Server-side field predicates and optional secondary indexes. The unindexed path scans bounded row
+pages and decodes the predicate field without shipping non-matches; the indexed path scans hidden
+derived candidates and verifies each against the authoritative row.
+
+- **Key symbols:** `recordIndexPrefix` (`\x08ri:`), `recordPredicate`/`newRecordPredicate`,
+  `recordSortableFieldBytes`, the index-key prefix helpers, `recordPrepareRowIndexes`/
+  `recordCommitRowIndexes`/`recordDeleteRowIndexes`/`recordPutRowIndexes`,
+  `recordConfigureIndex`/`recordRebuildIndexLocked`, and `recordSelectRows`.
+- **Ordering and bounds:** `eq` scans one encoded value prefix; range predicates scan sortable value
+  order and then row key. Signed integers flip their sign bit; IEEE floats use the monotone sign
+  transform and canonicalize ±0. `limit` defaults to 500 (max 10,000); examined-candidate `budget`
+  defaults to 4,096 (max 262,144). Unindexed cursors follow row-key order; indexed range cursors follow
+  index-key order. Both are opaque `x<hex>` tokens.
+- **Common mistakes:** the index is not authoritative. Keep candidates hidden, reload/recheck the live
+  row, prepare the new entry before the row write, and make schema state the lifecycle commit point.
+  Compaction must purge/build the target index generation before renaming the schema, then purge the
+  old generation. A field index adds write amplification and therefore stays opt-in.
+
 #### [`src/micro_record.go`](src/micro_record.go)
 
-The `RECORD` micro-command: `define`, `alter`, `compact`, `schema`, `tables`, `set`, `get`, `scan`.
+The `RECORD` micro-command: `define`, `alter`, `compact`, `schema`, `tables`, `set`, `get`, `scan`,
+`select`/`reduce`/`where`, and `index`.
 Deletion is not here — `DEL records` ([`micro_del.go`](src/micro_del.go)) is, because `DEL` is the
 protocol's only erasure verb.
 
 - **Key symbols:** `microRecord` (target dispatch), `Database.recordResolveTable`,
   `recordSchemaFields`, `recordPayloadField`, `recordValueParams`, `isRecordUserError`, and the
-  per-target handlers `microRecordDefine`/`Alter`/`Compact`/`Schema`/`Tables`/`Set`/`Get`/`Scan`.
+  per-target handlers `microRecordDefine`/`Alter`/`Compact`/`Schema`/`Tables`/`Set`/`Get`/`Scan`/
+  `Select`/`Index`.
 - **Common mistakes:** `recordValueParams` treats every non-reserved argument as a field value, so a
   typo in a modifier name lands as `ERROR,unknown_field:<typo>` rather than being ignored — that is
   intentional. `RECORD schema` reports `rows=` only with `rows=1`: the count is a full subtree walk
@@ -1425,7 +1460,8 @@ free-function command layers — [`lib/kv.js`](binders/nodejs/lib/kv.js) (the tw
 `query`, `recall`/`recallBatched`, id-based `recallAsync`/`fetchRecall`/`awaitRecall`, `similar`,
 `termIndex`, and the `GRAPH_AMBIGUITY_*` trio),
 [`lib/records.js`](binders/nodejs/lib/records.js) (the `RECORD` family plus `DEL records`, with
-`fieldSpec` validating a field declaration — reserved names included — before the wire),
+`fieldSpec` validating a field declaration — reserved names included — before the wire, plus
+`selectPage`/`selectRows`/`selectAll` and the optional index lifecycle),
 [`lib/jobs.js`](binders/nodejs/lib/jobs.js) (`JOB` submit/status/fetch plus `awaitJob`),
 [`lib/predict.js`](binders/nodejs/lib/predict.js) (`PREDICT_*`),
 [`lib/alias.js`](binders/nodejs/lib/alias.js) (the `ALIAS` family: the command index, the
@@ -1458,7 +1494,7 @@ actually spawnable).
   while the server defaults to stopping, so `continue_on_error=1` must travel explicitly. **Any
   change to those on the Go side is a change here too**, and the binder's tests are where a client
   would first notice.
-- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 137 tests (136 passing + 1 opt-in integration test skipped by default):
+- **Tests:** `node --test test/*.test.js` from [`binders/nodejs/`](binders/nodejs/) — 143 tests (142 passing + 1 opt-in integration test skipped by default):
   codec, key primitives, the `GRAPH_*` command spellings
   ([`test/graph.test.js`](binders/nodejs/test/graph.test.js)), the `RECORD` ones
   ([`test/records.test.js`](binders/nodejs/test/records.test.js)), the job/prediction/admin ones
@@ -1496,7 +1532,8 @@ objects across `close_all()` so post-reset reconnects remain owned), the free-fu
 [`graph.py`](binders/python/cheetah_db/graph.py) (the whole `GRAPH_*` surface, including
 `recall_async`/`fetch_recall`/`await_recall` by job id),
 [`records.py`](binders/python/cheetah_db/records.py) (the `RECORD` family plus `DEL records`, with
-`field_spec` validating a field declaration — reserved names included — before the wire),
+`field_spec` validating a field declaration — reserved names included — before the wire, plus
+`select`/`iter_selected` and the optional index lifecycle),
 [`jobs.py`](binders/python/cheetah_db/jobs.py) (`JOB` submit/status/fetch plus a poll loop),
 [`predict.py`](binders/python/cheetah_db/predict.py),
 [`alias.py`](binders/python/cheetah_db/alias.py) (the `ALIAS` family) and
@@ -1522,7 +1559,7 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   `BATCH` must explicitly send `continue_on_error=1` when using the binders' continue-by-default API;
   omission means stop-on-error to the server.
 - **Tests:** `python3 -m unittest discover -s tests -t .` from
-  [`binders/python/`](binders/python/) — 188 tests (174 passing + 14 opt-in integration tests skipped by default): codec, key primitives, the binary codec and the `ALIAS` layer
+  [`binders/python/`](binders/python/) — 192 tests (178 passing + 14 opt-in integration tests skipped by default): codec, key primitives, the binary codec and the `ALIAS` layer
   ([`tests/test_binary.py`](binders/python/tests/test_binary.py)), KV/graph/record/job
   and database-operation call shapes, and `CheetahDatabase` against an in-memory stand-in
   ([`tests/fakes.py`](binders/python/tests/fakes.py), which reproduces enough record-table semantics
@@ -1544,7 +1581,8 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
   `values_<size>.recycle.table` (free list of value slots; both carry the `"CHRL"` header),
   `pairs/<hexid>.table` + `pairs/next_id.dat` + `pairs/format.dat`,
   `pair_jumps/{jumps.bin,index.bin,next_id.dat}`, `prediction_<name>.table`,
-  `records/<table>.schema` (the `"CHRS"` record-table schemas; the rows themselves live in the trie),
+  `records/<table>.schema` (the `"CHRS"` record-table schemas; rows and hidden `\x08ri:` indexes live
+  in the trie),
   `settings.ini` (this database's ad-hoc overrides), `protocol_profiles.dat` (the `"CHNP"` per-table
   numeric widths of the binary protocol), `cluster_topology.json`.
   Source of truth is the engine; these are outputs — but note that `settings.ini` is the one an
@@ -1741,21 +1779,24 @@ Plus [`keys.py`](binders/python/cheetah_db/keys.py),
 
 ### Record tables (multi-field rows) — Shipped
 
-- **Behavior:** `RECORD define/alter/compact/schema/tables/set/get/scan` plus `DEL records`. A table
+- **Behavior:** `RECORD define/alter/compact/schema/tables/set/get/scan/select/index` plus `DEL records`. A table
   declares named fields with per-field byte widths; a row packs them side by side in one payload under
   `\x06rr:<table>/<generation>/<key>`. `alter add=`/`drop=` are schema-only — no row is rewritten —
-  and `compact` is the explicit rewrite that reclaims a dropped field's bytes.
+  and `compact` is the explicit rewrite that reclaims a dropped field's bytes. `select` (also spelled
+  `reduce`/`where`) evaluates bounded typed predicates in-process; `index` opts individual fields into
+  hidden `\x08ri:` secondary indexes without changing the selection contract.
 - **Owners:** [`record_schema.go`](src/record_schema.go) (shape + codec + `CHRS` file),
-  [`record_table.go`](src/record_table.go) (rows), [`micro_record.go`](src/micro_record.go) (protocol),
-  `microDelRecords` in [`micro_del.go`](src/micro_del.go).
+  [`record_table.go`](src/record_table.go) (rows), [`record_index.go`](src/record_index.go) (predicates
+  + indexes), [`micro_record.go`](src/micro_record.go) (protocol), `microDelRecords` in
+  [`micro_del.go`](src/micro_del.go).
 - **Why:** the same key repeated under `cnt:`, `prob:` and `meta:` was three entries, three payloads
   and three round-trips describing one thing, with nothing keeping them consistent.
 - **Clients:** wrapped by both binders — [`records.js`](binders/nodejs/lib/records.js) and
   [`records.py`](binders/python/cheetah_db/records.py) — including the client-side validation of a
   field declaration (type, width, reserved name) so a bad schema fails before the wire.
-- **Gaps:** no secondary index over field values (a `RECORD scan` filters by row-key prefix only, and
-  by-value selection is a client-side pass); no reducer mode reads fields directly; a compaction
-  doubles the table's disk footprint until the old generation is purged.
+- **Constraints:** indexes are opt-in derived state and add a write per indexed field; unindexed
+  selection is still bounded but may need several cursor pages. A compaction briefly doubles the
+  table and enabled-index footprint until the old generation is purged.
 
 ### Per-database ad-hoc settings — Shipped
 
@@ -1929,7 +1970,7 @@ plus the two front-end handlers. There is no generated API manifest.
 | `ALIAS`, `BATCH`, `DEL`, `GRAPH_CACHE`, `JOB`, `RECORD` (micro-commands) | [`micro_alias.go`](src/micro_alias.go), [`batch.go`](src/batch.go), [`micro_del.go`](src/micro_del.go), [`micro_graph_cache.go`](src/micro_graph_cache.go), [`micro_job.go`](src/micro_job.go), [`jobs.go`](src/jobs.go), [`micro_record.go`](src/micro_record.go) |
 | `ALIAS list/get/keys/types/profile/digest` | [`micro_alias.go`](src/micro_alias.go), [`command_index.go`](src/command_index.go), [`binary_profile.go`](src/binary_profile.go) |
 | The binary framing itself (no command of its own — a codec over every line) | [`binary_protocol.go`](src/binary_protocol.go), [`server.go`](src/server.go) `handleBinaryConnection` |
-| `RECORD define/alter/compact/schema/tables/set/get/scan`, `DEL records` | [`micro_record.go`](src/micro_record.go), [`record_table.go`](src/record_table.go), [`record_schema.go`](src/record_schema.go) |
+| `RECORD define/alter/compact/schema/tables/set/get/scan/select/reduce/where/index`, `DEL records` | [`micro_record.go`](src/micro_record.go), [`record_table.go`](src/record_table.go), [`record_index.go`](src/record_index.go), [`record_schema.go`](src/record_schema.go) |
 | `DELETE`, `PAIR_DEL`, `PAIR_PURGE`, `GRAPH_NODE_DEL`, `GRAPH_EDGE_DEL`, `PAIR_REDUCE_ASYNC/_STATUS/_FETCH`, `PREDICT_INHERIT_ASYNC/_STATUS/_FETCH`, `GRAPH_RECALL_ASYNC/_STATUS/_FETCH` (aliases over the above) | [`command_alias.go`](src/command_alias.go) |
 | `INSERT`, `READ`, `EDIT` | [`commands.go`](src/commands.go) |
 | `PAIR_SET(_HIDDEN)`, `PAIR_GET` | [`commands.go`](src/commands.go) |
@@ -2113,6 +2154,7 @@ seen in old docs are **client-side**; the server does not read them.
 | `ALIAS` answers describe the index and the profiles | [`TestAliasCommandDescribesTheIndex`, `TestAliasProfileReadsAndWrites`](src/binary_protocol_test.go) |
 | Size-changing `EDIT` relocates + recycles | [`TestEditResizesValues`](src/benchmark_test.go) |
 | Equal-size payload inserts reserve distinct slots across reopen | [`TestEqualSizeInsertsReserveDistinctValueSlots`](src/key_recycle_test.go) |
+| A queued value write overlays an EOF and is readable immediately | [`TestValuesTablePendingWriteIsImmediatelyReadable`](src/key_recycle_test.go) |
 | Sharded keys: concurrent uniqueness/read/pair/reopen, exclusive adaptive leases, lane-local recycling, pinned-format guards | [`key_slots_test.go`](src/key_slots_test.go) |
 | Adaptive container ≡ always-dense (set/get/scan/delete, both strides) | [`TestAdaptiveMatchesFixed`](src/pair_adaptive_test.go) |
 | LIST→DENSE densify + ordered `PopulatedBranchIndices` over a sparse body | [`TestPairTableListToDense`](src/pair_adaptive_test.go) |
@@ -2171,6 +2213,8 @@ seen in old docs are **client-side**; the server does not read them.
 | Concurrent partial updates on one row keep every field | [`TestRecordConcurrentPartialUpdates`](src/record_test.go) (`-race`) |
 | Record schema round-trips through the `CHRS` file across a reopen | [`TestRecordSchemaSurvivesReopen`](src/record_test.go) |
 | Every field type at every declared width, encode → decode | [`TestRecordFieldWidthsAndTypes`](src/record_test.go) |
+| Record predicates: bounded unindexed reduction, sortable numeric indexes, cursor paging, stale-candidate verification, lifecycle | [`TestRecordSelectUsesFieldReducerAndOptionalIndexes`](src/record_test.go) |
+| Record indexes survive compaction/reopen/drop; v1 schema flags migrate safely to v2 | [`TestRecordIndexesSurviveCompactionReopenAndDrop`, `TestRecordSchemaV1LoadsWithoutIndexFlagsAndWritesV2`](src/record_test.go) |
 | `DB_CREATE` ad-hoc settings apply to one database and survive a restart | [`TestDatabaseCreateWithAdHocSettings`](src/engine_control_test.go) |
 | `DB_CONFIG` applies cache fields hot, reports trie reset, and handles unloaded databases | [`TestDatabaseConfigAppliesHotSettingsAndReportsTrieReset`, `TestDatabaseConfigReportsOnOpenForUnloadedDatabase`](src/engine_control_test.go) |
 | `DATABASE key=value` overrides persist next to the data | [`TestDatabaseOverridesFromDatabaseCommandPersist`](src/engine_control_test.go) |
@@ -2214,8 +2258,9 @@ coverage ([`graph_test.go`](src/graph_test.go)) and a gated real-execution path 
   `PairFormatVersion`) and pinned per database by `pairs/format.dat` (`"CHPF"`). The main-key mode is
   pinned separately by `main_keys.format.dat` (`"CHKS"`); an old unsharded database gains that marker
   on open, while requesting sharding over its single file is refused. Record-table schemas
-  are versioned too (`"CHRS"` + `RecordFormatVersion`, [`record_schema.go`](src/record_schema.go)) and
-  refuse an unknown version rather than guessing a layout. Legacy migrations
+  are versioned too (`"CHRS"` + `RecordFormatVersion`, [`record_schema.go`](src/record_schema.go));
+  v1 loads with no index flags and the next schema mutation writes v2, while unknown versions are
+  refused rather than guessed. Legacy migrations
   that *do* exist: per-file `.jump` → `pair_jumps/*.bin` ([`jump_store.go`](src/jump_store.go)), and
   prediction `.json` → binary ([`prediction_table.go`](src/prediction_table.go)). The pre-header pair
   format has **no** migration: such a directory is refused at open and must be rebuilt with

@@ -233,6 +233,42 @@ function buildScan(table, { prefix = null, limit = DEFAULT_SCAN_LIMIT, cursor = 
     });
 }
 
+function buildSelect(
+    table,
+    { field, op = 'eq', value, prefix = null, limit = DEFAULT_SCAN_LIMIT, budget = null, cursor = null, fields = null } = {}
+) {
+    const predicate = String(op || 'eq').toLowerCase();
+    if (!['eq', 'ne', 'lt', 'lte', 'gt', 'gte'].includes(predicate)) {
+        throw new CheetahError(`cheetah RECORD select predicate is invalid: ${JSON.stringify(op)}`);
+    }
+    return buildKeyValueCommand('RECORD select', {
+        table: tableName(table),
+        field: fieldName(field),
+        op: predicate,
+        value: encodeFieldValue(field, value),
+        prefix: prefix === null || prefix === '' ? null : encodeArgument(prefix),
+        limit: limit || null,
+        budget: budget || null,
+        cursor: cursor ? rawArgument(cursor) : null,
+        fields: fields === null ? null : commaList(fields.map(fieldName)),
+    });
+}
+
+function buildIndex(table, field = null, { action = 'create' } = {}) {
+    const normalized = String(action || 'create').toLowerCase();
+    if (!['create', 'rebuild', 'drop', 'list'].includes(normalized)) {
+        throw new CheetahError(`cheetah RECORD index action is invalid: ${JSON.stringify(action)}`);
+    }
+    if (normalized !== 'list' && (field === null || field === undefined)) {
+        throw new CheetahError('cheetah RECORD index needs a field');
+    }
+    return buildKeyValueCommand('RECORD index', {
+        table: tableName(table),
+        field: normalized === 'list' ? null : fieldName(field),
+        action: normalized,
+    });
+}
+
 function buildDeleteRow(table, key) {
     return buildKeyValueCommand('DEL records', { table: tableName(table), key: encodeArgument(key) });
 }
@@ -277,6 +313,7 @@ function schemaFrom(response) {
             // `offset` and does not shadow anything in caller code.
             width: field.bytes,
             offset: field.offset,
+            indexed: field.indexed === true,
         }));
     }
     return base;
@@ -329,6 +366,7 @@ async function tables(conn) {
             type: field.type,
             width: field.bytes,
             offset: field.offset,
+            indexed: field.indexed === true,
         })),
     }));
 }
@@ -369,24 +407,80 @@ function decodeRowKey(raw) {
     return text.startsWith('x') ? Buffer.from(text.slice(1), 'hex') : Buffer.from(text, 'utf8');
 }
 
+function rowsFromPayload(response) {
+    const payload = decodePayload(response.fields) || [];
+    return payload.map((entry) => {
+        const bytes = decodeRowKey(entry.key);
+        return {
+            keyHex: entry.key,
+            bytes,
+            key: bytes.toString('utf8'),
+            absKey: entry.abs_key ?? null,
+            fields: entry.fields || {},
+        };
+    });
+}
+
 /** One page of rows, already decoded into their declared fields. */
 async function scanPage(conn, table, options = {}) {
     const response = await sendOrThrow(conn, buildScan(table, options), `RECORD scan ${table}`);
-    const payload = decodePayload(response.fields) || [];
     return {
-        rows: payload.map((entry) => {
-            const bytes = decodeRowKey(entry.key);
-            return {
-                keyHex: entry.key,
-                bytes,
-                key: bytes.toString('utf8'),
-                absKey: entry.abs_key ?? null,
-                fields: entry.fields || {},
-            };
-        }),
+        rows: rowsFromPayload(response),
         cursor: parseCursor(response.fields),
         response,
     };
+}
+
+/** One bounded page selected by a decoded field predicate. */
+async function selectPage(conn, table, options = {}) {
+    const response = await sendOrThrow(conn, buildSelect(table, options), `RECORD select ${table}`);
+    return {
+        rows: rowsFromPayload(response),
+        cursor: parseCursor(response.fields),
+        scanned: numericField(response.fields, 'scanned', 0),
+        indexed: numericField(response.fields, 'indexed', 0) === 1,
+        response,
+    };
+}
+
+/** Follow selection cursors until the predicate sweep finishes. */
+async function* selectRows(conn, table, options = {}) {
+    let cursor = options.cursor || null;
+    let yielded = 0;
+    const maxRows = options.maxRows ?? Infinity;
+    do {
+        const page = await selectPage(conn, table, { ...options, cursor });
+        for (const row of page.rows) {
+            if (yielded >= maxRows) return;
+            yielded += 1;
+            yield row;
+        }
+        cursor = page.cursor;
+    } while (cursor);
+}
+
+async function selectAll(conn, table, options) {
+    const rows = [];
+    for await (const row of selectRows(conn, table, options)) rows.push(row);
+    return rows;
+}
+
+async function configureIndex(conn, table, field, options) {
+    const line = buildIndex(table, field, options);
+    const response = await sendOrThrow(conn, line, `RECORD index ${table}`);
+    return {
+        field: response.fields.field || String(field),
+        action: response.fields.action || options?.action || 'create',
+        changed: numericField(response.fields, 'changed', 0) === 1,
+        indexed: numericField(response.fields, 'indexed', 0) === 1,
+        entries: numericField(response.fields, 'entries', 0),
+        response,
+    };
+}
+
+async function listIndexes(conn, table) {
+    const response = await sendOrThrow(conn, buildIndex(table, null, { action: 'list' }), `RECORD index ${table}`);
+    return decodePayload(response.fields) || [];
 }
 
 /** Every row of a table (or of a key prefix), one page at a time. */
@@ -447,20 +541,27 @@ module.exports = {
     buildDeleteRow,
     buildDropTable,
     buildGet,
+    buildIndex,
     buildScan,
+    buildSelect,
     buildSchema,
     buildSet,
     buildTables,
     compact,
+    configureIndex,
     define,
     deleteRow,
     dropTable,
     fieldSpec,
     fieldSpecs,
     getRow,
+    listIndexes,
     scanAll,
     scanPage,
     scanRows,
+    selectAll,
+    selectPage,
+    selectRows,
     schema,
     setRow,
     tables,

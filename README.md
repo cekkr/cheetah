@@ -26,7 +26,8 @@ other dense analytical slices must be served with predictable latency.
   which keeps the row arithmetic; a field can be **added or removed on a live table** without
   rewriting a single row, because offsets never move and a row shorter than the current schema simply
   reads `null` for what it predates. `RECORD compact` reclaims the space a removal left behind, when
-  you want it back.
+  you want it back. `RECORD select` evaluates typed field predicates inside the server with bounded
+  work, and an opt-in per-field secondary index accelerates the predicates that justify its write cost.
 - **Associative recall.** `GRAPH_RECALL` takes several terms at once and spreads activation from all
   of them, returning everything they co-activate above a requested precision — each hit with the
   seeds that reached it, its distance, the edges that justify it, and a novelty score. Because the
@@ -66,9 +67,10 @@ holds documentation, `config.example.ini`, `build.sh`, and the two standalone bu
     compaction pauses.
   - `PairTable` nodes store child pointers and terminal flags independently, unlocking
     prefix-sharing namespaces such as `ctx:`, `ctxv:`, `prob:`, or `meta:`.
-- `src/record_schema.go` and `src/record_table.go` implement multi-field **record tables**: a
+- `src/record_schema.go`, `src/record_table.go` and `src/record_index.go` implement multi-field **record tables**: a
   fixed-byte schema file per table (`records/<name>.schema`) plus rows stored as ordinary payloads
-  under a reserved trie prefix, with fields addressable by declared offset and width.
+  under a reserved trie prefix, with fields addressable by declared offset and width and optional
+  hidden secondary indexes over their typed values.
 - `src/server.go` accepts newline-delimited commands (`INSERT`, `READ`, `PAIR_SCAN`, `PAIR_REDUCE`, …)
   over TCP so external adapters can talk to the engine without embedding Go code. `DB_CONFIG`,
   `DB_CREATE` and `DB_LIST` are answered one level up, by `engineControlCommand` in `src/engine.go`, because they
@@ -226,7 +228,7 @@ them, so nothing below replaces anything you already use.
 | `DEL graph from=<a> to=<b> [type=] [directed=]` | `GRAPH_EDGE_DEL` | one edge |
 | `DEL records table=<t> key=<k>` | — | one row of a record table |
 | `DEL records table=<t> drop=1` | — | the whole record table: every row, every generation, and the schema |
-| `RECORD define \| alter \| compact \| schema \| tables \| set \| get \| scan` | — | multi-field tables, see [Record tables](#record-tables--one-thing-many-fields) |
+| `RECORD define \| alter \| compact \| schema \| tables \| set \| get \| scan \| select \| index` | — | multi-field tables, field predicates and opt-in indexes; see [Record tables](#record-tables--one-thing-many-fields) |
 | `ALIAS list \| get \| keys \| types \| profile \| digest` | — | the protocol describing itself: the numeric index of every command, and a table's numeric widths. See [Byte-wise protocol](#byte-wise-binary-protocol) |
 | `JOB submit <command>` · `JOB submit command=<base64>` | `PAIR_REDUCE_ASYNC`, `PREDICT_INHERIT_ASYNC`, `GRAPH_RECALL_ASYNC` | answers `job=<id>`; only commands registered as bounded are accepted (today `PAIR_REDUCE`, `PREDICT_INHERIT_BATCH`, `BATCH`, `GRAPH_RECALL`), anything else is `ERROR,command_not_submittable` |
 | `JOB status id=<job>` | `PAIR_REDUCE_STATUS`, `PREDICT_INHERIT_STATUS`, `GRAPH_RECALL_STATUS` | retrieves a job by its returned id and reports `state=`, `progress=`, `completed=`/`total=`, plus the family's own counters; `available=` appears only for a job that produces results per item |
@@ -626,21 +628,25 @@ round-trips, and nothing keeping them consistent with each other. A **record tab
 quantities once as fixed-width fields and stores them side by side in a single row.
 
 Rows are ordinary payloads under the reserved `\x06rr:` prefix, so they inherit the payload cache,
-slot recycling and paged scanning unchanged; what the table adds is a declared shape. The schema
-itself is a fixed-byte file, `records/<table>.schema` inside the database directory.
+slot recycling and paged scanning unchanged; what the table adds is a declared shape. Optional
+secondary-index candidates live hidden under `\x08ri:` and are always checked against the live row,
+so they are derived acceleration data rather than another source of truth. The schema itself is a
+fixed-byte file, `records/<table>.schema` inside the database directory.
 
 | Command | What it means |
 | --- | --- |
 | `RECORD define table=<t> fields=<spec> [if_not_exists=1]` | Create the table. `<spec>` is `name:type[:bytes]` items separated by commas — `cnt:uint:4,prob:float:4,label:string:12`. Refuses an existing table unless `if_not_exists=1`, which answers with the stored schema and `created=0`. |
 | `RECORD alter table=<t> [add=<spec>] [drop=<name,…>] [compact=1]` | **Add or remove fields on a live table.** Neither touches a single row (see below); `compact=1` chains the rewrite when you want the space back immediately. |
 | `RECORD compact table=<t>` | Reclaim the bytes dropped fields left behind: offsets are reassigned with no holes and every row is rewritten. Reports `rewritten=<rows>` and the new `width`/`dead_bytes`/`generation`. |
-| `RECORD schema table=<t> [rows=1]` | The shape: field count, row width, dead bytes, generation, and the full field list (name/type/bytes/offset) in `payload=`. `rows=1` adds the live row count — opt-in because counting walks the whole subtree, and describing a table should not cost what reading it does. |
+| `RECORD schema table=<t> [rows=1]` | The shape: field count, row width, dead bytes, generation, and the full field list (name/type/bytes/offset/indexed) in `payload=`. `rows=1` adds the live row count — opt-in because counting walks the whole subtree, and describing a table should not cost what reading it does. |
 | `RECORD tables` | Every record table in this database with its schema, in `payload=`. |
 | `RECORD set table=<t> key=<k> <field>=<value> …` | Upsert a row, writing **only the fields named** — the others keep the bytes they had. Answers `created=1` the first time, `written=<n>`, and the row's absolute key. |
 | `RECORD get table=<t> key=<k> [fields=<name,…>]` | One row as a JSON object in `payload=`. `fields=` projects; a field the row predates reads `null`. |
 | `RECORD scan table=<t> [prefix=<p>] [limit=<n>] [cursor=<c>] [fields=<name,…>]` | A page of rows — `{"key":"x<hex>","abs_key":<n>,"fields":{…}}` — with `next_cursor` when more remain. `prefix=` filters on the row key, exactly like `PAIR_SCAN` on a namespace. |
+| `RECORD select table=<t> field=<f> [op=eq\|ne\|lt\|lte\|gt\|gte] value=<v> [prefix=<p>] [limit=<n>] [budget=<n>] [cursor=<c>] [fields=<name,…>]` | Evaluate a typed field predicate inside the server. `budget=` bounds candidates examined (default 4,096; maximum 262,144), `limit=` bounds matches returned (default 500; maximum 10,000), and the response reports both `scanned=` and `indexed=`. `RECORD reduce` and `RECORD where` are equivalent target spellings. |
+| `RECORD index table=<t> [field=<f>] action=create\|rebuild\|drop\|list` | Opt one field into or out of its hidden secondary index, rebuild it from authoritative rows, or list indexed fields. Creating an index scans the live generation once; indexed writes maintain one extra derived entry per value. |
 | `DEL records table=<t> key=<k>` | Delete one row (name *and* payload). |
-| `DEL records table=<t> drop=1` | Delete the table: every row of every generation, then the schema file. |
+| `DEL records table=<t> drop=1` | Delete the table: every row and secondary index of every generation, then the schema file. |
 
 **Types and byte widths.** The width is per field and part of the declaration, because it is what
 keeps a row's addressing arithmetic:
@@ -671,7 +677,15 @@ must stay distinguishable. That is checked at `define`/`alter` time, not on writ
 - **`compact` is the only operation that touches rows**, which is why it is explicit. It copies every
   row into the next generation under a new key prefix and only then swaps in the new schema, so an
   interrupted compaction leaves the old layout intact rather than a half-converted table. Rows that
-  were still short stay short: what a row never had stays `null`.
+  were still short stay short: what a row never had stays `null`. Enabled indexes are rebuilt into
+  the new generation before the same schema commit point.
+
+**Selection and indexes.** Without an index, `RECORD select` walks row-key order and decodes only the
+predicate field in-process; rows never cross the wire unless they match. With an index, equality
+narrows directly to one encoded value and range predicates walk sortable value order (then row key).
+Both paths obey the same `budget=`/`limit=`/`next_cursor` contract. Indexes are opt-in because every
+indexed field adds a derived write on row changes; use them for repeated predicates, and keep the
+server-side unindexed reducer for occasional analytical passes.
 
 **In context** — one row per n-gram context instead of three namespaces, then a field added, one
 dropped, and the space reclaimed:
@@ -700,6 +714,12 @@ SUCCESS,table=ngram,fields=3,width=12,dead_bytes=0,generation=2,rewritten=1
 [cheetah_data/notes]> RECORD scan table=ngram limit=8
 SUCCESS,table=ngram,count=1,payload=W3sia2V5IjoieDYyNjU3MjZjNjk2ZSIsImFic19rZXkiOjMsImZpZWxkcyI6…
 # payload decodes to: [{"key":"x6265726c696e","abs_key":3,"fields":{"cnt":43,"novelty":null,"prob":0.25}}]
+[cheetah_data/notes]> RECORD select table=ngram field=cnt op=gt value=40 budget=256 fields=cnt,prob
+SUCCESS,table=ngram,field=cnt,op=gt,indexed=0,scanned=1,count=1,payload=…
+[cheetah_data/notes]> RECORD index table=ngram field=cnt action=create
+SUCCESS,table=ngram,field=cnt,action=create,changed=1,indexed=1,entries=1
+[cheetah_data/notes]> RECORD select table=ngram field=cnt op=eq value=43
+SUCCESS,table=ngram,field=cnt,op=eq,indexed=1,scanned=1,count=1,payload=…
 [cheetah_data/notes]> DEL records table=ngram key=berlin
 SUCCESS,deleted=1,table=ngram,key=x6265726c696e
 ```
@@ -1142,10 +1162,10 @@ price. The distinctions that actually matter:
   `GRAPH_NEIGHBORS`/`GRAPH_QUERY` always execute as prefix scans over an adjacency index. The full
   `GRAPH_QUERY` grammar — patterns, predicates, `HOPS`/`BRANCH_LIMIT`/`COST_LIMIT`, `RETURN` modes —
   is in [Pattern queries](#pattern-queries--graph_query).
-- `RECORD scan` pages the same way with named arguments instead of positional ones —
+- `RECORD scan` and `RECORD select` page the same way with named arguments instead of positional ones —
   `limit=`/`cursor=`, the cursor being the `x<hex>` token the previous page returned — and each row
-  arrives already decoded into its declared fields, so a scan of a record table costs one request,
-  not one `READ` per row.
+  arrives already decoded into its declared fields. Selection additionally bounds examined candidates
+  with `budget=` and reports whether an optional field index served the page.
 - Every paging command uses the same convention: `next_cursor=*` (or absent) means the scan is
   exhausted, and `*` as an *input* cursor or prefix means "start from the beginning / no prefix".
 

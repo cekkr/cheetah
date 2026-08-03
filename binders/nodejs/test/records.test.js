@@ -73,6 +73,25 @@ test('buildScan hands the cursor back verbatim', () => {
     assert.doesNotMatch(line, /cursor=x78/);
 });
 
+test('buildSelect renders a bounded field predicate and keeps its cursor verbatim', () => {
+    assert.equal(
+        records.buildSelect('ngram', {
+            field: 'cnt', op: 'gt', value: 100, prefix: 'de/', limit: 20, budget: 200,
+            cursor: 'x1234', fields: ['cnt', 'label'],
+        }),
+        'RECORD select table=ngram field=cnt op=gt value=100 prefix=de/ limit=20 budget=200 cursor=x1234 fields=cnt,label'
+    );
+    assert.match(records.buildSelect('ngram', { field: 'label', value: 'old town' }), /value=x/);
+    assert.throws(() => records.buildSelect('ngram', { field: 'cnt', op: 'between', value: 1 }), /predicate is invalid/);
+});
+
+test('buildIndex spells the opt-in lifecycle', () => {
+    assert.equal(records.buildIndex('ngram', 'cnt'), 'RECORD index table=ngram field=cnt action=create');
+    assert.equal(records.buildIndex('ngram', 'cnt', { action: 'rebuild' }), 'RECORD index table=ngram field=cnt action=rebuild');
+    assert.equal(records.buildIndex('ngram', null, { action: 'list' }), 'RECORD index table=ngram action=list');
+    assert.throws(() => records.buildIndex('ngram', null), /needs a field/);
+});
+
 test('buildAlter needs something to do and renders drops as a list', () => {
     assert.throws(() => records.buildAlter('t', {}), /needs add or drop/);
     assert.equal(
@@ -138,6 +157,31 @@ test('scanPage decodes rows and their hex keys', async () => {
     assert.deepEqual(page.rows.map((row) => row.key), ['berlin', 'lisbon']);
     assert.equal(page.rows[0].fields.cnt, 42);
     assert.equal(page.cursor, null);
+});
+
+test('selectPage reports reducer work and whether an index served it', async () => {
+    const rows = [{ key: 'x6265726c696e', abs_key: 3, fields: { cnt: 142 } }];
+    const conn = fakeConn(() =>
+        `SUCCESS,table=ngram,field=cnt,op=gt,indexed=1,scanned=1,count=1,payload=${payloadOf(rows)}`
+    );
+    const page = await records.selectPage(conn, 'ngram', { field: 'cnt', op: 'gt', value: 100 });
+    assert.equal(page.rows[0].key, 'berlin');
+    assert.equal(page.scanned, 1);
+    assert.equal(page.indexed, true);
+});
+
+test('configureIndex and listIndexes wrap the index lifecycle', async () => {
+    const responses = [
+        'SUCCESS,table=ngram,field=cnt,action=create,changed=1,indexed=1,entries=7',
+        `SUCCESS,table=ngram,count=1,payload=${payloadOf(['cnt'])}`,
+    ];
+    const conn = fakeConn((_line, index) => responses[index]);
+    const changed = await records.configureIndex(conn, 'ngram', 'cnt');
+    assert.deepEqual(
+        { changed: changed.changed, indexed: changed.indexed, entries: changed.entries },
+        { changed: true, indexed: true, entries: 7 }
+    );
+    assert.deepEqual(await records.listIndexes(conn, 'ngram'), ['cnt']);
 });
 
 test('scanRows follows the cursor to the end of the sweep', async () => {

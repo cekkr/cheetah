@@ -21,8 +21,8 @@
 // separated, EXCEPT that `value=` (the READ payload) is raw bytes and runs to
 // the end of the line — it may legitimately contain commas.
 
-/** `\x01gn:` … `\x05gt:` — the graph store's reserved first bytes. */
-const RESERVED_CONTROL_PREFIXES = Object.freeze([0x01, 0x02, 0x03, 0x04, 0x05]);
+/** `\x01` … `\x08` — graph, record, cache, and record-index namespaces. */
+const RESERVED_CONTROL_PREFIXES = Object.freeze([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
 
 /** Reserved textual namespaces (graph.go → `graph/idx/`). */
 const RESERVED_TEXT_PREFIXES = Object.freeze(['graph/', 'idx/']);

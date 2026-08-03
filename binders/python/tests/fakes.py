@@ -418,7 +418,7 @@ class FakeCheetahServer:
             parts = entry.split(":")
             name, kind = parts[0], parts[1]
             width = int(parts[2]) if len(parts) > 2 else self._RECORD_DEFAULT_WIDTHS[kind]
-            parsed.append({"name": name, "type": kind, "bytes": width})
+            parsed.append({"name": name, "type": kind, "bytes": width, "indexed": False})
         return parsed
 
     def _record_schema_line(self, table: str, *extra: str, payload: bool = False) -> str:
@@ -533,6 +533,29 @@ class FakeCheetahServer:
             if fields.get("rows") == "1":
                 extra.append(f"rows={self._record_row_count(table)}")
             return self._record_schema_line(table, *extra, payload=True)
+        if action == "index":
+            operation = fields.get("action") or "create"
+            if operation == "list":
+                names = [field["name"] for field in schema["fields"] if field.get("indexed")]
+                payload = base64.b64encode(json.dumps(names).encode("utf-8")).decode("ascii")
+                return f"SUCCESS,table={table},count={len(names)},payload={payload}"
+            name = fields.get("field", "")
+            field = next((entry for entry in schema["fields"] if entry["name"] == name), None)
+            if field is None:
+                return f"ERROR,unknown_field:{name}"
+            before = bool(field.get("indexed"))
+            if operation == "create":
+                field["indexed"] = True
+            elif operation == "drop":
+                field["indexed"] = False
+            elif operation != "rebuild":
+                return f"ERROR,invalid_record_index_action:{operation}"
+            entries = self._record_row_count(table)
+            return (
+                f"SUCCESS,table={table},field={name},action={operation},"
+                f"changed={1 if before != bool(field.get('indexed')) else 0},"
+                f"indexed={1 if field.get('indexed') else 0},entries={entries}"
+            )
         if action in {"set", "put"}:
             key = _parse_value(fields.get("key", ""))
             row_key = (table, schema["generation"], key)
@@ -593,6 +616,62 @@ class FakeCheetahServer:
             line = f"SUCCESS,table={table},count={len(rows)}"
             if len(keys) > limit:
                 line += f",next_cursor=x{page[-1].hex()}"
+            return line + f",payload={payload}"
+        if action in {"select", "reduce", "where"}:
+            name = fields.get("field", "")
+            field = next((entry for entry in schema["fields"] if entry["name"] == name), None)
+            if field is None:
+                return f"ERROR,unknown_field:{name}"
+            operation = fields.get("op") or "eq"
+            target = self._record_decode(field, fields.get("value"))
+            prefix = _parse_value(fields["prefix"]) if fields.get("prefix") else b""
+            cursor = _parse_value(fields["cursor"]) if fields.get("cursor") else b""
+            limit = int(fields.get("limit") or 500)
+            budget = int(fields.get("budget") or 4096)
+            only = set(filter(None, (fields.get("fields") or "").split(","))) or None
+            keys = sorted(
+                key
+                for (table_name, generation, key) in self.record_rows
+                if table_name == table and generation == schema["generation"]
+                and key.startswith(prefix) and key > cursor
+            )
+            examined = keys[:budget]
+            rows = []
+            last = b""
+            scanned_count = 0
+            compare = {
+                "eq": lambda value: value == target,
+                "ne": lambda value: value != target,
+                "lt": lambda value: value < target,
+                "lte": lambda value: value <= target,
+                "gt": lambda value: value > target,
+                "gte": lambda value: value >= target,
+            }.get(operation)
+            if compare is None:
+                return f"ERROR,invalid_record_predicate_op:{operation}"
+            for key in examined:
+                last = key
+                scanned_count += 1
+                row = self.record_rows[(table, schema["generation"], key)]
+                value = self._record_row_view(table, row, {name}).get(name)
+                if value is None or not compare(value):
+                    continue
+                rows.append(
+                    {
+                        "key": "x" + key.hex(),
+                        "abs_key": row["abs_key"],
+                        "fields": self._record_row_view(table, row, only),
+                    }
+                )
+                if len(rows) >= limit:
+                    break
+            payload = base64.b64encode(json.dumps(rows).encode("utf-8")).decode("ascii")
+            line = (
+                f"SUCCESS,table={table},field={name},op={operation},"
+                f"indexed={1 if field.get('indexed') else 0},scanned={scanned_count},count={len(rows)}"
+            )
+            if last and (last != keys[-1]):
+                line += f",next_cursor=x{last.hex()}"
             return line + f",payload={payload}"
         return "ERROR,unknown_record_target"
 

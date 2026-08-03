@@ -24,7 +24,10 @@ class ArgumentEncodingTests(unittest.TestCase):
         self.assertEqual(protocol.decode_hex_key(protocol.encode_argument(value)), value)
 
     def test_reserved_namespaces_are_refused(self) -> None:
-        for key in (b"\x01gn:node", "graph/edges", "idx/terms"):
+        for key in (
+            b"\x01gn:node", b"\x05gt:term", b"\x06rr:row", b"\x07gc:cache",
+            b"\x08ri:index", "graph/edges", "idx/terms",
+        ):
             with self.assertRaises(ValueError):
                 protocol.assert_unreserved_key(key)
         self.assertEqual(protocol.assert_unreserved_key("ctx:1"), b"ctx:1")

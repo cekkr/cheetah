@@ -179,11 +179,16 @@ func (t *ValuesTable) WriteAt(p []byte, off int64) (n int, err error) {
 }
 
 func (t *ValuesTable) ReadAt(p []byte, off int64) (n int, err error) {
+	// Tieni ferma la vista pending durante il ReadAt. Senza questo lock il file
+	// poteva rispondere EOF, il writer completare e rimuovere pending, e la
+	// lettura non trovare più né i byte su disco che aveva appena mancato né la
+	// loro copia in memoria.
+	t.pendingMu.RLock()
+	defer t.pendingMu.RUnlock()
 	n, err = t.file.ReadAt(p, off)
 	if err != nil && err != io.EOF {
 		return n, err
 	}
-	t.pendingMu.RLock()
 	for offset, data := range t.pending {
 		start := offset
 		end := offset + int64(len(data))
@@ -207,7 +212,11 @@ func (t *ValuesTable) ReadAt(p []byte, off int64) (n int, err error) {
 			}
 		}
 	}
-	t.pendingMu.RUnlock()
+	if n == len(p) {
+		// Un EOF del file non è l'esito della lettura composta quando pending ha
+		// fornito tutti i byte mancanti.
+		err = nil
+	}
 	return n, err
 }
 

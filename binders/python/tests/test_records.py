@@ -221,6 +221,37 @@ class ScanAndDeleteTests(unittest.TestCase):
     def test_iter_rows_honours_max_rows(self) -> None:
         self.assertEqual(len(list(records.iter_rows(self.conn, "ctx", limit=2, max_rows=3))), 3)
 
+    def test_select_filters_decoded_fields_and_pages(self) -> None:
+        page = records.select(
+            self.conn, "ctx", "cnt", 2, op="gte", prefix="de/", limit=2, budget=3,
+            fields=["cnt"],
+        )
+        self.assertEqual([row.fields["cnt"] for row in page.rows], [2])
+        self.assertEqual(page.scanned, 3)
+        self.assertFalse(page.indexed)
+        self.assertIn("field=cnt op=gte value=2", self.conn.commands[-1])
+        self.assertIsNotNone(page.cursor)
+        rest = list(
+            records.iter_selected(
+                self.conn, "ctx", "cnt", 2, op="gte", prefix="de/", limit=2,
+                budget=3,
+            )
+        )
+        self.assertEqual([row.fields["cnt"] for row in rest], [2, 3, 4, 5])
+
+    def test_secondary_index_lifecycle_is_opt_in(self) -> None:
+        change = records.configure_index(self.conn, "ctx", "cnt")
+        self.assertTrue(change.changed)
+        self.assertTrue(change.indexed)
+        self.assertEqual(change.entries, 7)
+        self.assertEqual(records.list_indexes(self.conn, "ctx"), ("cnt",))
+        self.assertTrue(records.schema(self.conn, "ctx").field("cnt").indexed)
+        page = records.select(self.conn, "ctx", "cnt", 99)
+        self.assertTrue(page.indexed)
+        dropped = records.configure_index(self.conn, "ctx", "cnt", action="drop")
+        self.assertFalse(dropped.indexed)
+        self.assertEqual(records.list_indexes(self.conn, "ctx"), ())
+
     def test_delete_row_is_idempotent_and_drop_takes_the_table(self) -> None:
         self.assertTrue(records.delete_row(self.conn, "ctx", "de/0"))
         self.assertFalse(records.delete_row(self.conn, "ctx", "de/0"))
