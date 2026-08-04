@@ -76,3 +76,37 @@ func TestPayloadCacheResizeIsSafeDuringAccess(t *testing.T) {
 		t.Fatalf("cache escaped resized bounds: %+v", stats)
 	}
 }
+
+// I due tetti della cache sono indipendenti, e con payload piccoli — i record di
+// grafo, i più piccoli che questo motore scriva — quello sulle voci vince sempre
+// e il budget in byte resta inutilizzato.
+func TestPayloadCacheEntryBudgetFollowsTheByteBudget(t *testing.T) {
+	// Default su entrambi: il tetto si deriva dai byte, o 64 MB terrebbero
+	// 16 384 voci da ~120 byte, cioè 2 MB.
+	derived := payloadCacheEntryBudget(defaultPayloadCacheEntries, defaultPayloadCacheBytes)
+	if derived <= defaultPayloadCacheEntries {
+		t.Fatalf("the entry cap still binds before the byte budget: %d", derived)
+	}
+	if int64(derived)*payloadCacheSmallEntryBytes > defaultPayloadCacheBytes {
+		t.Fatalf("the derived cap promises more bytes than the budget: %d", derived)
+	}
+
+	// Un numero scelto dal chiamante resta quello che ha chiesto.
+	if got := payloadCacheEntryBudget(1024, defaultPayloadCacheBytes); got != 1024 {
+		t.Fatalf("an explicit entry cap was overridden: %d", got)
+	}
+	// Un budget in byte piccolo non deve *alzare* il default.
+	if got := payloadCacheEntryBudget(defaultPayloadCacheEntries, 1024); got != defaultPayloadCacheEntries {
+		t.Fatalf("a small byte budget lowered the entry cap: %d", got)
+	}
+	if got := payloadCacheEntryBudget(defaultPayloadCacheEntries, 0); got != defaultPayloadCacheEntries {
+		t.Fatalf("a disabled byte budget changed the entry cap: %d", got)
+	}
+
+	// E la cache costruita dal config lo applica davvero.
+	cfg := defaultConfig().DatabaseDefaults
+	cache := newPayloadCacheFromConfig(cfg)
+	if cache.maxEntries != derived {
+		t.Fatalf("newPayloadCacheFromConfig ignored the derived cap: %d vs %d", cache.maxEntries, derived)
+	}
+}

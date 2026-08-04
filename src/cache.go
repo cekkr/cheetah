@@ -8,6 +8,11 @@ import (
 const (
 	defaultPayloadCacheEntries = 16384
 	defaultPayloadCacheBytes   = 64 << 20
+
+	// Dimensione di payload sotto la quale il tetto sul *numero* di voci
+	// diventa il vincolo effettivo e il budget in byte non si raggiunge mai.
+	// Serve solo a derivare il tetto implicito qui sotto.
+	payloadCacheSmallEntryBytes = 160
 )
 
 type payloadCacheKey struct {
@@ -56,9 +61,34 @@ func newPayloadCache(maxEntries int, maxBytes int64) *payloadCache {
 	}
 }
 
+// payloadCacheEntryBudget concilia i due tetti della cache.
+//
+// Sono limiti *indipendenti* e quello sul numero di voci vince sempre quando i
+// payload sono piccoli — che è esattamente il caso dei record di grafo, i più
+// piccoli che questo motore scriva. Misurato su image-sign-db, 100 immagini e
+// ~400k archi: con il valore di default la cache teneva 16 384 voci per 2,0 MB
+// di 64 MB concessi, con 2,0 milioni di sfratti contro 331 mila hit e un tasso
+// di successo del 27%. Non era una cache troppo piccola: era una cache che non
+// poteva usare il 97% del budget che le era stato dato.
+//
+// Quando il chiamante non fissa esplicitamente il numero di voci, il tetto si
+// deriva dal budget in byte, così è quest'ultimo a vincolare davvero. Un
+// chiamante che *ha* scelto un numero lo ottiene comunque: è un limite di
+// bookkeeping, e chi lo imposta sta rispondendo a un'altra domanda.
+func payloadCacheEntryBudget(entries int, maxBytes int64) int {
+	if entries != defaultPayloadCacheEntries || maxBytes <= 0 {
+		return entries
+	}
+	derived := maxBytes / payloadCacheSmallEntryBytes
+	if derived <= int64(entries) {
+		return entries
+	}
+	return int(derived)
+}
+
 func newPayloadCacheFromConfig(cfg DatabaseConfig) *payloadCache {
-	entries := cfg.PayloadCacheEntries
 	maxBytes := cfg.PayloadCacheBytes
+	entries := payloadCacheEntryBudget(cfg.PayloadCacheEntries, maxBytes)
 	return newPayloadCache(entries, maxBytes)
 }
 

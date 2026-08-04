@@ -192,6 +192,23 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   [`ManagedFile.ReadAt`](src/file_manager.go) stops at the first sector entirely past EOF, so a single
   read across a hole silently truncates and hides every later entry. Use
   [`readSpanTolerant`](src/tables.go), which reads one sector at a time and tolerates `io.EOF`.
+- **The payload cache's two ceilings are independent, and with small payloads the entry count is the
+  one that binds.** `payload_cache_entries` (16 384) and `payload_cache_bytes` (64 MiB) are separate
+  limits, so a workload of small records — graph edges and adjacency rows are the smallest this
+  engine writes — fills the entry cap while using a few percent of the byte budget. Measured on
+  image-sign-db, 100 images and ~400k edges: 16 384 entries for **2.0 MB of 64 MB**, 2.0 million
+  evictions against 331 thousand hits, 27% hit rate, and recall spending most of its time re-reading
+  edge records it had just evicted. `payloadCacheEntryBudget` ([`cache.go`](src/cache.go)) therefore
+  derives the entry cap from the byte budget **when the caller left it at the default**, so the byte
+  budget is what actually constrains; an explicitly configured entry count is still honoured, because
+  someone who sets it is answering a different question. Recall on that corpus went from ~165 ms to
+  ~110 ms per 32-seed request.
+- **The graph association cache is admission-heavy and only pays on repeated query shapes.** A first
+  sighting of a seed set costs ~190 ms against ~30 ms warm on that same corpus. That is the right
+  trade for a client that asks similar questions repeatedly and the wrong one for a client whose
+  every query is freshly random — image-sign-db draws new constellations each round, so no seed set
+  ever recurs. `cache=off` per recall (or `graph_cache_enabled=0`) is the escape hatch; do not assume
+  the cache is free for a scan-shaped workload.
 - **Payload cache must be invalidated on mutation.** `DELETE`/`EDIT` MUST call
   [`invalidatePayload`](src/database.go); the cache copies bytes on `Get`/`Add`
   ([`cloneBytes`](src/cache.go)) so callers may not mutate returned slices in place.
