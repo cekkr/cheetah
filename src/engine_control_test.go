@@ -305,3 +305,82 @@ func TestDatabaseNameStaysInsideDataDir(t *testing.T) {
 		t.Fatal("ResetDatabase accepted a traversal name")
 	}
 }
+
+// RESET_DB deve staccare il nome subito e cancellare dopo: su un corpus reale
+// la rimozione dura minuti e il client scade prima di vedere la risposta.
+func TestResetDatabaseDefersDeletion(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := defaultConfig()
+	cfg.DataDir = dataDir
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	t.Cleanup(func() { engine.Close() })
+
+	db, err := engine.GetDatabase("corpus")
+	if err != nil {
+		t.Fatalf("GetDatabase: %v", err)
+	}
+	if resp, err := db.ExecuteCommand("PAIR_SET survivor 1"); err != nil {
+		t.Fatalf("PAIR_SET: %v (%s)", err, resp)
+	}
+	marker := filepath.Join(dataDir, "corpus", "marker.dat")
+	if err := os.WriteFile(marker, []byte("x"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := engine.ResetDatabase("corpus"); err != nil {
+		t.Fatalf("ResetDatabase: %v", err)
+	}
+
+	// Il nome è libero all'istante, indipendentemente da quanto la
+	// cancellazione stia ancora impiegando.
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("the reset name still resolves to the old directory: %v", err)
+	}
+	fresh, err := engine.GetDatabase("corpus")
+	if err != nil {
+		t.Fatalf("GetDatabase after reset: %v", err)
+	}
+	if resp, err := fresh.ExecuteCommand("PAIR_GET survivor"); err != nil || !strings.HasPrefix(resp, "ERROR") {
+		t.Fatalf("reset database still answers for the old data: %q (%v)", resp, err)
+	}
+
+	engine.waitDiscarded()
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), discardedDatabasePrefix) {
+			t.Fatalf("discarded directory %s survived the background delete", entry.Name())
+		}
+	}
+}
+
+// Una cancellazione interrotta da un arresto del processo deve riprendere: la
+// directory rinominata non è più raggiungibile da nessun comando, quindi senza
+// la passata di avvio resterebbe sul disco per sempre.
+func TestNewEngineSweepsDiscardedDirectories(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	leftover := filepath.Join(dataDir, discardedDatabasePrefix+"corpus-1")
+	if err := os.MkdirAll(filepath.Join(leftover, "pairs"), 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	cfg := defaultConfig()
+	cfg.DataDir = dataDir
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	t.Cleanup(func() { engine.Close() })
+
+	engine.waitDiscarded()
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Fatalf("leftover discarded directory survived start-up: %v", err)
+	}
+	if err := validateDatabaseName(discardedDatabasePrefix + "corpus-1"); err == nil {
+		t.Fatal("validateDatabaseName accepted a reserved discarded name")
+	}
+}

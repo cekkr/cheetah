@@ -839,6 +839,11 @@ func validateDatabaseName(name string) error {
 	if name == "." || name == ".." {
 		return fmt.Errorf("invalid database name %q", name)
 	}
+	// Riservato: RESET_DB ci sposta le directory in attesa di cancellazione.
+	// Un client che potesse nominarle riaprirebbe un corpus a metà rimozione.
+	if strings.HasPrefix(name, discardedDatabasePrefix) {
+		return fmt.Errorf("invalid database name %q", name)
+	}
 	for _, r := range name {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':

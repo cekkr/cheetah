@@ -50,9 +50,14 @@ const (
 	// Pavimento assoluto: sotto questa attivazione un cammino non viene esteso
 	// nemmeno quando la precisione richiesta è 0, altrimenti la diffusione non
 	// termina mai su un grafo denso.
-	graphRecallMinActivation    = 0.01
-	graphRecallDefaultSeedLimit = 8
-	graphRecallMaxSeeds         = 32
+	// Pavimento della diffusione oltre il primo hop, dove l'attivazione si
+	// moltiplica e la coda va tagliata.
+	graphRecallMinActivation = 0.01
+	// Pavimento assoluto: esiste solo perché seguire un arco a attivazione zero
+	// non è mai lavoro utile, non per limitare la spesa.
+	graphRecallEpsilonActivation = 1e-9
+	graphRecallDefaultSeedLimit  = 8
+	graphRecallMaxSeeds          = 32
 	// Oltre questo numero di tipi conviene una scansione unica filtrata a valle
 	// invece di N scansioni con prefisso tipizzato.
 	graphRecallMaxTypeScans = 8
@@ -1382,9 +1387,22 @@ func (db *Database) graphRecallSpread(
 	// Un nodo arriva alla soglia solo se almeno un seme gli porta precision/semi:
 	// il noisy-OR non supera mai la somma delle attivazioni, quindi tagliare qui
 	// non perde convergenze.
+	//
+	// Il minimo assoluto vale però solo dove la diffusione può moltiplicarsi.
+	// A un solo hop l'attivazione è `seme × peso dell'arco` e non si propaga:
+	// la spesa è già limitata da BranchLimit e da Budget, e alzare il pavimento
+	// a 0.01 significa soltanto rendere invisibili gli archi leggeri. Con un
+	// peso che porta una frequenza relativa — un indice invertito costruito sul
+	// grafo — quel taglio cancella la coda della distribuzione: misurato su
+	// image-sign-db, 100 immagini a 1024 costellazioni, il peso più piccolo vale
+	// 0.0014 e il pavinento fisso costava 3 punti di rank-1 su 100. Oltre il
+	// primo hop il vincolo resta, perché lì la coda si moltiplica davvero.
 	floor := opts.Precision / float64(len(resolutions))
-	if floor < graphRecallMinActivation {
+	if opts.Hops > 1 && floor < graphRecallMinActivation {
 		floor = graphRecallMinActivation
+	}
+	if floor <= 0 {
+		floor = graphRecallEpsilonActivation
 	}
 
 	frontier := make([]graphRecallFrontierItem, 0, len(resolutions)*opts.SeedLimit)

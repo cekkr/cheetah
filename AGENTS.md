@@ -313,6 +313,14 @@ line is re-encoded into a frame. That is why it needs no edit when a command is 
   single answer — only how fast it arrives. A cached shortcut therefore enters a recall as evidence
   marked `cached` (a dedicated `graphRecallEdgeView.Cached` bool, **not** a reserved edge type, which
   a user-declared type could always collide with), never as an edge.
+- **The absolute activation floor applies past the first hop only.** `graphRecallSpread` derives its
+  cut-off from `precision / seeds`, and raises it to `graphRecallMinActivation` (0.01) **only when
+  `hops > 1`** — that is where activation compounds and the tail has to be cut. At one hop an
+  activation is just `seed × edge weight`, the sweep is already bounded by `BranchLimit` and `Budget`,
+  and clamping up would merely hide light edges. That matters as soon as a client uses the graph as an
+  inverted index and puts a *relative frequency* in the weight: measured on image-sign-db (100 images,
+  1024 constellations) the smallest legitimate weight is 0.0014, and the fixed floor cost 3 rank-1
+  points out of 100. `graphRecallEpsilonActivation` (1e-9) remains as the "never follow a zero" guard.
 - **Recall decay has two independent, bounded feedback factors.** A query shape's cache class maps
   its smoothed hit-rate bias to a quantized 0.75–1.25 multiplier only after 32 lookups;
   `cache=off` fixes this factor at 1. Relation factors come from the optional prediction table
@@ -485,7 +493,8 @@ Engine-wide [`graphCacheBudget`](src/graph_cache_budget.go), attached to every l
 engine-scoped commands, since a `Database` cannot see the registry it belongs to.
 
 - **Key symbols:** `Engine`, `GetDatabase`/`getDatabaseLocked` (lazy create + cache),
-  `ResetDatabase` (close + `RemoveAll` + drop from map), `SetDatabaseOverrides`, `ConfigureDatabase`,
+  `ResetDatabase` (close + rename + drop from map), `discardDirectory`/`sweepDiscarded`/`waitDiscarded`,
+  `SetDatabaseOverrides`, `ConfigureDatabase`,
   `resolveSettingsLocked`, `EffectiveSettings`, `CreateDatabase`, `ListDatabases`/`DatabaseInfo`,
   `engineControlCommand`, `graphCacheBudget`, `DefaultDatabaseName`, `Close`.
 - **Settings layering:** `resolveSettingsLocked` composes `cfg.DatabaseDefaults` →
@@ -501,7 +510,17 @@ engine-scoped commands, since a `Database` cannot see the registry it belongs to
   `FileManager.Close` and `ClusterMessenger.Stop`, whose stop channels used to be closed twice.
   Signal shutdown, CLI `EXIT` and `Engine.Close` all land on the same handles, so keep any new
   shutdown path safe to call twice.
-- **Common mistakes:** `ResetDatabase` deletes the directory on disk; callers must re-`GetDatabase`
+- **`RESET_DB` renames; the deletion happens afterwards.** `ResetDatabase` closes the database and
+  `os.Rename`s its directory to `.discarded-<name>-<nanos>`, then removes it on a background
+  goroutine. The rename is the commit point: the name is free and reopenable the moment it returns.
+  This is not an optimisation — deleting a real corpus takes minutes (3.3 GB in 754k files measured at
+  **200 s** on macOS/APFS) against the Node binder's 30 s command timeout, so the synchronous form
+  made every run that began with a reset unable to start. `validateDatabaseName` reserves the
+  `.discarded-` prefix, which is what keeps those directories out of `ListDatabases` and out of
+  `GetDatabase`; `NewEngine` sweeps leftovers so a deletion interrupted by a restart resumes. `Close`
+  deliberately does **not** wait for them (that would put the cost back into shutdown) — `waitDiscarded`
+  exists for tests only. A rename that fails falls back to deleting in place rather than refusing.
+- **Common mistakes:** `ResetDatabase` destroys the directory's contents; callers must re-`GetDatabase`
   afterward (the front-ends do). It only resets one named database, never the whole data dir.
 
 #### [`src/config.go`](src/config.go)

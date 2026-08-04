@@ -622,3 +622,38 @@ func TestGraphRecallRejectsMissingSeeds(t *testing.T) {
 	assertCommandPrefix(t, db, "GRAPH_SIMILAR by=context", "ERROR,graph_similar_requires_id")
 	assertCommandPrefix(t, db, "GRAPH_TERM_INDEX action=nope", "ERROR,unknown_action")
 }
+
+// Un arco leggero deve restare visibile a un hop: il peso può portare una
+// frequenza relativa, e un pavimento fisso a 0.01 ne cancellerebbe la coda.
+func TestGraphRecallHonoursPrecisionAtOneHop(t *testing.T) {
+	db := newRecallTestDB(t)
+
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=seed labels=w", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=heavy labels=img", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_NODE_SET id=faint labels=img", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_EDGE_SET from=seed to=heavy type=sign weight=0.9", "SUCCESS")
+	assertCommandPrefix(t, db, "GRAPH_EDGE_SET from=seed to=faint type=sign weight=0.0014", "SUCCESS")
+
+	resp := assertCommandPrefix(
+		t, db,
+		"GRAPH_RECALL seeds=seed hops=1 decay=1 precision=0.0001 direction=out type=sign limit=16",
+		"SUCCESS",
+	)
+	faint, ok := findAssociation(recallPayload(t, resp), "faint")
+	if !ok {
+		t.Fatalf("a 0.0014 edge was dropped at one hop despite precision=0.0001: %s", resp)
+	}
+	if faint.Score > graphRecallMinActivation {
+		t.Fatalf("expected the faint association to carry its own small weight, got %.6f", faint.Score)
+	}
+
+	// Oltre il primo hop il vincolo resta: lì la coda si moltiplica davvero.
+	resp = assertCommandPrefix(
+		t, db,
+		"GRAPH_RECALL seeds=seed hops=2 decay=1 precision=0.0001 direction=out type=sign limit=16",
+		"SUCCESS",
+	)
+	if _, ok := findAssociation(recallPayload(t, resp), "faint"); ok {
+		t.Fatalf("the multi-hop activation floor no longer applies: %s", resp)
+	}
+}

@@ -11,7 +11,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
+
+// Prefisso delle directory che RESET_DB ha già staccato dal loro nome e che
+// restano sul disco solo finché la cancellazione di sfondo non le raggiunge.
+// validateDatabaseName lo rifiuta, quindi non è un nome che un client possa
+// creare o su cui possa inciampare, e ListDatabases non le vede.
+const discardedDatabasePrefix = ".discarded-"
 
 type Engine struct {
 	cfg              *Config
@@ -21,20 +28,59 @@ type Engine struct {
 	mu               sync.Mutex
 	monitor          *ResourceMonitor
 	graphCacheBudget *graphCacheBudget
+	discards         sync.WaitGroup
 }
 
 func NewEngine(cfg *Config, monitor *ResourceMonitor) (*Engine, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		return nil, err
 	}
-	return &Engine{
+	engine := &Engine{
 		cfg:              cfg,
 		basePath:         cfg.DataDir,
 		databases:        make(map[string]*Database),
 		overrides:        make(map[string]DatabaseOverrides),
 		monitor:          monitor,
 		graphCacheBudget: newGraphCacheBudget(cfg.GraphCacheGlobalCapacity),
-	}, nil
+	}
+	engine.sweepDiscarded()
+	return engine, nil
+}
+
+// sweepDiscarded riprende le cancellazioni che un arresto del processo ha
+// interrotto. Una directory rinominata è già invisibile a ogni comando, ma
+// resta sul disco: senza questa passata un server riavviato spesso accumula
+// corpus scartati per sempre.
+func (e *Engine) sweepDiscarded() {
+	entries, err := os.ReadDir(e.basePath)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), discardedDatabasePrefix) {
+			continue
+		}
+		e.discardDirectory(filepath.Join(e.basePath, entry.Name()))
+	}
+}
+
+// discardDirectory cancella in background. Non è mai atteso da Close: aspettare
+// significherebbe riportare dentro l'arresto proprio il costo che RESET_DB ha
+// spostato fuori dalla risposta.
+func (e *Engine) discardDirectory(path string) {
+	e.discards.Add(1)
+	go func() {
+		defer e.discards.Done()
+		if err := os.RemoveAll(path); err != nil {
+			logErrorf("Failed to delete discarded directory %s: %v", path, err)
+		}
+	}()
+}
+
+// waitDiscarded esiste per i test, che devono poter osservare il disco dopo che
+// la cancellazione differita è finita.
+func (e *Engine) waitDiscarded() {
+	e.discards.Wait()
 }
 
 var errDatabaseExists = errors.New("database already exists")
@@ -187,10 +233,37 @@ func (e *Engine) ResetDatabase(name string) error {
 		delete(e.databases, name)
 	}
 	dbPath := filepath.Join(e.basePath, name)
-	if err := os.RemoveAll(dbPath); err != nil {
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			logInfof("Reset database: %s", name)
+			return nil
+		}
 		return fmt.Errorf("failed to reset database %s: %w", name, err)
 	}
-	logInfof("Reset database: %s", name)
+
+	// Il rename è il punto di commit, e la ragione per cui non si cancella qui.
+	// Staccare il nome costa una syscall; cancellare un corpus reale no —
+	// misurato su image-sign-db, 3,3 GB in 754k file hanno impiegato 200 s,
+	// contro i 30 s di timeout comando del binder Node: il client abbatteva la
+	// connessione mentre il server stava ancora lavorando, e ogni run che
+	// iniziava con un reset non partiva affatto. Appena il rename ritorna il
+	// nome è libero e riapribile vuoto; i byte se ne vanno in background.
+	discarded := filepath.Join(
+		e.basePath,
+		fmt.Sprintf("%s%s-%d", discardedDatabasePrefix, name, time.Now().UnixNano()),
+	)
+	if err := os.Rename(dbPath, discarded); err != nil {
+		// Un rename può fallire per ragioni che la cancellazione non ha
+		// (permessi sulla directory padre): meglio lento che rotto.
+		logErrorf("Failed to rename database %s for deferred deletion: %v", name, err)
+		if rmErr := os.RemoveAll(dbPath); rmErr != nil {
+			return fmt.Errorf("failed to reset database %s: %w", name, rmErr)
+		}
+		logInfof("Reset database: %s", name)
+		return nil
+	}
+	e.discardDirectory(discarded)
+	logInfof("Reset database: %s (deleting %s in background)", name, filepath.Base(discarded))
 	return nil
 }
 
